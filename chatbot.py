@@ -22,15 +22,15 @@ print(device)
 
 batch_size = int(args.batch_size)
 block_size = 128
-max_iters = 200
+max_iters = 10000
 eval_interval = 100
 learning_rate = 3e-4
 eval_iters = 100
-n_embd = 384
-n_layer = 8
-n_head = 8
+n_embd = 1024
+n_layer = 16
+n_head = 16
 dropout = 0.2
-num_experts = 4
+num_experts = 8
 top_k = 2
 
 chars = ""
