@@ -20,7 +20,7 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 print(device)
 
-batch_size = args.batch_size
+batch_size = int(args.batch_size)
 block_size = 128
 max_iters = 200
 eval_interval = 100
@@ -53,7 +53,6 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -64,7 +63,8 @@ class Head(nn.Module):
         q = self.query(x) # (B, T, hs)
         # compute attention scores ("affinities")
         wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        tril = torch.tril(torch.ones(T, T, device=x.device))
+        wei = wei.masked_fill(tril == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
