@@ -1,0 +1,1 @@
+- [Hybrid Code and Literature Training Pipeline with MoE](project/hybrid-code-training.md) — Custom GPT training on literature + multi-language code with MoE FFN.

@@ -79,3 +79,7 @@ Thumbs.db
 *.env
 tokens.json
 secrets.json
+
+# Training datasets & text corpora
+*.txt
+!vocab.txt
