@@ -259,5 +259,7 @@ reasoner = ReasoningEngine(m, decode, encode, device)
 while True:
     prompt = input("Prompt:\n")
     context = torch.tensor(encode(prompt), dtype=torch.long, device=device)
+    generated_chars = m.generate(context.unsqueeze(0), max_new_tokens=150)
+    generated_text = decode(generated_chars[0].tolist())
     reasoned_solution = reasoner.solve_with_cot(prompt, max_new_tokens=150)
-    print(f"Completion:\n{reasoned_solution}")
+    print(f"Completion:\n{reasoned_solution}\n")
