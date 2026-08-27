@@ -109,7 +109,6 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
@@ -120,7 +119,8 @@ class Head(nn.Module):
         q = self.query(x) # (B, T, hs)
         # compute attention scores ("affinities")
         wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5 # (B, T, hs) @ (B, hs, T) -> (B, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf')) # (B, T, T)
+        tril = torch.tril(torch.ones(T, T, device=x.device))
+        wei = wei.masked_fill(tril == 0, float('-inf')) # (B, T, T)
         wei = F.softmax(wei, dim=-1) # (B, T, T)
         wei = self.dropout(wei)
         # perform the weighted aggregation of the values
@@ -235,7 +235,10 @@ class GPTLanguageModel(nn.Module):
 
         # idx and targets are both (B, T) tensor of integers
         tok_emb = self.token_embedding_table(index) # (B, T, C)
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) # (T, C)
+        pos_indices = torch.arange(T, device=device)
+        max_pos = self.position_embedding_table.num_embeddings
+        pos_indices = torch.clamp(pos_indices, min=0, max=max_pos - 1)
+        pos_emb = self.position_embedding_table(pos_indices) # (T, C)
         x = tok_emb + pos_emb # (B, T, C)
         x = self.blocks(x) # (B, T, C)
         x = self.ln_f(x) # (B, T, C)
