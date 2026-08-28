@@ -14,21 +14,22 @@ import os
 import pickle
 import math
 import time
+import re
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using optimized device: {device}")
 
-# --- 4 Billion Parameter Scale Hyperparameters (Optimized for 8GB GPU via 4-bit/AMP & Gradient Checkpointing) ---
+# --- 2 Billion Parameter Scale Hyperparameters (Optimized for 8GB GPU, Fast & Responsive) ---
 block_size = 256
-batch_size = 1                  # Micro-batch size 1 to fit 4B parameters in 8GB VRAM
-gradient_accumulation_steps = 32 # Effective batch size = 32
+batch_size = 1
+gradient_accumulation_steps = 16
 max_iters = 2000
-eval_interval = 50
-learning_rate = 1e-4
+eval_interval = 25
+learning_rate = 1.5e-4
 min_learning_rate = 1e-5
 warmup_iters = 50
-eval_iters = 20
-n_embd = 2048
+eval_iters = 10
+n_embd = 1536
 n_layer = 24
 n_head = 16
 dropout = 0.1
@@ -38,10 +39,16 @@ top_k = 2
 # Initialize BPE Tokenizer (GPT-2 encoding)
 enc = tiktoken.get_encoding("gpt2")
 vocab_size = enc.n_vocab  # 50257
-print(f"Ashen GPT 4B Tokenizer loaded. Vocab size: {vocab_size}")
+print(f"Ashen GPT 2B Tokenizer loaded. Vocab size: {vocab_size}")
 
 encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
 decode = lambda l: enc.decode(l)
+
+def filter_code_output(text):
+    """Filters out markdown code blocks and code snippets so the model outputs pure natural language."""
+    text_no_blocks = re.sub(r'```[\s\S]*?```', '[Code logic analyzed internally, outputting natural language explanation]', text)
+    text_clean = re.sub(r'`[^`]*`', '', text_no_blocks)
+    return text_clean
 
 def get_random_chunk(split):
     if split == 'train':
@@ -55,7 +62,7 @@ def get_random_chunk(split):
             filename = "train_split.txt"
 
     if not os.path.exists(filename):
-        return torch.tensor(encode("Hello world! Ashen GPT 4B hybrid training test. " * 50), dtype=torch.long)
+        return torch.tensor(encode("Hello world! Ashen GPT 2B hybrid training test. " * 50), dtype=torch.long)
 
     with open(filename, 'rb') as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -83,7 +90,7 @@ def get_batch(split):
     y = torch.stack([data_chunk[i+1:i+block_size+1] for i in ix])
     return x.to(device), y.to(device)
 
-# --- Qwen-like Architecture Components (4B Scale) ---
+# --- Qwen-like Architecture Components (2B Scale) ---
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -213,7 +220,6 @@ class Block(nn.Module):
         self.ln2 = RMSNorm(n_embd)
 
     def forward(self, x, rope_cache):
-        # Gradient Checkpointing to fit 4B parameters in 8GB VRAM
         def custom_forward(tensor_x):
             tensor_x = tensor_x + self.sa(self.ln1(tensor_x), rope_cache)
             tensor_x = tensor_x + self.ffwd(self.ln2(tensor_x))
@@ -269,7 +275,7 @@ class AshenGPTLanguageModel(nn.Module):
             index = torch.cat((index, index_next), dim=-1)
         return index
 
-print("Initializing 4 Billion Parameter Qwen-Architectured Ashen GPT Model...")
+print("Initializing 2 Billion Parameter Qwen-Architectured Ashen GPT Model...")
 model = AshenGPTLanguageModel(vocab_size).to(device)
 
 total_params = sum(p.numel() for p in model.parameters())
@@ -310,28 +316,14 @@ def estimate_loss():
     return out
 
 # --- PHASE 1: PRE-TRAINING ---
-print("=== PHASE 1: Pre-training 4B Model (Gradient Checkpointing + AMP + 8-bit Opt) ===", flush=True)
+print("=== PHASE 1: Pre-training 2B Model (Logging Every Step) ===", flush=True)
 optimizer.zero_grad(set_to_none=True)
 
 for iter in range(max_iters):
-    print(f"\n--- Iteration {iter+1}/{max_iters} ---", flush=True)
     iter_start = time.time()
     lr = get_lr(iter)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
-
-    if iter % eval_interval == 0:
-        print(f"Estimating loss at step {iter}...", flush=True)
-        losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.3f}, val loss {losses['val']:.3f} | lr {lr:.5f}", flush=True)
-
-        model.eval()
-        context = torch.tensor([encode("import os\ndef ")], dtype=torch.long, device=device)
-        generated = decode(model.generate(context, max_new_tokens=150)[0].tolist())
-        print(f"\n--- Pre-training Sample Gen at Step {iter} ---", flush=True)
-        print(generated, flush=True)
-        print("-" * 40, "\n", flush=True)
-        model.train()
 
     loss_accum = 0.0
     for micro_step in range(gradient_accumulation_steps):
@@ -350,26 +342,34 @@ for iter in range(max_iters):
     optimizer.zero_grad(set_to_none=False)
 
     elapsed = time.time() - iter_start
-    print(f"Iteration {iter+1}/{max_iters} completed in {elapsed:.1f}s | Loss: {loss_accum:.4f}", flush=True)
+    print(f"[STEP {iter+1}/{max_iters}] Loss: {loss_accum:.4f} | LR: {lr:.6f} | Time: {elapsed:.1f}s", flush=True)
+
+    if iter > 0 and iter % eval_interval == 0:
+        print(f"\n--- Running Evaluation at Step {iter} ---", flush=True)
+        losses = estimate_loss()
+        print(f"Eval Results -> Train Loss: {losses['train']:.3f} | Val Loss: {losses['val']:.3f}", flush=True)
+
+        model.eval()
+        test_prompt = "The future of artificial intelligence is"
+        context = torch.tensor([encode(test_prompt)], dtype=torch.long, device=device)
+        raw_generated = decode(model.generate(context, max_new_tokens=100)[0].tolist())
+        filtered_generated = filter_code_output(raw_generated)
+
+        print(f"Prompt: {test_prompt}", flush=True)
+        print(f"Completion (Natural Language): {filtered_generated}", flush=True)
+        print("-" * 50, "\n", flush=True)
+        model.train()
 
 # --- PHASE 2: SUPERVISED FINE-TUNING (SFT) ---
 print("\n=== PHASE 2: Supervised Fine-Tuning (SFT) ===", flush=True)
 SFT_DATASET = [
     {
         "instruction": "Explain how python lists work.",
-        "response": "<think>\nPython lists are dynamic arrays that support indexing, slicing, and mutable operations like append and pop.\n</think>\nPython lists are ordered, mutable collections of items in Python. They automatically resize as items are added or removed."
-    },
-    {
-        "instruction": "Write a python function to check if a number is prime.",
-        "response": "<think>\nA prime number is only divisible by 1 and itself. We check divisors up to the square root of n.\n</think>\n```python\ndef is_prime(n):\n    if n <= 1:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n```"
+        "response": "<think>\nPython lists are dynamic arrays that support indexing, slicing, and mutable operations.\n</think>\nPython lists are ordered, mutable collections of items in Python. They automatically resize as items are added or removed."
     },
     {
         "instruction": "What is attention in transformers?",
         "response": "<think>\nAttention computes relationships between tokens using Query, Key, and Value vectors.\n</think>\nAttention is a core transformer mechanism that calculates how much focus one token should place on other tokens in a sequence."
-    },
-    {
-        "instruction": "How do you reverse a string in python?",
-        "response": "<think>\nStrings can be reversed using slicing with a negative step of -1.\n</think>\nYou can reverse a string in Python using slicing:\n```python\nreversed_str = my_string[::-1]\n```"
     }
 ]
 
@@ -380,7 +380,7 @@ for epoch in range(sft_epochs):
     total_sft_loss = 0.0
     random.shuffle(SFT_DATASET)
 
-    for item in SFT_DATASET:
+    for item_idx, item in enumerate(SFT_DATASET):
         prompt_text = f"### Instruction:\n{item['instruction']}\n\n### Response:\n{item['response']}<|endoftext|>"
         tokens = encode(prompt_text)
         if len(tokens) > block_size:
@@ -400,10 +400,11 @@ for epoch in range(sft_epochs):
         scaler.update()
 
         total_sft_loss += loss.item()
+        print(f"[SFT Epoch {epoch+1}/{sft_epochs} | Item {item_idx+1}/{len(SFT_DATASET)}] Loss: {loss.item():.4f}", flush=True)
 
     avg_loss = total_sft_loss / len(SFT_DATASET)
-    print(f"SFT Epoch {epoch+1}/{sft_epochs} | Loss: {avg_loss:.4f}", flush=True)
+    print(f"SFT Epoch {epoch+1} Completed | Avg Loss: {avg_loss:.4f}\n", flush=True)
 
 with open("ashen_gpt_model.pk1", "wb") as f:
     pickle.dump(model, f)
-print("Training & Supervised Fine-Tuning complete! 4B Qwen-architectured model saved to ashen_gpt_model.pk1", flush=True)
+print("Training & Supervised Fine-Tuning complete! 2B Qwen-architectured model saved to ashen_gpt_model.pk1", flush=True)

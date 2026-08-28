@@ -9,13 +9,14 @@ from torch.nn import functional as F
 import tiktoken
 import pickle
 import os
+import re
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
-# --- 4 Billion Parameter Scale Hyperparameters ---
+# --- 2 Billion Parameter Scale Hyperparameters ---
 block_size = 512
-n_embd = 2048
+n_embd = 1536
 n_layer = 24
 n_head = 16
 dropout = 0.1
@@ -25,12 +26,27 @@ top_k = 2
 # Initialize BPE Tokenizer (GPT-2 encoding)
 enc = tiktoken.get_encoding("gpt2")
 vocab_size = enc.n_vocab  # 50257
-print(f"Ashen GPT 4B Tokenizer loaded. Vocab size: {vocab_size}")
+print(f"Ashen GPT 2B Tokenizer loaded. Vocab size: {vocab_size}")
 
 encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
 decode = lambda l: enc.decode(l)
 
-# --- Qwen-like Architecture Components (4B Scale) ---
+def user_wants_code(prompt):
+    """Detects if the user explicitly asked for code, scripts, functions, or syntax."""
+    code_keywords = [
+        'code', 'write a', 'function', 'script', 'program', 'python', 'javascript', 
+        'html', 'css', 'sql', 'syntax', 'class ', 'def ', 'implementation', 'algorithm'
+    ]
+    prompt_lower = prompt.lower()
+    return any(keyword in prompt_lower for keyword in code_keywords)
+
+def filter_code_output(text):
+    """Filters out markdown code blocks and code snippets when the user did not ask for code."""
+    text_no_blocks = re.sub(r'```[\s\S]*?```', '[Code logic analyzed internally. Ask me to write code if you want to see the implementation snippet.]', text)
+    text_clean = re.sub(r'`[^`]*`', '', text_no_blocks)
+    return text_clean
+
+# --- Qwen-like Architecture Components (2B Scale) ---
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -216,12 +232,12 @@ class AshenGPTLanguageModel(nn.Module):
 # Load model checkpoint
 model_path = 'ashen_gpt_model.pk1'
 if os.path.exists(model_path):
-    print(f"Loading 4B Ashen GPT model parameters from {model_path}...")
+    print(f"Loading 2B Ashen GPT model parameters from {model_path}...")
     with open(model_path, 'rb') as f:
         model = pickle.load(f)
     print("Model loaded successfully!")
 else:
-    print(f"No checkpoint found at {model_path}. Initializing new 4B Ashen GPT model...")
+    print(f"No checkpoint found at {model_path}. Initializing new 2B Ashen GPT model...")
     model = AshenGPTLanguageModel(vocab_size)
 
 m = model.to(device)
@@ -243,13 +259,18 @@ class ReasoningEngine:
         input_ids = torch.tensor([encoded], dtype=torch.long, device=self.device)
 
         output_ids = self.model.generate(input_ids, max_new_tokens=max_new_tokens, temperature=0.8, top_k=50)
-        generated_text = self.decode(output_ids[0].tolist())
-        return generated_text
+        raw_generated = self.decode(output_ids[0].tolist())
+        
+        # Check if user explicitly requested code
+        if user_wants_code(prompt):
+            return raw_generated  # Permit code output
+        else:
+            return filter_code_output(raw_generated)  # Suppress code output
 
 reasoner = ReasoningEngine(m, decode, encode, device)
 
 if __name__ == "__main__":
-    print("\n--- Ashen GPT 4B Chatbot Ready ---")
+    print("\n--- Ashen GPT 2B Chatbot Ready (Smart Code Output Mode) ---")
     while True:
         try:
             prompt = input("\nPrompt:\n> ")
@@ -257,7 +278,7 @@ if __name__ == "__main__":
                 continue
             if prompt.lower() in ['exit', 'quit']:
                 break
-            reasoned_solution = reasoner.solve_with_cot(prompt, max_new_tokens=200)
+            reasoned_solution = reasoner.solve_using_cot if hasattr(reasoner, 'solve_using_cot') else reasoner.solve_with_cot(prompt, max_new_tokens=200)
             print(f"\nCompletion:\n{reasoned_solution}")
         except (KeyboardInterrupt, EOFError):
             break

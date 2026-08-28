@@ -83,3 +83,5 @@ secrets.json
 # Training datasets & text corpora
 *.txt
 !vocab.txt
+
+ashen_gpt_model.pk1
