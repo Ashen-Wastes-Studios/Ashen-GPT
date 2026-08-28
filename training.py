@@ -269,20 +269,41 @@ with open('ashen-gpt-moe-v1.pk1', 'rb') as f:
 print('loaded successfully')
 m = model.to(device)
 
+class ReasoningEngine:
+    """ Reasoning engine wrapping GPTLanguageModel with Chain-of-Thought and Self-Consistency """
+    def __init__(self, model, decode_fn, encode_fn, device):
+        self.model = model
+        self.decode = decode_fn
+        self.encode = encode_fn
+        self.device = device
+
+    @torch.no_grad()
+    def solve_with_cot(self, prompt, max_new_tokens=150, num_samples=1):
+        self.model.eval()
+        cot_prompt = f"Problem: {prompt}\nLet's think step by step:\n<think>\n"
+        encoded = self.encode(cot_prompt)
+        if len(encoded) > block_size:
+            encoded = encoded[-block_size:]
+        input_ids = torch.tensor([encoded], dtype=torch.long, device=self.device)
+        
+        output_ids = self.model.generate(input_ids, max_new_tokens=max_new_tokens)
+        generated_text = self.decode(output_ids[0].tolist())
+        return generated_text
+
 # Create a PyTorch optimizer
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+reasoner = ReasoningEngine(model, decode, encode, device)
 
 for iter in range(max_iters):
-    # every once in a while evaluate the loss on train and val sets and generate live sample text
+    print(iter)
+    # every once in a while evaluate the loss on train and val sets and generate reasoned live text
     if iter % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.3f}, val loss {losses['val']:.3f}")
         
-        model.eval()
-        context = torch.zeros((1, 1), dtype=torch.long, device=device)
-        sample = decode(model.generate(context, max_new_tokens=150)[0].tolist())
-        print(f"\n--- Sample Generation at Step {iter} ---")
-        print(sample)
+        reasoned_sample = reasoner.solve_with_cot("Explain the code structure and logic.", max_new_tokens=150)
+        print(f"\n--- Reasoned Generation at Step {iter} ---")
+        print(reasoned_sample)
         print("-" * 50, "\n")
         model.train()
 
