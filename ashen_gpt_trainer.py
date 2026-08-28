@@ -19,19 +19,19 @@ import re
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using optimized device: {device}")
 
-# --- Optimized 250M Parameter Scale (Fits perfectly in 8GB GPU VRAM without OOM) ---
+# --- Peak Safe Limit for 8GB GPU (~450M Parameters) ---
 block_size = 256
-batch_size = 8                  # Larger batch size for efficient GPU utilization
-gradient_accumulation_steps = 4
+batch_size = 4
+gradient_accumulation_steps = 8
 max_iters = 2000
 eval_interval = 50
 learning_rate = 3e-4
 min_learning_rate = 3e-5
 warmup_iters = 50
 eval_iters = 20
-n_embd = 768
-n_layer = 12
-n_head = 12
+n_embd = 896
+n_layer = 16
+n_head = 14
 dropout = 0.1
 num_experts = 4
 top_k = 2
@@ -220,9 +220,11 @@ class Block(nn.Module):
         self.ln2 = RMSNorm(n_embd)
 
     def forward(self, x, rope_cache):
-        x = x + self.sa(self.ln1(x), rope_cache)
-        x = x + self.ffwd(self.ln2(x))
-        return x
+        def custom_forward(tensor_x):
+            tensor_x = tensor_x + self.sa(self.ln1(tensor_x), rope_cache)
+            tensor_x = tensor_x + self.ffwd(self.ln2(tensor_x))
+            return tensor_x
+        return torch.utils.checkpoint.checkpoint(custom_forward, x, use_reentrant=False)
 
 class AshenGPTLanguageModel(nn.Module):
     def __init__(self, vocab_size):
@@ -273,13 +275,20 @@ class AshenGPTLanguageModel(nn.Module):
             index = torch.cat((index, index_next), dim=-1)
         return index
 
-print("Initializing Optimized 250M Qwen-Architectured Ashen GPT Model...")
+print("Initializing Peak Safe 450M Qwen-Architectured Ashen GPT Model...")
 model = AshenGPTLanguageModel(vocab_size).to(device)
 
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Total Model Parameters: {total_params / 1e6:.2f} Million")
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+try:
+    import bitsandbytes as bnb
+    optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
+    print("Using bitsandbytes 8-bit AdamW optimizer for VRAM savings.")
+except Exception:
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    print("Using standard torch AdamW optimizer.")
+
 scaler = torch.amp.GradScaler('cuda' if device == 'cuda' else 'cpu')
 
 def get_lr(it):
@@ -307,7 +316,7 @@ def estimate_loss():
     return out
 
 # --- PHASE 1: PRE-TRAINING ---
-print("=== PHASE 1: Pre-training 250M Model (Zero OOM, Lightning Fast) ===", flush=True)
+print("=== PHASE 1: Pre-training Peak 450M Model (With Gradient Checkpointing) ===", flush=True)
 optimizer.zero_grad(set_to_none=True)
 
 for iter in range(max_iters):
@@ -336,19 +345,38 @@ for iter in range(max_iters):
     print(f"[STEP {iter+1}/{max_iters}] Loss: {loss_accum:.4f} | LR: {lr:.6f} | Time: {elapsed:.1f}s", flush=True)
 
     if iter > 0 and iter % eval_interval == 0:
-        print(f"\n--- Running Evaluation at Step {iter} ---", flush=True)
+        print(f"\n==================================================", flush=True)
+        print(f"--- EVALUATION & GENERATION TESTS AT STEP {iter} ---", flush=True)
+        print(f"==================================================", flush=True)
         losses = estimate_loss()
-        print(f"Eval Results -> Train Loss: {losses['train']:.3f} | Val Loss: {losses['val']:.3f}", flush=True)
+        print(f"Eval Results -> Train Loss: {losses['train']:.3f} | Val Loss: {losses['val']:.3f}\n", flush=True)
 
         model.eval()
-        test_prompt = "The future of artificial intelligence is"
-        context = torch.tensor([encode(test_prompt)], dtype=torch.long, device=device)
-        raw_generated = decode(model.generate(context, max_new_tokens=100)[0].tolist())
-        filtered_generated = filter_code_output(raw_generated)
 
-        print(f"Prompt: {test_prompt}", flush=True)
-        print(f"Completion (Natural Language): {filtered_generated}", flush=True)
-        print("-" * 50, "\n", flush=True)
+        # 1. TEXT TEST (Natural Language - Filtered, No Code)
+        text_prompt = "The future of artificial intelligence is"
+        context_text = torch.tensor([encode(text_prompt)], dtype=torch.long, device=device)
+        raw_text_gen = decode(model.generate(context_text, max_new_tokens=80)[0].tolist())
+        clean_text_gen = filter_code_output(raw_text_gen)
+
+        print(f"[TEXT TEST]", flush=True)
+        print(f"Prompt: {text_prompt}", flush=True)
+        print(f"Completion (Natural Language): {clean_text_gen}\n", flush=True)
+
+        # 2. CODE TEST (Clock App Generation in Python / JavaScript - Code Permitted)
+        code_prompts = [
+            "def create_python_clock_app():\n    # Write a simple clock app in Python using tkinter:\n",
+            "// Write a simple clock app in JavaScript:\nfunction createClock() {\n"
+        ]
+        code_prompt = random.choice(code_prompts)
+        context_code = torch.tensor([encode(code_prompt)], dtype=torch.long, device=device)
+        raw_code_gen = decode(model.generate(context_code, max_new_tokens=120)[0].tolist())
+
+        print(f"[CODE TEST - CLOCK APP GENERATION]", flush=True)
+        print(f"Prompt: {code_prompt.strip()}", flush=True)
+        print(f"Completion (Code Permitted):\n{raw_code_gen}", flush=True)
+        print(f"==================================================\n", flush=True)
+
         model.train()
 
 # --- PHASE 2: SUPERVISED FINE-TUNING (SFT) ---
@@ -364,7 +392,7 @@ SFT_DATASET = [
     }
 ]
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=5e-5) if 'bnb' in sys.modules else torch.optim.AdamW(model.parameters(), lr=5e-5)
 sft_epochs = 5
 
 for epoch in range(sft_epochs):
@@ -398,4 +426,4 @@ for epoch in range(sft_epochs):
 
 with open("ashen_gpt_model.pk1", "wb") as f:
     pickle.dump(model, f)
-print("Training & Supervised Fine-Tuning complete! Optimized model saved to ashen_gpt_model.pk1", flush=True)
+print("Training & Supervised Fine-Tuning complete! Peak 450M Qwen-architectured model saved to ashen_gpt_model.pk1", flush=True)
