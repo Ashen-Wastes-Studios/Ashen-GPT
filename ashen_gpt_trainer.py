@@ -6,20 +6,24 @@ import mmap
 import random
 import os
 import pickle
+import math
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"Using device: {device}")
+print(f"Using optimized device: {device}")
 
-# Ashen GPT Hyperparameters (Optimized for 8GB VRAM)
+# Ashen GPT Hyperparameters (Optimized for 8GB VRAM with AMP)
 block_size = 256
-batch_size = 8
-max_iters = 500
-eval_interval = 100
+batch_size = 16  # Increased batch size enabled by AMP mixed precision
+gradient_accumulation_steps = 2  # Effective batch size = 32
+max_iters = 1000
+eval_interval = 200
 learning_rate = 3e-4
+min_learning_rate = 3e-5
+warmup_iters = 100
 eval_iters = 50
 n_embd = 384
-n_layer = 6
-n_head = 6
+n_layer = 8
+n_head = 8
 dropout = 0.2
 num_experts = 4
 top_k = 2
@@ -71,23 +75,27 @@ def get_batch(split):
     return x.to(device), y.to(device)
 
 class Head(nn.Module):
+    """ Optimized FlashAttention / Scaled Dot-Product Attention """
     def __init__(self, head_size):
         super().__init__()
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = dropout
 
     def forward(self, x):
         B, T, C = x.shape
         k = self.key(x)
         q = self.query(x)
-        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
-        tril = torch.tril(torch.ones(T, T, device=x.device))
-        wei = wei.masked_fill(tril == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-        return wei @ self.value(x)
+        v = self.value(x)
+        
+        out = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=None, 
+            dropout_p=self.dropout if self.training else 0.0, 
+            is_causal=True
+        )
+        return out
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
@@ -105,7 +113,7 @@ class Expert(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(4 * n_embd, n_embd),
             nn.Dropout(dropout),
         )
@@ -201,9 +209,19 @@ class AshenGPTLanguageModel(nn.Module):
             index = torch.cat((index, index_next), dim=-1)
         return index
 
-print("Initializing Ashen GPT Model...")
+print("Initializing Optimized Ashen GPT Model...")
 model = AshenGPTLanguageModel(vocab_size).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+scaler = torch.amp.GradScaler('cuda' if device == 'cuda' else 'cpu')
+
+def get_lr(it):
+    if it < warmup_iters:
+        return learning_rate * (it + 1) / warmup_iters
+    if it > max_iters:
+        return min_learning_rate
+    decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+    return min_learning_rate + coeff * (learning_rate - min_learning_rate)
 
 @torch.no_grad()
 def estimate_loss():
@@ -213,33 +231,49 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
-            _, loss = model(X, Y)
+            with torch.amp.autocast('cuda' if device == 'cuda' else 'cpu'):
+                _, loss = model(X, Y)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
 
-print("Starting Ashen GPT training loop...")
+print("Starting Optimized Ashen GPT training loop with AMP and Cosine LR...")
+optimizer.zero_grad(set_to_none=True)
+
 for iter in range(max_iters):
-    print(f"Iteration {iter}/{max_iters}", flush=True)
+    lr = get_lr(iter)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     if iter % eval_interval == 0:
         losses = estimate_loss()
-        print(f"step {iter}: train loss {losses['train']:.3f}, val loss {losses['val']:.3f}")
+        print(f"step {iter}: train loss {losses['train']:.3f}, val loss {losses['val']:.3f} | lr {lr:.5f}")
         
         model.eval()
-        context = torch.tensor([encode("Once upon a time")], dtype=torch.long, device=device)
+        context = torch.tensor([encode("import os\ndef ")], dtype=torch.long, device=device)
         generated = decode(model.generate(context, max_new_tokens=100)[0].tolist())
         print(f"\n--- Ashen GPT Sample Gen at Step {iter} ---")
         print(generated)
         print("-" * 40, "\n")
         model.train()
 
-    xb, yb = get_batch('train')
-    logits, loss = model.forward(xb, yb)
+    loss_accum = 0.0
+    for micro_step in range(gradient_accumulation_steps):
+        xb, yb = get_batch('train')
+        with torch.amp.autocast('cuda' if device == 'cuda' else 'cpu'):
+            logits, loss = model.forward(xb, yb)
+            loss = loss / gradient_accumulation_steps
+            loss_accum += loss.detach().item()
+        
+        scaler.scale(loss).backward()
+
+    scaler.unscale_(optimizer)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    scaler.step(optimizer)
+    scaler.update()
     optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    optimizer.step()
 
 with open("ashen_gpt_model.pk1", "wb") as f:
     pickle.dump(model, f)
-print("Training complete! Model saved to ashen_gpt_model.pk1")
+print("Training complete! Optimized model saved to ashen_gpt_model.pk1")
