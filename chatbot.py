@@ -20,8 +20,8 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 print(device)
 
-batch_size = int(args.batch_size)
-block_size = 128
+batch_size = 32
+block_size = 512
 max_iters = 10000
 eval_interval = 100
 learning_rate = 3e-4
