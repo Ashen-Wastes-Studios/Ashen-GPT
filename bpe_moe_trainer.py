@@ -11,17 +11,17 @@ device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using device: {device}")
 
 # Hyperparameters
-block_size = 512
-batch_size = 32
+block_size = 256
+batch_size = 8
 max_iters = 500
 eval_interval = 100
 learning_rate = 3e-4
 eval_iters = 50
-n_embd = 768
-n_layer = 12
-n_head = 12
+n_embd = 384
+n_layer = 6
+n_head = 6
 dropout = 0.2
-num_experts = 8
+num_experts = 4
 top_k = 2
 
 # Initialize BPE Tokenizer (GPT-2 encoding)
@@ -224,6 +224,7 @@ def estimate_loss():
 
 print("Starting training loop...")
 for iter in range(max_iters):
+    print(iter)
     if iter % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.3f}, val loss {losses['val']:.3f}")

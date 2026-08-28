@@ -8,12 +8,12 @@ import os
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
-block_size = 512
-n_embd = 768
-n_layer = 12
-n_head = 12
+block_size = 256
+n_embd = 384
+n_layer = 6
+n_head = 6
 dropout = 0.2
-num_experts = 8
+num_experts = 4
 top_k = 2
 
 # Initialize BPE Tokenizer (GPT-2 encoding)
