@@ -14,8 +14,8 @@ import re
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
-# --- 250M Parameter Scale ---
-block_size = 512
+# --- 250M Parameter Scale with Ultra-Long 32K Context Window for Inference ---
+block_size = 32768
 n_embd = 768
 n_layer = 10
 n_head = 12
@@ -59,7 +59,7 @@ class RMSNorm(nn.Module):
         return self.weight * x * torch.rsqrt(norm + self.eps)
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=2048, theta=10000.0):
+    def __init__(self, dim, max_seq_len=65536, theta=10000.0):
         super().__init__()
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -185,7 +185,7 @@ class AshenGPTLanguageModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         head_size = n_embd // n_head
-        self.rotary_emb = RotaryEmbedding(head_size, max_seq_len=block_size * 2)
+        self.rotary_emb = RotaryEmbedding(head_size, max_seq_len=65536)
         self.blocks = nn.ModuleList([Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = RMSNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
@@ -269,7 +269,7 @@ class ReasoningEngine:
 reasoner = ReasoningEngine(m, decode, encode, device)
 
 if __name__ == "__main__":
-    print("\n--- Ashen GPT Chatbot Ready (Smart Code Output Mode) ---")
+    print("\n--- Ashen GPT Chatbot Ready (Smart Code Output Mode & 32K Context) ---")
     while True:
         try:
             prompt = input("\nPrompt:\n> ")

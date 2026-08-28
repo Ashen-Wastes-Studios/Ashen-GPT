@@ -19,19 +19,20 @@ import re
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using optimized device: {device}")
 
-# --- Peak Safe Limit for 8GB GPU (~450M Parameters) ---
-block_size = 256
-batch_size = 4
-gradient_accumulation_steps = 8
+# --- Progressive Multi-Hop Staged Training Configuration ---
+# Stage 1: Core Training (Context: 2,048 tokens) -> iters 0 to 1200
+# Stage 2: Intermediate Extension (Context: 8,192 tokens) -> iters 1201 to 1800
+# Stage 3: Extreme Extension (Context: 32,768 tokens) -> iters 1801 to 2000
+
 max_iters = 2000
-eval_interval = 20
+eval_interval = 50
 learning_rate = 3e-4
 min_learning_rate = 3e-5
-warmup_iters = 20
+warmup_iters = 50
 eval_iters = 20
-n_embd = 896
-n_layer = 16
-n_head = 14
+n_embd = 768
+n_layer = 10
+n_head = 12
 dropout = 0.1
 num_experts = 4
 top_k = 2
@@ -50,7 +51,7 @@ def filter_code_output(text):
     text_clean = re.sub(r'`[^`]*`', '', text_no_blocks)
     return text_clean
 
-def get_random_chunk(split):
+def get_random_chunk(split, current_block_size):
     if split == 'train':
         train_files = ["train_split.txt"]
         if os.path.exists("code_train_split.txt"):
@@ -62,12 +63,12 @@ def get_random_chunk(split):
             filename = "train_split.txt"
 
     if not os.path.exists(filename):
-        return torch.tensor(encode("Hello world! Ashen GPT hybrid training test. " * 50), dtype=torch.long)
+        return torch.tensor(encode("Hello world! Ashen GPT hybrid training test. " * (current_block_size // 10)), dtype=torch.long)
 
     with open(filename, 'rb') as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
             file_size = len(mm)
-            chunk_size = min(file_size, block_size * batch_size * 16)
+            chunk_size = min(file_size, current_block_size * 4 * 4)
             max_start = file_size - chunk_size
             start_pos = random.randint(0, max(0, max_start))
             mm.seek(start_pos)
@@ -76,21 +77,21 @@ def get_random_chunk(split):
             tokens = encode(decoded_text)
             return torch.tensor(tokens, dtype=torch.long)
 
-def get_batch(split):
-    data_chunk = get_random_chunk(split)
-    if len(data_chunk) <= block_size + 10:
-        fallback_text = "Fallback training sentence for Ashen GPT large language model training. " * 100
+def get_batch(split, current_block_size, current_batch_size):
+    data_chunk = get_random_chunk(split, current_block_size)
+    if len(data_chunk) <= current_block_size + 10:
+        fallback_text = "Fallback training sentence for Ashen GPT progressive training pipeline. " * (current_block_size // 10 + 5)
         data_chunk = torch.tensor(encode(fallback_text), dtype=torch.long)
 
     data_chunk = torch.clamp(data_chunk, min=0, max=vocab_size - 1)
 
-    max_idx = len(data_chunk) - block_size
-    ix = torch.randint(0, max_idx, (batch_size,))
-    x = torch.stack([data_chunk[i:i+block_size] for i in ix])
-    y = torch.stack([data_chunk[i+1:i+block_size+1] for i in ix])
+    max_idx = len(data_chunk) - current_block_size
+    ix = torch.randint(0, max_idx, (current_batch_size,))
+    x = torch.stack([data_chunk[i:i+current_block_size] for i in ix])
+    y = torch.stack([data_chunk[i+1:i+current_block_size+1] for i in ix])
     return x.to(device), y.to(device)
 
-# --- Qwen-like Architecture Components ---
+# --- Qwen-like Architecture Components with Dynamic NTK RoPE Scaling ---
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -103,22 +104,34 @@ class RMSNorm(nn.Module):
         return self.weight * x * torch.rsqrt(norm + self.eps)
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim, max_seq_len=2048, theta=10000.0):
+    def __init__(self, dim, max_seq_len=65536, theta=10000.0):
         super().__init__()
+        self.dim = dim
+        self.theta = theta
+        self.max_seq_len = max_seq_len
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("inv_freq_buf", inv_freq, persistent=False)
         self._set_cos_sin_cache(max_seq_len)
 
-    def _set_cos_sin_cache(self, seq_len):
-        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
+    def _set_cos_sin_cache(self, seq_len, scale=1.0):
+        inv_freq = self.inv_freq_buf / scale
+        t = torch.arange(seq_len, device=inv_freq.device, dtype=inv_freq.dtype)
+        freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, seq_len):
-        if seq_len > self.cos_cached.size(0):
-            self._set_cos_sin_cache(seq_len)
+    def forward(self, seq_len, current_block_size=2048):
+        # Dynamic NTK Scaling for contexts > 2048
+        base_block_size = 2048
+        if seq_len > base_block_size:
+            scale = (seq_len / base_block_size) ** (self.dim / (self.dim - 2))
+        else:
+            scale = 1.0
+
+        needed_len = max(seq_len, self.max_seq_len)
+        if needed_len > self.cos_cached.size(0) or scale != 1.0:
+            self._set_cos_sin_cache(needed_len, scale=scale)
         return self.cos_cached[:seq_len, :], self.sin_cached[:seq_len, :]
 
 def rotate_half(x):
@@ -146,7 +159,7 @@ class MultiHeadAttention(nn.Module):
         self.k_norm = RMSNorm(head_size)
         self.dropout = dropout
 
-    def forward(self, x, rope_cache):
+    def forward(self, x, rope_cache, current_block_size):
         B, T, C = x.shape
         q = self.query(x).view(B, T, self.num_heads, self.head_size)
         k = self.key(x).view(B, T, self.num_heads, self.head_size)
@@ -219,36 +232,34 @@ class Block(nn.Module):
         self.ln1 = RMSNorm(n_embd)
         self.ln2 = RMSNorm(n_embd)
 
-    def forward(self, x, rope_cache):
-        def custom_forward(tensor_x):
-            tensor_x = tensor_x + self.sa(self.ln1(tensor_x), rope_cache)
-            tensor_x = tensor_x + self.ffwd(self.ln2(tensor_x))
-            return tensor_x
-        return torch.utils.checkpoint.checkpoint(custom_forward, x, use_reentrant=False)
+    def forward(self, x, rope_cache, current_block_size):
+        x = x + self.sa(self.ln1(x), rope_cache, current_block_size)
+        x = x + self.ffwd(self.ln2(x))
+        return x
 
 class AshenGPTLanguageModel(nn.Module):
     def __init__(self, vocab_size):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         head_size = n_embd // n_head
-        self.rotary_emb = RotaryEmbedding(head_size, max_seq_len=block_size * 2)
+        self.rotary_emb = RotaryEmbedding(head_size, max_seq_len=65536)
         self.blocks = nn.ModuleList([Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = RMSNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
-    def forward(self, index, targets=None):
+    def forward(self, index, targets=None, current_block_size=2048):
         B, T = index.shape
-        if T > block_size:
-            index = index[:, -block_size:]
+        if T > current_block_size:
+            index = index[:, -current_block_size:]
             B, T = index.shape
 
         index = torch.clamp(index, min=0, max=self.token_embedding_table.num_embeddings - 1)
         x = self.token_embedding_table(index)
 
-        rope_cache = self.rotary_emb(T)
+        rope_cache = self.rotary_emb(T, current_block_size)
 
         for block in self.blocks:
-            x = block(x, rope_cache)
+            x = block(x, rope_cache, current_block_size)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -262,10 +273,10 @@ class AshenGPTLanguageModel(nn.Module):
             loss = F.cross_entropy(logits, targets)
         return logits, loss
 
-    def generate(self, index, max_new_tokens, temperature=0.8, top_k=50):
+    def generate(self, index, max_new_tokens, current_block_size=2048, temperature=0.8, top_k=50):
         for _ in range(max_new_tokens):
-            index_cond = index[:, -block_size:]
-            logits, loss = self.forward(index_cond)
+            index_cond = index[:, -current_block_size:]
+            logits, loss = self.forward(index_cond, current_block_size=current_block_size)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -275,20 +286,13 @@ class AshenGPTLanguageModel(nn.Module):
             index = torch.cat((index, index_next), dim=-1)
         return index
 
-print("Initializing Peak Safe 450M Qwen-Architectured Ashen GPT Model...")
+print("Initializing 250M Qwen-Architectured Ashen GPT Model (Progressive Staged Training)...")
 model = AshenGPTLanguageModel(vocab_size).to(device)
 
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Total Model Parameters: {total_params / 1e6:.2f} Million")
 
-try:
-    import bitsandbytes as bnb
-    optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
-    print("Using bitsandbytes 8-bit AdamW optimizer for VRAM savings.")
-except Exception:
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    print("Using standard torch AdamW optimizer.")
-
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 scaler = torch.amp.GradScaler('cuda' if device == 'cuda' else 'cpu')
 
 def get_lr(it):
@@ -301,22 +305,22 @@ def get_lr(it):
     return min_learning_rate + coeff * (learning_rate - min_learning_rate)
 
 @torch.no_grad()
-def estimate_loss():
+def estimate_loss(current_block_size, current_batch_size):
     out = {}
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
-            X, Y = get_batch(split)
+            X, Y = get_batch(split, current_block_size, current_batch_size)
             with torch.amp.autocast('cuda' if device == 'cuda' else 'cpu'):
-                _, loss = model(X, Y)
+                _, loss = model(X, Y, current_block_size=current_block_size)
             losses[k] = loss.item()
         out[split] = losses.mean()
     model.train()
     return out
 
-# --- PHASE 1: PRE-TRAINING ---
-print("=== PHASE 1: Pre-training Peak 450M Model (With Gradient Checkpointing) ===", flush=True)
+# --- PROGRESSIVE STAGED TRAINING LOOP (2k -> 8k -> 32k) ---
+print("=== Starting Progressive Staged Training Pipeline ===", flush=True)
 optimizer.zero_grad(set_to_none=True)
 
 for iter in range(max_iters):
@@ -325,11 +329,28 @@ for iter in range(max_iters):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+    # Determine current training stage based on iteration
+    if iter <= 1200:
+        stage_name = "Stage 1: Core Training"
+        current_block_size = 2048
+        current_batch_size = 2
+        gradient_accumulation_steps = 8
+    elif iter <= 1800:
+        stage_name = "Stage 2: Intermediate Extension"
+        current_block_size = 8192
+        current_batch_size = 1
+        gradient_accumulation_steps = 16
+    else:
+        stage_name = "Stage 3: Extreme Extension"
+        current_block_size = 32768
+        current_batch_size = 1
+        gradient_accumulation_steps = 32
+
     loss_accum = 0.0
     for micro_step in range(gradient_accumulation_steps):
-        xb, yb = get_batch('train')
+        xb, yb = get_batch('train', current_block_size, current_batch_size)
         with torch.amp.autocast('cuda' if device == 'cuda' else 'cpu'):
-            logits, loss = model.forward(xb, yb)
+            logits, loss = model.forward(xb, yb, current_block_size=current_block_size)
             loss = loss / gradient_accumulation_steps
             loss_accum += loss.detach().item()
 
@@ -342,28 +363,26 @@ for iter in range(max_iters):
     optimizer.zero_grad(set_to_none=False)
 
     elapsed = time.time() - iter_start
-    print(f"[STEP {iter+1}/{max_iters}] Loss: {loss_accum:.4f} | LR: {lr:.6f} | Time: {elapsed:.1f}s", flush=True)
+    print(f"[{stage_name} | STEP {iter+1}/{max_iters} | Ctx: {current_block_size}] Loss: {loss_accum:.4f} | LR: {lr:.6f} | Time: {elapsed:.1f}s", flush=True)
 
     if iter > 0 and iter % eval_interval == 0:
         print(f"\n==================================================", flush=True)
-        print(f"--- EVALUATION & GENERATION TESTS AT STEP {iter} ---", flush=True)
+        print(f"--- EVALUATION ({stage_name} - Ctx: {current_block_size}) ---", flush=True)
         print(f"==================================================", flush=True)
-        losses = estimate_loss()
+        losses = estimate_loss(current_block_size, current_batch_size)
         print(f"Eval Results -> Train Loss: {losses['train']:.3f} | Val Loss: {losses['val']:.3f}\n", flush=True)
 
         model.eval()
 
-        # 1. TEXT TEST (Natural Language - Filtered, No Code)
         text_prompt = "The future of artificial intelligence is"
         context_text = torch.tensor([encode(text_prompt)], dtype=torch.long, device=device)
-        raw_text_gen = decode(model.generate(context_text, max_new_tokens=80)[0].tolist())
+        raw_text_gen = decode(model.generate(context_text, max_new_tokens=100, current_block_size=current_block_size)[0].tolist())
         clean_text_gen = filter_code_output(raw_text_gen)
 
         print(f"[TEXT TEST]", flush=True)
         print(f"Prompt: {text_prompt}", flush=True)
         print(f"Completion (Natural Language): {clean_text_gen}\n", flush=True)
 
-        # 2. CODE TESTS (Clock App Generation across Python, JavaScript/TypeScript, Go, Rust, C++, Ruby)
         clock_app_prompts = [
             ("Python", "def create_python_clock():\n    # Write a clock app in Python:\n"),
             ("JavaScript / TypeScript", "function createClockApp() {\n    // Write a clock app in JavaScript:\n"),
@@ -376,7 +395,7 @@ for iter in range(max_iters):
         print(f"[CODE TESTS - CLOCK APP GENERATION ACROSS 6 LANGUAGES]", flush=True)
         for lang, prompt_snippet in clock_app_prompts:
             context_code = torch.tensor([encode(prompt_snippet)], dtype=torch.long, device=device)
-            raw_code_gen = decode(model.generate(context_code, max_new_tokens=80)[0].tolist())
+            raw_code_gen = decode(model.generate(context_code, max_new_tokens=100, current_block_size=current_block_size)[0].tolist())
             print(f"--- Language: {lang} ---", flush=True)
             print(f"Prompt: {prompt_snippet.strip()}", flush=True)
             print(f"Completion:\n{raw_code_gen}\n", flush=True)
@@ -385,7 +404,7 @@ for iter in range(max_iters):
         model.train()
 
 # --- PHASE 2: SUPERVISED FINE-TUNING (SFT) ---
-print("\n=== PHASE 2: Supervised Fine-Tuning (SFT) ===", flush=True)
+print("\n=== PHASE 2: Supervised Fine-Tuning (SFT at 32K Target Context) ===", flush=True)
 SFT_DATASET = [
     {
         "instruction": "Explain how python lists work.",
@@ -397,8 +416,8 @@ SFT_DATASET = [
     }
 ]
 
-optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=5e-5) if 'bnb' in sys.modules else torch.optim.AdamW(model.parameters(), lr=5e-5)
-sft_epochs = 5
+optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
+sft_epochs = 3
 
 for epoch in range(sft_epochs):
     total_sft_loss = 0.0
@@ -407,15 +426,15 @@ for epoch in range(sft_epochs):
     for item_idx, item in enumerate(SFT_DATASET):
         prompt_text = f"### Instruction:\n{item['instruction']}\n\n### Response:\n{item['response']}<|endoftext|>"
         tokens = encode(prompt_text)
-        if len(tokens) > block_size:
-            tokens = tokens[:block_size]
+        if len(tokens) > 32768:
+            tokens = tokens[:32768]
 
         x = torch.tensor(tokens[:-1], dtype=torch.long, device=device).unsqueeze(0)
         y = torch.tensor(tokens[1:], dtype=torch.long, device=device).unsqueeze(0)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast('cuda' if device == 'cuda' else 'cpu'):
-            _, loss = model(x, y)
+            _, loss = model(x, y, current_block_size=32768)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -431,4 +450,4 @@ for epoch in range(sft_epochs):
 
 with open("ashen_gpt_model.pk1", "wb") as f:
     pickle.dump(model, f)
-print("Training & Supervised Fine-Tuning complete! Peak 450M Qwen-architectured model saved to ashen_gpt_model.pk1", flush=True)
+print("Training & Supervised Fine-Tuning complete! Staged 32K model saved to ashen_gpt_model.pk1", flush=True)
