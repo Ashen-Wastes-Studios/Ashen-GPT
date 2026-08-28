@@ -15,24 +15,22 @@ import pickle
 import math
 import time
 import re
+import gc
+import copy
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using optimized device: {device}")
 
-# --- Progressive Multi-Hop Staged Training Configuration ---
-# Stage 1: Core Training (Context: 2,048 tokens) -> iters 0 to 1200
-# Stage 2: Intermediate Extension (Context: 8,192 tokens) -> iters 1201 to 1800
-# Stage 3: Extreme Extension (Context: 32,768 tokens) -> iters 1801 to 2000
-
-max_iters = 2000
-eval_interval = 50
-learning_rate = 3e-4
+# --- Progressive Multi-Hop Staged Training Configuration (Fast 500 Max Iters) ---
+max_iters = 500                 # Reduced max_iters for lightning-fast training completion
+eval_interval = 100             # Frequent evaluation checkpoints
+learning_rate = 4e-4
 min_learning_rate = 3e-5
-warmup_iters = 50
-eval_iters = 20
-n_embd = 768
-n_layer = 10
-n_head = 12
+warmup_iters = 100
+eval_iters = 100
+n_embd = 512
+n_layer = 8
+n_head = 8
 dropout = 0.1
 num_experts = 4
 top_k = 2
@@ -122,7 +120,6 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
     def forward(self, seq_len, current_block_size=2048):
-        # Dynamic NTK Scaling for contexts > 2048
         base_block_size = 2048
         if seq_len > base_block_size:
             scale = (seq_len / base_block_size) ** (self.dim / (self.dim - 2))
@@ -233,8 +230,16 @@ class Block(nn.Module):
         self.ln2 = RMSNorm(n_embd)
 
     def forward(self, x, rope_cache, current_block_size):
-        x = x + self.sa(self.ln1(x), rope_cache, current_block_size)
-        x = x + self.ffwd(self.ln2(x))
+        if self.training and current_block_size > 2048:
+            x = x + torch.utils.checkpoint.checkpoint(
+                lambda inp, rc: self.sa(self.ln1(inp), rc, current_block_size),
+                x, rope_cache,
+                use_reentrant=False
+            )
+            x = x + self.ffwd(self.ln2(x))
+        else:
+            x = x + self.sa(self.ln1(x), rope_cache, current_block_size)
+            x = x + self.ffwd(self.ln2(x))
         return x
 
 class AshenGPTLanguageModel(nn.Module):
@@ -286,13 +291,38 @@ class AshenGPTLanguageModel(nn.Module):
             index = torch.cat((index, index_next), dim=-1)
         return index
 
-print("Initializing 250M Qwen-Architectured Ashen GPT Model (Progressive Staged Training)...")
-model = AshenGPTLanguageModel(vocab_size).to(device)
+model_path = "ashen_gpt_model.pk1"
+if os.path.exists(model_path):
+    print(f"Detected existing model checkpoint at {model_path}. Upscaling model by 2x depth (doubling layers)...")
+    with open(model_path, "rb") as f:
+        model = pickle.load(f)
+    
+    old_layer_count = len(model.blocks)
+    model.blocks = nn.ModuleList([copy.deepcopy(block) for block in model.blocks] + [copy.deepcopy(block) for block in model.blocks])
+    new_layer_count = len(model.blocks)
+    print(f"Model successfully upscaled by 2x depth! Layers doubled from {old_layer_count} to {new_layer_count}.")
+    
+    with open(model_path, "wb") as f:
+        pickle.dump(model, f)
+    print(f"Upscaled model saved back to {model_path}.")
+    model = model.to(device)
+else:
+    print("Initializing ~127M Qwen-Architectured Ashen GPT Model (Fast 500 Iters)...")
+    model = AshenGPTLanguageModel(vocab_size).to(device)
+
+try:
+    if hasattr(torch, 'compile') and os.name != 'nt':
+        print("Compiling model with torch.compile...")
+        model = torch.compile(model)
+    else:
+        print("Running in highly optimized PyTorch eager mode.")
+except Exception as e:
+    print(f"torch.compile skipped: {e}")
 
 total_params = sum(p.numel() for p in model.parameters())
 print(f"Total Model Parameters: {total_params / 1e6:.2f} Million")
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, fused=True if device == 'cuda' else False)
 scaler = torch.amp.GradScaler('cuda' if device == 'cuda' else 'cpu')
 
 def get_lr(it):
@@ -319,8 +349,8 @@ def estimate_loss(current_block_size, current_batch_size):
     model.train()
     return out
 
-# --- PROGRESSIVE STAGED TRAINING LOOP (2k -> 8k -> 32k) ---
-print("=== Starting Progressive Staged Training Pipeline ===", flush=True)
+# --- PROGRESSIVE STAGED TRAINING LOOP (2k -> 8k -> 32k scaled to 500 iters) ---
+print("=== Starting Lightning-Fast Progressive Staged Training Pipeline (500 Iters) ===", flush=True)
 optimizer.zero_grad(set_to_none=True)
 
 for iter in range(max_iters):
@@ -329,22 +359,22 @@ for iter in range(max_iters):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # Determine current training stage based on iteration
-    if iter <= 1200:
+    # Determine current training stage based on iteration (scaled for 500 max_iters)
+    if iter <= 300:
         stage_name = "Stage 1: Core Training"
+        current_block_size = 512
+        current_batch_size = 8
+        gradient_accumulation_steps = 2
+    elif iter <= 450:
+        stage_name = "Stage 2: Intermediate Extension"
         current_block_size = 2048
         current_batch_size = 2
         gradient_accumulation_steps = 8
-    elif iter <= 1800:
-        stage_name = "Stage 2: Intermediate Extension"
+    else:
+        stage_name = "Stage 3: Extreme Extension"
         current_block_size = 8192
         current_batch_size = 1
         gradient_accumulation_steps = 16
-    else:
-        stage_name = "Stage 3: Extreme Extension"
-        current_block_size = 32768
-        current_batch_size = 1
-        gradient_accumulation_steps = 32
 
     loss_accum = 0.0
     for micro_step in range(gradient_accumulation_steps):
@@ -361,6 +391,7 @@ for iter in range(max_iters):
     scaler.step(optimizer)
     scaler.update()
     optimizer.zero_grad(set_to_none=False)
+    torch.cuda.empty_cache()
 
     elapsed = time.time() - iter_start
     print(f"[{stage_name} | STEP {iter+1}/{max_iters} | Ctx: {current_block_size}] Loss: {loss_accum:.4f} | LR: {lr:.6f} | Time: {elapsed:.1f}s", flush=True)
@@ -402,6 +433,8 @@ for iter in range(max_iters):
 
         print(f"==================================================\n", flush=True)
         model.train()
+        torch.cuda.empty_cache()
+        gc.collect()
 
 # --- PHASE 2: SUPERVISED FINE-TUNING (SFT) ---
 print("\n=== PHASE 2: Supervised Fine-Tuning (SFT at 32K Target Context) ===", flush=True)
@@ -416,8 +449,8 @@ SFT_DATASET = [
     }
 ]
 
-optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
-sft_epochs = 3
+optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, fused=True if device == 'cuda' else False)
+sft_epochs = 2
 
 for epoch in range(sft_epochs):
     total_sft_loss = 0.0
@@ -426,28 +459,31 @@ for epoch in range(sft_epochs):
     for item_idx, item in enumerate(SFT_DATASET):
         prompt_text = f"### Instruction:\n{item['instruction']}\n\n### Response:\n{item['response']}<|endoftext|>"
         tokens = encode(prompt_text)
-        if len(tokens) > 32768:
-            tokens = tokens[:32768]
+        if len(tokens) > 8192:
+            tokens = tokens[:8192]
 
         x = torch.tensor(tokens[:-1], dtype=torch.long, device=device).unsqueeze(0)
         y = torch.tensor(tokens[1:], dtype=torch.long, device=device).unsqueeze(0)
 
         optimizer.zero_grad(set_to_none=True)
         with torch.amp.autocast('cuda' if device == 'cuda' else 'cpu'):
-            _, loss = model(x, y, current_block_size=32768)
+            _, loss = model(x, y, current_block_size=8192)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         scaler.step(optimizer)
         scaler.update()
+        torch.cuda.empty_cache()
 
         total_sft_loss += loss.item()
         print(f"[SFT Epoch {epoch+1}/{sft_epochs} | Item {item_idx+1}/{len(SFT_DATASET)}] Loss: {loss.item():.4f}", flush=True)
 
     avg_loss = total_sft_loss / len(SFT_DATASET)
     print(f"SFT Epoch {epoch+1} Completed | Avg Loss: {avg_loss:.4f}\n", flush=True)
+    torch.cuda.empty_cache()
+    gc.collect()
 
 with open("ashen_gpt_model.pk1", "wb") as f:
     pickle.dump(model, f)
-print("Training & Supervised Fine-Tuning complete! Staged 32K model saved to ashen_gpt_model.pk1", flush=True)
+print("Training & Supervised Fine-Tuning complete! Staged 8K model saved to ashen_gpt_model.pk1", flush=True)

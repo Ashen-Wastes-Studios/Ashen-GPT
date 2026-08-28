@@ -14,11 +14,11 @@ import re
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
-# --- 250M Parameter Scale with Ultra-Long 32K Context Window for Inference ---
-block_size = 32768
-n_embd = 768
-n_layer = 10
-n_head = 12
+# --- ~127M Parameter Scale with 8K Context Window for Inference ---
+block_size = 8192
+n_embd = 512
+n_layer = 8
+n_head = 8
 dropout = 0.1
 num_experts = 4
 top_k = 2
@@ -34,7 +34,7 @@ decode = lambda l: enc.decode(l)
 def user_wants_code(prompt):
     """Detects if the user explicitly asked for code, scripts, functions, or syntax."""
     code_keywords = [
-        'code', 'write a', 'function', 'script', 'program', 'python', 'javascript', 
+        'code', 'write a', 'function', 'script', 'program', 'python', 'javascript',
         'html', 'css', 'sql', 'syntax', 'class ', 'def ', 'implementation', 'algorithm'
     ]
     prompt_lower = prompt.lower()
@@ -46,7 +46,7 @@ def filter_code_output(text):
     text_clean = re.sub(r'`[^`]*`', '', text_no_blocks)
     return text_clean
 
-# --- Qwen-like Architecture Components ---
+# --- Qwen-like Architecture Components with Dynamic NTK RoPE Scaling ---
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -61,20 +61,31 @@ class RMSNorm(nn.Module):
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim, max_seq_len=65536, theta=10000.0):
         super().__init__()
+        self.dim = dim
+        self.theta = theta
+        self.max_seq_len = max_seq_len
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.register_buffer("inv_freq_buf", inv_freq, persistent=False)
         self._set_cos_sin_cache(max_seq_len)
 
-    def _set_cos_sin_cache(self, seq_len):
-        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.outer(t, self.inv_freq)
+    def _set_cos_sin_cache(self, seq_len, scale=1.0):
+        inv_freq = self.inv_freq_buf / scale
+        t = torch.arange(seq_len, device=inv_freq.device, dtype=inv_freq.dtype)
+        freqs = torch.outer(t, inv_freq)
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
 
-    def forward(self, seq_len):
-        if seq_len > self.cos_cached.size(0):
-            self._set_cos_sin_cache(seq_len)
+    def forward(self, seq_len, current_block_size=8192):
+        base_block_size = 2048
+        if seq_len > base_block_size:
+            scale = (seq_len / base_block_size) ** (self.dim / (self.dim - 2))
+        else:
+            scale = 1.0
+
+        needed_len = max(seq_len, self.max_seq_len)
+        if needed_len > self.cos_cached.size(0) or scale != 1.0:
+            self._set_cos_sin_cache(needed_len, scale=scale)
         return self.cos_cached[:seq_len, :], self.sin_cached[:seq_len, :]
 
 def rotate_half(x):
@@ -97,12 +108,12 @@ class MultiHeadAttention(nn.Module):
         self.key = nn.Linear(n_embd, self.hidden_dim, bias=False)
         self.value = nn.Linear(n_embd, self.hidden_dim, bias=False)
         self.proj = nn.Linear(self.hidden_dim, n_embd, bias=False)
-        
+
         self.q_norm = RMSNorm(head_size)
         self.k_norm = RMSNorm(head_size)
         self.dropout = dropout
 
-    def forward(self, x, rope_cache):
+    def forward(self, x, rope_cache, current_block_size):
         B, T, C = x.shape
         q = self.query(x).view(B, T, self.num_heads, self.head_size)
         k = self.key(x).view(B, T, self.num_heads, self.head_size)
@@ -175,8 +186,8 @@ class Block(nn.Module):
         self.ln1 = RMSNorm(n_embd)
         self.ln2 = RMSNorm(n_embd)
 
-    def forward(self, x, rope_cache):
-        x = x + self.sa(self.ln1(x), rope_cache)
+    def forward(self, x, rope_cache, current_block_size):
+        x = x + self.sa(self.ln1(x), rope_cache, current_block_size)
         x = x + self.ffwd(self.ln2(x))
         return x
 
@@ -190,19 +201,19 @@ class AshenGPTLanguageModel(nn.Module):
         self.ln_f = RMSNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
-    def forward(self, index, targets=None):
+    def forward(self, index, targets=None, current_block_size=8192):
         B, T = index.shape
-        if T > block_size:
-            index = index[:, -block_size:]
+        if T > current_block_size:
+            index = index[:, -current_block_size:]
             B, T = index.shape
 
         index = torch.clamp(index, min=0, max=self.token_embedding_table.num_embeddings - 1)
         x = self.token_embedding_table(index)
 
-        rope_cache = self.rotary_emb(T)
+        rope_cache = self.rotary_emb(T, current_block_size)
 
         for block in self.blocks:
-            x = block(x, rope_cache)
+            x = block(x, rope_cache, current_block_size)
 
         x = self.ln_f(x)
         logits = self.lm_head(x)
@@ -216,10 +227,10 @@ class AshenGPTLanguageModel(nn.Module):
             loss = F.cross_entropy(logits, targets)
         return logits, loss
 
-    def generate(self, index, max_new_tokens, temperature=0.8, top_k=50):
+    def generate(self, index, max_new_tokens, current_block_size=8192, temperature=0.8, top_k=50):
         for _ in range(max_new_tokens):
-            index_cond = index[:, -block_size:]
-            logits, loss = self.forward(index_cond)
+            index_cond = index[:, -current_block_size:]
+            logits, loss = self.forward(index_cond, current_block_size=current_block_size)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -252,24 +263,46 @@ class ReasoningEngine:
     @torch.no_grad()
     def solve_with_cot(self, prompt, max_new_tokens=250):
         self.model.eval()
-        cot_prompt = f"Problem: {prompt}\nLet's think step by step:\n<think>\n"
-        encoded = self.encode(cot_prompt)
+        formatted_prompt = f"### Instruction:\n{prompt}\n\n### Response:\n<think>\n"
+        encoded = self.encode(formatted_prompt)
         if len(encoded) > block_size:
             encoded = encoded[-block_size:]
         input_ids = torch.tensor([encoded], dtype=torch.long, device=self.device)
 
-        output_ids = self.model.generate(input_ids, max_new_tokens=max_new_tokens, temperature=0.8, top_k=50)
+        output_ids = self.model.generate(input_ids, max_new_tokens=max_new_tokens, current_block_size=block_size, temperature=0.7, top_k=40)
         raw_generated = self.decode(output_ids[0].tolist())
-        
-        if user_wants_code(prompt):
-            return raw_generated
+
+        if raw_generated.startswith(formatted_prompt):
+            response_text = raw_generated[len(formatted_prompt):]
         else:
-            return filter_code_output(raw_generated)
+            response_text = raw_generated
+
+        response_text = "<think>\n" + response_text
+
+        think_match = re.search(r'<think>([\s\S]*?)(?:</think>|$)', response_text)
+        if think_match:
+            thought_process = think_match.group(1).strip()
+            remainder_start = think_match.end()
+            final_answer = response_text[remainder_start:].replace('</think>', '').strip()
+        else:
+            thought_process = "Analyzing instruction internally..."
+            final_answer = response_text
+
+        if user_wants_code(prompt):
+            clean_final = final_answer
+        else:
+            clean_final = filter_code_output(final_answer)
+
+        GREY = "\033[90m"
+        RESET = "\033[0m"
+        print(f"\n{GREY}<think>\n{thought_process}\n</think>{RESET}")
+
+        return clean_final
 
 reasoner = ReasoningEngine(m, decode, encode, device)
 
 if __name__ == "__main__":
-    print("\n--- Ashen GPT Chatbot Ready (Smart Code Output Mode & 32K Context) ---")
+    print("\n--- Ashen GPT Chatbot Ready (~127M Scale & 8K Context) ---")
     while True:
         try:
             prompt = input("\nPrompt:\n> ")
