@@ -13,13 +13,13 @@ print(f"Using optimized device: {device}")
 
 # Ashen GPT Hyperparameters (Optimized for 8GB VRAM with AMP)
 block_size = 256
-batch_size = 16  # Increased batch size enabled by AMP mixed precision
-gradient_accumulation_steps = 2  # Effective batch size = 32
-max_iters = 1000
+batch_size = 16
+gradient_accumulation_steps = 2
+max_iters = 600  # Pre-training iterations
 eval_interval = 200
 learning_rate = 3e-4
 min_learning_rate = 3e-5
-warmup_iters = 100
+warmup_iters = 50
 eval_iters = 50
 n_embd = 384
 n_layer = 8
@@ -75,7 +75,6 @@ def get_batch(split):
     return x.to(device), y.to(device)
 
 class Head(nn.Module):
-    """ Optimized FlashAttention / Scaled Dot-Product Attention """
     def __init__(self, head_size):
         super().__init__()
         self.key = nn.Linear(n_embd, head_size, bias=False)
@@ -88,7 +87,6 @@ class Head(nn.Module):
         k = self.key(x)
         q = self.query(x)
         v = self.value(x)
-        
         out = F.scaled_dot_product_attention(
             q, k, v, 
             attn_mask=None, 
@@ -238,7 +236,8 @@ def estimate_loss():
     model.train()
     return out
 
-print("Starting Optimized Ashen GPT training loop with AMP and Cosine LR...")
+# --- PHASE 1: PRE-TRAINING ---
+print("=== PHASE 1: Pre-training on Hybrid Text & Code Corpus ===")
 optimizer.zero_grad(set_to_none=True)
 
 for iter in range(max_iters):
@@ -252,8 +251,8 @@ for iter in range(max_iters):
         
         model.eval()
         context = torch.tensor([encode("import os\ndef ")], dtype=torch.long, device=device)
-        generated = decode(model.generate(context, max_new_tokens=100)[0].tolist())
-        print(f"\n--- Ashen GPT Sample Gen at Step {iter} ---")
+        generated = decode(model.generate(context, max_new_tokens=80)[0].tolist())
+        print(f"\n--- Pre-training Sample Gen at Step {iter} ---")
         print(generated)
         print("-" * 40, "\n")
         model.train()
@@ -274,6 +273,58 @@ for iter in range(max_iters):
     scaler.update()
     optimizer.zero_grad(set_to_none=True)
 
+# --- PHASE 2: SUPERVISED FINE-TUNING (SFT) ---
+print("\n=== PHASE 2: Supervised Fine-Tuning (SFT) on Instruction-Response Pairs ===")
+SFT_DATASET = [
+    {
+        "instruction": "Explain how python lists work.",
+        "response": "<think>\nPython lists are dynamic arrays that support indexing, slicing, and mutable operations like append and pop.\n</think>\nPython lists are ordered, mutable collections of items in Python. They automatically resize as items are added or removed."
+    },
+    {
+        "instruction": "Write a python function to check if a number is prime.",
+        "response": "<think>\nA prime number is only divisible by 1 and itself. We check divisors up to the square root of n.\n</think>\n```python\ndef is_prime(n):\n    if n <= 1:\n        return False\n    for i in range(2, int(n**0.5) + 1):\n        if n % i == 0:\n            return False\n    return True\n```"
+    },
+    {
+        "instruction": "What is attention in transformers?",
+        "response": "<think>\nAttention computes relationships between tokens using Query, Key, and Value vectors.\n</think>\nAttention is a core transformer mechanism that calculates how much focus one token should place on other tokens in a sequence."
+    },
+    {
+        "instruction": "How do you reverse a string in python?",
+        "response": "<think>\nStrings can be reversed using slicing with a negative step of -1.\n</think>\nYou can reverse a string in Python using slicing:\n```python\nreversed_str = my_string[::-1]\n```"
+    }
+]
+
+optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)  # Lower learning rate for SFT
+sft_epochs = 10
+
+for epoch in range(sft_epochs):
+    total_sft_loss = 0.0
+    random.shuffle(SFT_DATASET)
+    
+    for item in SFT_DATASET:
+        prompt_text = f"### Instruction:\n{item['instruction']}\n\n### Response:\n{item['response']}<|endoftext|>"
+        tokens = encode(prompt_text)
+        if len(tokens) > block_size:
+            tokens = tokens[:block_size]
+            
+        x = torch.tensor(tokens[:-1], dtype=torch.long, device=device).unsqueeze(0)
+        y = torch.tensor(tokens[1:], dtype=torch.long, device=device).unsqueeze(0)
+        
+        optimizer.zero_grad(set_to_none=True)
+        with torch.amp.autocast('cuda' if device == 'cuda' else 'cpu'):
+            _, loss = model(x, y)
+        
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        
+        total_sft_loss += loss.item()
+        
+    avg_loss = total_sft_loss / len(SFT_DATASET)
+    print(f"SFT Epoch {epoch+1}/{sft_epochs} | Loss: {avg_loss:.4f}")
+
 with open("ashen_gpt_model.pk1", "wb") as f:
     pickle.dump(model, f)
-print("Training complete! Optimized model saved to ashen_gpt_model.pk1")
+print("Training & Supervised Fine-Tuning complete! Final model saved to ashen_gpt_model.pk1")
