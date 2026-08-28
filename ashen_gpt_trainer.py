@@ -2,13 +2,21 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
-import pickle
+import mmap
+import random
 import os
+import pickle
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-print(f"Device: {device}")
+print(f"Using device: {device}")
 
+# Ashen GPT Hyperparameters (Optimized for 8GB VRAM)
 block_size = 256
+batch_size = 8
+max_iters = 500
+eval_interval = 100
+learning_rate = 3e-4
+eval_iters = 50
 n_embd = 384
 n_layer = 6
 n_head = 6
@@ -23,6 +31,44 @@ print(f"Ashen GPT Tokenizer loaded. Vocab size: {vocab_size}")
 
 encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
 decode = lambda l: enc.decode(l)
+
+def get_random_chunk(split):
+    if split == 'train':
+        train_files = ["train_split.txt"]
+        if os.path.exists("code_train_split.txt"):
+            train_files.append("code_train_split.txt")
+        filename = random.choice(train_files)
+    else:
+        filename = "val_split.txt"
+        if not os.path.exists(filename):
+            filename = "train_split.txt"
+        
+    if not os.path.exists(filename):
+        return torch.tensor(encode("Hello world! Ashen GPT hybrid training test."), dtype=torch.long)
+
+    with open(filename, 'rb') as f:
+        with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
+            file_size = len(mm)
+            chunk_size = min(file_size, block_size * batch_size * 4)
+            max_start = file_size - chunk_size
+            start_pos = random.randint(0, max(0, max_start))
+            mm.seek(start_pos)
+            block = mm.read(chunk_size)
+            decoded_text = block.decode('utf-8', errors='ignore').replace('\r', '')
+            tokens = encode(decoded_text)
+            return torch.tensor(tokens, dtype=torch.long)
+
+def get_batch(split):
+    data_chunk = get_random_chunk(split)
+    if len(data_chunk) <= block_size:
+        data_chunk = torch.tensor(encode("Fallback training sentence for Ashen GPT."), dtype=torch.long)
+    
+    data_chunk = torch.clamp(data_chunk, min=0, max=vocab_size - 1)
+    
+    ix = torch.randint(len(data_chunk) - block_size, (batch_size,))
+    x = torch.stack([data_chunk[i:i+block_size] for i in ix])
+    y = torch.stack([data_chunk[i+1:i+block_size+1] for i in ix])
+    return x.to(device), y.to(device)
 
 class Head(nn.Module):
     def __init__(self, head_size):
@@ -155,50 +201,45 @@ class AshenGPTLanguageModel(nn.Module):
             index = torch.cat((index, index_next), dim=-1)
         return index
 
-# Load model checkpoint
-model_path = 'ashen_gpt_model.pk1'
-if os.path.exists(model_path):
-    print(f"Loading Ashen GPT model parameters from {model_path}...")
-    with open(model_path, 'rb') as f:
-        model = pickle.load(f)
-    print("Model loaded successfully!")
-else:
-    print(f"No checkpoint found at {model_path}. Initializing new Ashen GPT model...")
-    model = AshenGPTLanguageModel(vocab_size)
+print("Initializing Ashen GPT Model...")
+model = AshenGPTLanguageModel(vocab_size).to(device)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
-m = model.to(device)
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    model.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch(split)
+            _, loss = model(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    model.train()
+    return out
 
-class ReasoningEngine:
-    def __init__(self, model, decode_fn, encode_fn, device):
-        self.model = model
-        self.decode = decode_fn
-        self.encode = encode_fn
-        self.device = device
-
-    @torch.no_grad()
-    def solve_with_cot(self, prompt, max_new_tokens=250, num_samples=1):
-        self.model.eval()
-        cot_prompt = f"Problem: {prompt}\nLet's think step by step:\n<think>\n"
-        encoded = self.encode(cot_prompt)
-        if len(encoded) > block_size:
-            encoded = encoded[-block_size:]
-        input_ids = torch.tensor([encoded], dtype=torch.long, device=self.device)
+print("Starting Ashen GPT training loop...")
+for iter in range(max_iters):
+    print(f"Iteration {iter}/{max_iters}", flush=True)
+    if iter % eval_interval == 0:
+        losses = estimate_loss()
+        print(f"step {iter}: train loss {losses['train']:.3f}, val loss {losses['val']:.3f}")
         
-        output_ids = self.model.generate(input_ids, max_new_tokens=max_new_tokens, temperature=0.8, top_k=50)
-        generated_text = self.decode(output_ids[0].tolist())
-        return generated_text
+        model.eval()
+        context = torch.tensor([encode("Once upon a time")], dtype=torch.long, device=device)
+        generated = decode(model.generate(context, max_new_tokens=100)[0].tolist())
+        print(f"\n--- Ashen GPT Sample Gen at Step {iter} ---")
+        print(generated)
+        print("-" * 40, "\n")
+        model.train()
 
-reasoner = ReasoningEngine(m, decode, encode, device)
+    xb, yb = get_batch('train')
+    logits, loss = model.forward(xb, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
 
-print("\n--- Ashen GPT Chatbot Ready ---")
-while True:
-    try:
-        prompt = input("\nPrompt:\n> ")
-        if not prompt.strip():
-            continue
-        if prompt.lower() in ['exit', 'quit']:
-            break
-        reasoned_solution = reasoner.solve_with_cot(prompt, max_new_tokens=200)
-        print(f"\nCompletion:\n{reasoned_solution}")
-    except (KeyboardInterrupt, EOFError):
-        break
+with open("ashen_gpt_model.pk1", "wb") as f:
+    pickle.dump(model, f)
+print("Training complete! Model saved to ashen_gpt_model.pk1")
