@@ -1,6 +1,6 @@
-# Ashen AI Base
+# Ashen GPT
 
-Ashen AI Base is a high-performance, custom PyTorch implementation of a **Qwen-like Transformer architecture** trained from scratch on a hybrid dataset of literature and multi-language open-source code. It is specifically optimized for consumer hardware (tested and tuned for 8GB VRAM GPUs).
+Ashen GPT is a high-performance, custom PyTorch implementation of a **Qwen-like Transformer architecture** trained from scratch on a hybrid dataset of literature and multi-language open-source code. It is specifically optimized for consumer hardware (tested and tuned for 8GB VRAM GPUs).
 
 ---
 
@@ -16,7 +16,7 @@ Ashen AI Base is a high-performance, custom PyTorch implementation of a **Qwen-l
 
 ## ⚙️ Hardware Optimization (8GB VRAM Peak 450M Scale)
 
-Training large models from scratch on consumer GPUs is heavily constrained by optimizer states and gradient memory. Ashen AI Base is tuned to the **peak safe limit (~450 Million parameters)** for an 8GB GPU:
+Training large models from scratch on consumer GPUs is heavily constrained by optimizer states and gradient memory. Ashen GPT is tuned to the **peak safe limit (~450 Million parameters)** for an 8GB GPU:
 - **Embedding Dimension (`n_embd`)**: `896`
 - **Transformer Layers (`n_layer`)**: `16`
 - **Attention Heads (`n_head`)**: `14`
