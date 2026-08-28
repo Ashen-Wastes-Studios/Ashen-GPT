@@ -5,17 +5,7 @@ import mmap
 import random
 import os
 import pickle
-import argparse
 
-parser = argparse.ArgumentParser(description='This is a demonstration program')
-
-# Here we add an argument to the parser, specifying the expected type, a help message, etc.
-parser.add_argument('-batch_size', type=str, required=True, help='Please provide a batch_size')
-
-args = parser.parse_args()
-
-# Now we can use the argument value in our program
-print(f"batch_size: {args.batch_size}")
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 print(device)
@@ -46,15 +36,16 @@ encode = lambda s: [string_to_int.get(c, 0) for c in s]
 decode = lambda l: ''.join([int_to_string.get(i, '') for i in l])
 
 def get_random_chunk(split):
-    # Pool of training files (literature + code)
-    train_files = ["train_split.txt"]
-    if os.path.exists("code_train_split.txt"):
-        train_files.append("code_train_split.txt")
-        
-    filename = random.choice(train_files) if split == 'train' else "train_split.txt"
-    if not os.path.exists(filename):
-        filename = "train_split.txt"
-        
+    if split == 'train':
+        train_files = ["train_split.txt"]
+        if os.path.exists("code_train_split.txt"):
+            train_files.append("code_train_split.txt")
+        filename = random.choice(train_files)
+    else:
+        filename = "val_split.txt"
+        if not os.path.exists(filename):
+            filename = "train_split.txt"
+
     with open(filename, 'rb') as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
             file_size = len(mm)
@@ -282,19 +273,25 @@ m = model.to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 for iter in range(max_iters):
-    print(iter)
-
-    # every once in a while evaluate the loss on train and val sets
+    # every once in a while evaluate the loss on train and val sets and generate live sample text
     if iter % eval_interval == 0:
         losses = estimate_loss()
         print(f"step {iter}: train loss {losses['train']:.3f}, val loss {losses['val']:.3f}")
+        
+        model.eval()
+        context = torch.zeros((1, 1), dtype=torch.long, device=device)
+        sample = decode(model.generate(context, max_new_tokens=150)[0].tolist())
+        print(f"\n--- Sample Generation at Step {iter} ---")
+        print(sample)
+        print("-" * 50, "\n")
+        model.train()
 
     # sample a batch of data
     xb, yb = get_batch('train')
 
     # evaluate the loss
     logits, loss = model.forward(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
+    optimizer.zero_grad(set_to_none=False)
     loss.backward()
     optimizer.step()
 
