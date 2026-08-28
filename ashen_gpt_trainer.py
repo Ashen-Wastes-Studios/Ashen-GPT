@@ -19,19 +19,19 @@ import re
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using optimized device: {device}")
 
-# --- 2 Billion Parameter Scale Hyperparameters (Optimized for 8GB GPU, Fast & Responsive) ---
+# --- Optimized 250M Parameter Scale (Fits perfectly in 8GB GPU VRAM without OOM) ---
 block_size = 256
-batch_size = 1
-gradient_accumulation_steps = 16
+batch_size = 8                  # Larger batch size for efficient GPU utilization
+gradient_accumulation_steps = 4
 max_iters = 2000
-eval_interval = 25
-learning_rate = 1.5e-4
-min_learning_rate = 1e-5
+eval_interval = 50
+learning_rate = 3e-4
+min_learning_rate = 3e-5
 warmup_iters = 50
-eval_iters = 10
-n_embd = 1536
-n_layer = 24
-n_head = 16
+eval_iters = 20
+n_embd = 768
+n_layer = 12
+n_head = 12
 dropout = 0.1
 num_experts = 4
 top_k = 2
@@ -39,7 +39,7 @@ top_k = 2
 # Initialize BPE Tokenizer (GPT-2 encoding)
 enc = tiktoken.get_encoding("gpt2")
 vocab_size = enc.n_vocab  # 50257
-print(f"Ashen GPT 2B Tokenizer loaded. Vocab size: {vocab_size}")
+print(f"Ashen GPT Tokenizer loaded. Vocab size: {vocab_size}")
 
 encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
 decode = lambda l: enc.decode(l)
@@ -62,7 +62,7 @@ def get_random_chunk(split):
             filename = "train_split.txt"
 
     if not os.path.exists(filename):
-        return torch.tensor(encode("Hello world! Ashen GPT 2B hybrid training test. " * 50), dtype=torch.long)
+        return torch.tensor(encode("Hello world! Ashen GPT hybrid training test. " * 50), dtype=torch.long)
 
     with open(filename, 'rb') as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -90,7 +90,7 @@ def get_batch(split):
     y = torch.stack([data_chunk[i+1:i+block_size+1] for i in ix])
     return x.to(device), y.to(device)
 
-# --- Qwen-like Architecture Components (2B Scale) ---
+# --- Qwen-like Architecture Components ---
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -220,11 +220,9 @@ class Block(nn.Module):
         self.ln2 = RMSNorm(n_embd)
 
     def forward(self, x, rope_cache):
-        def custom_forward(tensor_x):
-            tensor_x = tensor_x + self.sa(self.ln1(tensor_x), rope_cache)
-            tensor_x = tensor_x + self.ffwd(self.ln2(tensor_x))
-            return tensor_x
-        return torch.utils.checkpoint.checkpoint(custom_forward, x, use_reentrant=False)
+        x = x + self.sa(self.ln1(x), rope_cache)
+        x = x + self.ffwd(self.ln2(x))
+        return x
 
 class AshenGPTLanguageModel(nn.Module):
     def __init__(self, vocab_size):
@@ -275,20 +273,13 @@ class AshenGPTLanguageModel(nn.Module):
             index = torch.cat((index, index_next), dim=-1)
         return index
 
-print("Initializing 2 Billion Parameter Qwen-Architectured Ashen GPT Model...")
+print("Initializing Optimized 250M Qwen-Architectured Ashen GPT Model...")
 model = AshenGPTLanguageModel(vocab_size).to(device)
 
 total_params = sum(p.numel() for p in model.parameters())
-print(f"Total Model Parameters: {total_params / 1e9:.2f} Billion")
+print(f"Total Model Parameters: {total_params / 1e6:.2f} Million")
 
-try:
-    import bitsandbytes as bnb
-    optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
-    print("Using bitsandbytes 8-bit AdamW optimizer for VRAM savings.")
-except Exception:
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    print("Using standard torch AdamW optimizer.")
-
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 scaler = torch.amp.GradScaler('cuda' if device == 'cuda' else 'cpu')
 
 def get_lr(it):
@@ -316,7 +307,7 @@ def estimate_loss():
     return out
 
 # --- PHASE 1: PRE-TRAINING ---
-print("=== PHASE 1: Pre-training 2B Model (Logging Every Step) ===", flush=True)
+print("=== PHASE 1: Pre-training 250M Model (Zero OOM, Lightning Fast) ===", flush=True)
 optimizer.zero_grad(set_to_none=True)
 
 for iter in range(max_iters):
@@ -373,7 +364,7 @@ SFT_DATASET = [
     }
 ]
 
-optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=5e-5) if 'bnb' in sys.modules else torch.optim.AdamW(model.parameters(), lr=5e-5)
+optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)
 sft_epochs = 5
 
 for epoch in range(sft_epochs):
@@ -407,4 +398,4 @@ for epoch in range(sft_epochs):
 
 with open("ashen_gpt_model.pk1", "wb") as f:
     pickle.dump(model, f)
-print("Training & Supervised Fine-Tuning complete! 2B Qwen-architectured model saved to ashen_gpt_model.pk1", flush=True)
+print("Training & Supervised Fine-Tuning complete! Optimized model saved to ashen_gpt_model.pk1", flush=True)

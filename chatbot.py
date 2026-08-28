@@ -14,11 +14,11 @@ import re
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
-# --- 2 Billion Parameter Scale Hyperparameters ---
+# --- Optimized 250M Parameter Scale ---
 block_size = 512
-n_embd = 1536
-n_layer = 24
-n_head = 16
+n_embd = 768
+n_layer = 12
+n_head = 12
 dropout = 0.1
 num_experts = 4
 top_k = 2
@@ -26,7 +26,7 @@ top_k = 2
 # Initialize BPE Tokenizer (GPT-2 encoding)
 enc = tiktoken.get_encoding("gpt2")
 vocab_size = enc.n_vocab  # 50257
-print(f"Ashen GPT 2B Tokenizer loaded. Vocab size: {vocab_size}")
+print(f"Ashen GPT Tokenizer loaded. Vocab size: {vocab_size}")
 
 encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
 decode = lambda l: enc.decode(l)
@@ -46,7 +46,7 @@ def filter_code_output(text):
     text_clean = re.sub(r'`[^`]*`', '', text_no_blocks)
     return text_clean
 
-# --- Qwen-like Architecture Components (2B Scale) ---
+# --- Qwen-like Architecture Components ---
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -232,12 +232,12 @@ class AshenGPTLanguageModel(nn.Module):
 # Load model checkpoint
 model_path = 'ashen_gpt_model.pk1'
 if os.path.exists(model_path):
-    print(f"Loading 2B Ashen GPT model parameters from {model_path}...")
+    print(f"Loading Ashen GPT model parameters from {model_path}...")
     with open(model_path, 'rb') as f:
         model = pickle.load(f)
     print("Model loaded successfully!")
 else:
-    print(f"No checkpoint found at {model_path}. Initializing new 2B Ashen GPT model...")
+    print(f"No checkpoint found at {model_path}. Initializing new Ashen GPT model...")
     model = AshenGPTLanguageModel(vocab_size)
 
 m = model.to(device)
@@ -261,16 +261,15 @@ class ReasoningEngine:
         output_ids = self.model.generate(input_ids, max_new_tokens=max_new_tokens, temperature=0.8, top_k=50)
         raw_generated = self.decode(output_ids[0].tolist())
         
-        # Check if user explicitly requested code
         if user_wants_code(prompt):
-            return raw_generated  # Permit code output
+            return raw_generated
         else:
-            return filter_code_output(raw_generated)  # Suppress code output
+            return filter_code_output(raw_generated)
 
 reasoner = ReasoningEngine(m, decode, encode, device)
 
 if __name__ == "__main__":
-    print("\n--- Ashen GPT 2B Chatbot Ready (Smart Code Output Mode) ---")
+    print("\n--- Ashen GPT Chatbot Ready (Smart Code Output Mode) ---")
     while True:
         try:
             prompt = input("\nPrompt:\n> ")
@@ -278,7 +277,7 @@ if __name__ == "__main__":
                 continue
             if prompt.lower() in ['exit', 'quit']:
                 break
-            reasoned_solution = reasoner.solve_using_cot if hasattr(reasoner, 'solve_using_cot') else reasoner.solve_with_cot(prompt, max_new_tokens=200)
+            reasoned_solution = reasoner.solve_with_cot(prompt, max_new_tokens=200)
             print(f"\nCompletion:\n{reasoned_solution}")
         except (KeyboardInterrupt, EOFError):
             break
