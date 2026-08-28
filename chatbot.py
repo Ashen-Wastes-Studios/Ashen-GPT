@@ -30,18 +30,20 @@ class Head(nn.Module):
         self.key = nn.Linear(n_embd, head_size, bias=False)
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        self.dropout = dropout
 
     def forward(self, x):
         B, T, C = x.shape
         k = self.key(x)
         q = self.query(x)
-        wei = q @ k.transpose(-2, -1) * k.shape[-1]**-0.5
-        tril = torch.tril(torch.ones(T, T, device=x.device))
-        wei = wei.masked_fill(tril == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
-        wei = self.dropout(wei)
-        return wei @ self.value(x)
+        v = self.value(x)
+        out = F.scaled_dot_product_attention(
+            q, k, v, 
+            attn_mask=None, 
+            dropout_p=self.dropout if self.training else 0.0, 
+            is_causal=True
+        )
+        return out
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
@@ -59,7 +61,7 @@ class Expert(nn.Module):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(4 * n_embd, n_embd),
             nn.Dropout(dropout),
         )
