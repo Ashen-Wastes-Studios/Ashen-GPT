@@ -1,3 +1,8 @@
+import sys
+import io
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
+
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -8,65 +13,116 @@ import os
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
-block_size = 256
-n_embd = 384
-n_layer = 6
-n_head = 6
-dropout = 0.2
+# --- 4 Billion Parameter Scale Hyperparameters ---
+block_size = 512
+n_embd = 2048
+n_layer = 24
+n_head = 16
+dropout = 0.1
 num_experts = 4
 top_k = 2
 
 # Initialize BPE Tokenizer (GPT-2 encoding)
 enc = tiktoken.get_encoding("gpt2")
 vocab_size = enc.n_vocab  # 50257
-print(f"Ashen GPT Tokenizer loaded. Vocab size: {vocab_size}")
+print(f"Ashen GPT 4B Tokenizer loaded. Vocab size: {vocab_size}")
 
 encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
 decode = lambda l: enc.decode(l)
 
-class Head(nn.Module):
-    def __init__(self, head_size):
+# --- Qwen-like Architecture Components (4B Scale) ---
+
+class RMSNorm(nn.Module):
+    def __init__(self, dim, eps=1e-6):
         super().__init__()
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-        self.dropout = dropout
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x):
-        B, T, C = x.shape
-        k = self.key(x)
-        q = self.query(x)
-        v = self.value(x)
-        out = F.scaled_dot_product_attention(
-            q, k, v, 
-            attn_mask=None, 
-            dropout_p=self.dropout if self.training else 0.0, 
-            is_causal=True
-        )
-        return out
+        norm = x.pow(2).mean(-1, keepdim=True)
+        return self.weight * x * torch.rsqrt(norm + self.eps)
+
+class RotaryEmbedding(nn.Module):
+    def __init__(self, dim, max_seq_len=2048, theta=10000.0):
+        super().__init__()
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self._set_cos_sin_cache(max_seq_len)
+
+    def _set_cos_sin_cache(self, seq_len):
+        t = torch.arange(seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        freqs = torch.outer(t, self.inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, seq_len):
+        if seq_len > self.cos_cached.size(0):
+            self._set_cos_sin_cache(seq_len)
+        return self.cos_cached[:seq_len, :], self.sin_cached[:seq_len, :]
+
+def rotate_half(x):
+    x1 = x[..., :x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rope(x, cos, sin):
+    cos = cos.unsqueeze(0).unsqueeze(2)  # [1, T, 1, D]
+    sin = sin.unsqueeze(0).unsqueeze(2)  # [1, T, 1, D]
+    return (x * cos) + (rotate_half(x) * sin)
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
         super().__init__()
-        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
-        self.proj = nn.Linear(head_size * num_heads, n_embd)
-        self.dropout = nn.Dropout(dropout)
+        self.num_heads = num_heads
+        self.head_size = head_size
+        self.hidden_dim = num_heads * head_size
+        self.query = nn.Linear(n_embd, self.hidden_dim, bias=False)
+        self.key = nn.Linear(n_embd, self.hidden_dim, bias=False)
+        self.value = nn.Linear(n_embd, self.hidden_dim, bias=False)
+        self.proj = nn.Linear(self.hidden_dim, n_embd, bias=False)
+        
+        self.q_norm = RMSNorm(head_size)
+        self.k_norm = RMSNorm(head_size)
+        self.dropout = dropout
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        return self.dropout(self.proj(out))
+    def forward(self, x, rope_cache):
+        B, T, C = x.shape
+        q = self.query(x).view(B, T, self.num_heads, self.head_size)
+        k = self.key(x).view(B, T, self.num_heads, self.head_size)
+        v = self.value(x).view(B, T, self.num_heads, self.head_size)
+
+        q = self.q_norm(q)
+        k = self.k_norm(k)
+
+        cos, sin = rope_cache
+        q = apply_rope(q, cos[:T, :], sin[:T, :])
+        k = apply_rope(k, cos[:T, :], sin[:T, :])
+
+        q = q.transpose(1, 2)  # [B, H, T, D]
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=None,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=True
+        )
+        out = out.transpose(1, 2).contiguous().view(B, T, self.hidden_dim)
+        return self.proj(out)
 
 class Expert(nn.Module):
     def __init__(self, n_embd):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.GELU(),
-            nn.Linear(4 * n_embd, n_embd),
-            nn.Dropout(dropout),
-        )
+        hidden_dim = int(8 * n_embd / 3)
+        self.gate_proj = nn.Linear(n_embd, hidden_dim, bias=False)
+        self.up_proj = nn.Linear(n_embd, hidden_dim, bias=False)
+        self.down_proj = nn.Linear(hidden_dim, n_embd, bias=False)
+        self.dropout = dropout
+
     def forward(self, x):
-        return self.net(x)
+        return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 class MixtureOfExpertsFeedForward(nn.Module):
     def __init__(self, n_embd, num_experts=4, top_k=2):
@@ -82,7 +138,7 @@ class MixtureOfExpertsFeedForward(nn.Module):
         gate_logits = self.gate(x_flat)
         weights, selected_experts = torch.topk(F.softmax(gate_logits, dim=-1), self.top_k, dim=-1)
         weights = weights / weights.sum(dim=-1, keepdim=True)
-        
+
         out = torch.zeros_like(x_flat)
         for i, expert in enumerate(self.experts):
             batch_idx, nth_expert = torch.where(selected_experts == i)
@@ -100,11 +156,11 @@ class Block(nn.Module):
         head_size = n_embd // n_head
         self.sa = MultiHeadAttention(n_head, head_size)
         self.ffwd = MixtureOfExpertsFeedForward(n_embd, num_experts=num_experts, top_k=top_k)
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
+        self.ln1 = RMSNorm(n_embd)
+        self.ln2 = RMSNorm(n_embd)
 
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
+    def forward(self, x, rope_cache):
+        x = x + self.sa(self.ln1(x), rope_cache)
         x = x + self.ffwd(self.ln2(x))
         return x
 
@@ -112,10 +168,11 @@ class AshenGPTLanguageModel(nn.Module):
     def __init__(self, vocab_size):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-        self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.lm_head = nn.Linear(n_embd, vocab_size)
+        head_size = n_embd // n_head
+        self.rotary_emb = RotaryEmbedding(head_size, max_seq_len=block_size * 2)
+        self.blocks = nn.ModuleList([Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        self.ln_f = RMSNorm(n_embd)
+        self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
 
     def forward(self, index, targets=None):
         B, T = index.shape
@@ -124,17 +181,16 @@ class AshenGPTLanguageModel(nn.Module):
             B, T = index.shape
 
         index = torch.clamp(index, min=0, max=self.token_embedding_table.num_embeddings - 1)
-        tok_emb = self.token_embedding_table(index)
-        
-        pos_indices = torch.arange(T, device=device)
-        pos_indices = torch.clamp(pos_indices, min=0, max=self.position_embedding_table.num_embeddings - 1)
-        pos_emb = self.position_embedding_table(pos_indices)
-        
-        x = tok_emb + pos_emb
-        x = self.blocks(x)
+        x = self.token_embedding_table(index)
+
+        rope_cache = self.rotary_emb(T)
+
+        for block in self.blocks:
+            x = block(x, rope_cache)
+
         x = self.ln_f(x)
         logits = self.lm_head(x)
-        
+
         if targets is None:
             loss = None
         else:
@@ -160,12 +216,12 @@ class AshenGPTLanguageModel(nn.Module):
 # Load model checkpoint
 model_path = 'ashen_gpt_model.pk1'
 if os.path.exists(model_path):
-    print(f"Loading Ashen GPT model parameters from {model_path}...")
+    print(f"Loading 4B Ashen GPT model parameters from {model_path}...")
     with open(model_path, 'rb') as f:
         model = pickle.load(f)
     print("Model loaded successfully!")
 else:
-    print(f"No checkpoint found at {model_path}. Initializing new Ashen GPT model...")
+    print(f"No checkpoint found at {model_path}. Initializing new 4B Ashen GPT model...")
     model = AshenGPTLanguageModel(vocab_size)
 
 m = model.to(device)
@@ -178,29 +234,30 @@ class ReasoningEngine:
         self.device = device
 
     @torch.no_grad()
-    def solve_with_cot(self, prompt, max_new_tokens=250, num_samples=1):
+    def solve_with_cot(self, prompt, max_new_tokens=250):
         self.model.eval()
         cot_prompt = f"Problem: {prompt}\nLet's think step by step:\n<think>\n"
         encoded = self.encode(cot_prompt)
         if len(encoded) > block_size:
             encoded = encoded[-block_size:]
         input_ids = torch.tensor([encoded], dtype=torch.long, device=self.device)
-        
+
         output_ids = self.model.generate(input_ids, max_new_tokens=max_new_tokens, temperature=0.8, top_k=50)
         generated_text = self.decode(output_ids[0].tolist())
         return generated_text
 
 reasoner = ReasoningEngine(m, decode, encode, device)
 
-print("\n--- Ashen GPT Chatbot Ready ---")
-while True:
-    try:
-        prompt = input("\nPrompt:\n> ")
-        if not prompt.strip():
-            continue
-        if prompt.lower() in ['exit', 'quit']:
+if __name__ == "__main__":
+    print("\n--- Ashen GPT 4B Chatbot Ready ---")
+    while True:
+        try:
+            prompt = input("\nPrompt:\n> ")
+            if not prompt.strip():
+                continue
+            if prompt.lower() in ['exit', 'quit']:
+                break
+            reasoned_solution = reasoner.solve_with_cot(prompt, max_new_tokens=200)
+            print(f"\nCompletion:\n{reasoned_solution}")
+        except (KeyboardInterrupt, EOFError):
             break
-        reasoned_solution = reasoner.solve_with_cot(prompt, max_new_tokens=200)
-        print(f"\nCompletion:\n{reasoned_solution}")
-    except (KeyboardInterrupt, EOFError):
-        break
