@@ -245,15 +245,19 @@ class GPTLanguageModel(nn.Module):
 
         return logits, loss
 
-    def generate(self, index, max_new_tokens):
+    def generate(self, index, max_new_tokens, temperature=0.8, top_k=50):
         # index is (B, T) array of indices in the current context
         for _ in range(max_new_tokens):
             # crop index to the last block_size tokens
             index_cond = index[:, -block_size:]
             # get the predictions
             logits, loss = self.forward(index_cond)
-            # focus only on the last time step
-            logits = logits[:, -1, :] # becomes (B, C)
+            # focus only on the last time step and apply temperature
+            logits = logits[:, -1, :] / temperature
+            # apply top_k filtering
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to get probabilities
             probs = F.softmax(logits, dim=-1) # (B, C)
             # sample from the distribution
@@ -280,13 +284,14 @@ class ReasoningEngine:
     @torch.no_grad()
     def solve_with_cot(self, prompt, max_new_tokens=150, num_samples=1):
         self.model.eval()
-        cot_prompt = f"Problem: {prompt}\nLet's think step by step:\n<think>\n"
+        # Use a natural code/literature continuation prompt
+        cot_prompt = prompt if prompt else "import os\ndef "
         encoded = self.encode(cot_prompt)
         if len(encoded) > block_size:
             encoded = encoded[-block_size:]
         input_ids = torch.tensor([encoded], dtype=torch.long, device=self.device)
-        
-        output_ids = self.model.generate(input_ids, max_new_tokens=max_new_tokens)
+
+        output_ids = self.model.generate(input_ids, max_new_tokens=max_new_tokens, temperature=0.8, top_k=50)
         generated_text = self.decode(output_ids[0].tolist())
         return generated_text
 
