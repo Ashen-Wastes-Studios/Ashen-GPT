@@ -363,20 +363,25 @@ for iter in range(max_iters):
         print(f"Prompt: {text_prompt}", flush=True)
         print(f"Completion (Natural Language): {clean_text_gen}\n", flush=True)
 
-        # 2. CODE TEST (Clock App Generation in Python / JavaScript - Code Permitted)
-        code_prompts = [
-            "def create_python_clock_app():\n    # Write a simple clock app in Python using tkinter:\n",
-            "// Write a simple clock app in JavaScript:\nfunction createClock() {\n"
+        # 2. CODE TESTS (Clock App Generation across Python, JavaScript/TypeScript, Go, Rust, C++, Ruby)
+        clock_app_prompts = [
+            ("Python", "def create_python_clock():\n    # Write a clock app in Python:\n"),
+            ("JavaScript / TypeScript", "function createClockApp() {\n    // Write a clock app in JavaScript:\n"),
+            ("Go", "package main\n// Write a clock app in Go:\nfunc main() {\n"),
+            ("Rust", "// Write a clock app in Rust:\nfn main() {\n    println!(\"Rust Clock App\");\n"),
+            ("C++", "// Write a clock app in C++:\n#include <iostream>\nint main() {\n"),
+            ("Ruby", "# Write a clock app in Ruby:\nclass ClockApp\n")
         ]
-        code_prompt = random.choice(code_prompts)
-        context_code = torch.tensor([encode(code_prompt)], dtype=torch.long, device=device)
-        raw_code_gen = decode(model.generate(context_code, max_new_tokens=120)[0].tolist())
 
-        print(f"[CODE TEST - CLOCK APP GENERATION]", flush=True)
-        print(f"Prompt: {code_prompt.strip()}", flush=True)
-        print(f"Completion (Code Permitted):\n{raw_code_gen}", flush=True)
+        print(f"[CODE TESTS - CLOCK APP GENERATION ACROSS 6 LANGUAGES]", flush=True)
+        for lang, prompt_snippet in clock_app_prompts:
+            context_code = torch.tensor([encode(prompt_snippet)], dtype=torch.long, device=device)
+            raw_code_gen = decode(model.generate(context_code, max_new_tokens=80)[0].tolist())
+            print(f"--- Language: {lang} ---", flush=True)
+            print(f"Prompt: {prompt_snippet.strip()}", flush=True)
+            print(f"Completion:\n{raw_code_gen}\n", flush=True)
+
         print(f"==================================================\n", flush=True)
-
         model.train()
 
 # --- PHASE 2: SUPERVISED FINE-TUNING (SFT) ---
