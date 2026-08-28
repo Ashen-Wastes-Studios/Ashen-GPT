@@ -14,14 +14,14 @@ Ashen GPT is a high-performance, custom PyTorch implementation of a **Qwen-like 
 
 ---
 
-## ⚙️ Hardware Optimization (8GB VRAM Peak 450M Scale)
+## ⚙️ Hardware Optimization (8GB VRAM 250M Scale)
 
-Training large models from scratch on consumer GPUs is heavily constrained by optimizer states and gradient memory. Ashen GPT is tuned to the **peak safe limit (~450 Million parameters)** for an 8GB GPU:
-- **Embedding Dimension (`n_embd`)**: `896`
-- **Transformer Layers (`n_layer`)**: `16`
-- **Attention Heads (`n_head`)**: `14`
+Training large models from scratch on consumer GPUs is heavily constrained by optimizer states and gradient memory. Ashen GPT is tuned to **250 Million parameters** for lightning-fast, OOM-free training on an 8GB GPU:
+- **Embedding Dimension (`n_embd`)**: `768`
+- **Transformer Layers (`n_layer`)**: `10`
+- **Attention Heads (`n_head`)**: `12`
 - **MoE Experts (`num_experts`)**: `4` (Top-2 routing)
-- **Memory Savers**: Built-in **Gradient Checkpointing** (`torch.utils.checkpoint`), Automatic Mixed Precision (`torch.amp`), and optional 8-bit AdamW optimizer (`bitsandbytes`).
+- **Memory Savers**: Automatic Mixed Precision (`torch.amp`) and micro-batch optimization.
 
 ---
 
@@ -60,7 +60,7 @@ The inference chatbot features intent-based code filtering:
 
 ### Running the Scripts
 
-- **Train Custom 450M Model (Pre-training + SFT)**:
+- **Train Custom 250M Model (Pre-training + SFT)**:
   ```cmd
   run_ashen_gpt.bat
   ```

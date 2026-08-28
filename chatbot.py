@@ -14,11 +14,11 @@ import re
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
-# --- Peak Safe Limit for 8GB GPU (~450M Parameters) ---
+# --- 250M Parameter Scale ---
 block_size = 512
-n_embd = 896
-n_layer = 16
-n_head = 14
+n_embd = 768
+n_layer = 10
+n_head = 12
 dropout = 0.1
 num_experts = 4
 top_k = 2
