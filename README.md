@@ -85,8 +85,20 @@ run_web_chatbot.bat   →   http://localhost:5000
 - **Model Hub modal** — browse local `.pk1` checkpoints, upload new weights, swap models live.
 - **Quick-action chips** — one-click buttons for common agent tools (*File Glob*, *Grep*, *Git Status*, *Run Tests*).
 - **Adjustable settings** — temperature, top-k, max tokens, context length, GPU layer count, repeat penalty.
-- **Session management** — export chats as Markdown or purge history instantly.
+- **Session export & purge** — export chats as Markdown (`.md`) or purge history instantly.
 - **Workspace browser** — navigate project directory directly from the UI.
+- **Workspace context injection** — browsing any folder automatically injects its file tree into the model's system prompt so the agent is aware of which files you're examining.
+
+#### 💬 Session Management
+
+| Action | Description |
+|---|---|
+| 📝 New Chat | Creates a fresh session; first message auto-names it. |
+| 💬 Sessions Panel | Slide-out sidebar listing all past sessions with msg count & timestamps. |
+| Load / ✎ / × | Click to restore full conversation history, rename, or delete a session. |
+| Auto-save | Every chat message is persisted to `sessions/*.json`; settings, persona, and workspace context travel with each session. |
+
+Sessions are stored as JSON files in `sessions/` and include: conversation history, persona choice, generation settings, and active workspace context.
 
 ---
 
@@ -131,6 +143,7 @@ chatbot.py              # CLI agentic chatbot
 web_chatbot.py          # Web UI agentic chatbot (cyberpunk)
 ashen_gpt_model.pk1     # Saved model checkpoint (generated after training)
 training_logs.txt       # Auto-generated training log
+sessions/               # Persistent chat sessions (JSON files with history, settings, context)
 train_split.txt         # Literature training data
 val_split.txt           # Validation data
 code_train_split.txt    # Scraped code training data
