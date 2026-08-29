@@ -449,6 +449,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Ashen AI - Cybernetic Local AI Hub</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        // Suppress Tailwind CDN dev warning
+        window.tailwind.config = { theme: {}, variants: {} };
+    </script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.js"></script>
     <!-- Prism.js for Syntax Highlighting -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/themes/prism-okaidia.min.css" rel="stylesheet" />
@@ -469,7 +473,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-csharp.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-ruby.min.js"></script>
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-php.min.js"></script>
+    <!-- prism-php removed - broken dependency -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-xml.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js"></script>
@@ -966,7 +970,6 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 'java': 'language-java',
                 'cs': 'language-csharp',
                 'rb': 'language-ruby',
-                'php': 'language-php',
                 'sql': 'language-sql',
                 'xml': 'language-xml',
                 'toml': 'language-toml',
@@ -1023,8 +1026,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
                         // Use requestAnimationFrame then Prism.highlightAll()
                         requestAnimationFrame(() => {
                             if (typeof Prism !== 'undefined') {
-                                Prism.highlightAll();
-                                console.log('[DEBUG] Prism.highlightAll() called');
+                                try {
+                                    Prism.highlightAll();
+                                    console.log('[DEBUG] Prism.highlightAll() called successfully');
+                                } catch(e) {
+                                    console.warn('[DEBUG] Prism.highlightAll() failed:', e);
+                                }
                             } else {
                                 console.warn('[DEBUG] Prism not loaded');
                             }
