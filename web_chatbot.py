@@ -807,8 +807,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
         function toggleSessionsPanel(show) {
             const panel = document.getElementById('sessions-panel');
             const overlay = document.getElementById('sessions-overlay');
-            panel.style.transform = show ? 'translateX(0)' : '-translate-x-full';
-            overlay.style.display = show ? 'block' : 'none';
+            
+            console.log('[DEBUG] toggleSessionsPanel:', show);
+            console.log('[DEBUG] panel found:', !!panel);
+            console.log('[DEBUG] overlay found:', !!overlay);
+            
+            if (panel) {
+                panel.style.transform = show ? 'translateX(0)' : '-translate-x-full';
+                console.log('[DEBUG] panel transform set to:', panel.style.transform);
+            }
+            if (overlay) {
+                overlay.style.display = show ? 'block' : 'none';
+                console.log('[DEBUG] overlay display set to:', overlay.style.display);
+            }
             if (show) loadSessionList();
         }
 
