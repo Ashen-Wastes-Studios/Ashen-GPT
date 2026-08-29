@@ -22,6 +22,11 @@ import requests
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path
 
+# --- Session Storage ---
+SESSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sessions')
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+current_session_id = None
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
@@ -434,7 +439,10 @@ class AshenAIAgenticEngine:
 
 reasoner = AshenAIAgenticEngine(m, decode, encode, device)
 
-HTML_PAGE = """<!DOCTYPE html>
+# Track which session the reasoner belongs to
+reasoner.session_id = None
+
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -481,6 +489,8 @@ HTML_PAGE = """<!DOCTYPE html>
                 <option value="code_architect">Persona: Code Architect</option>
                 <option value="cyber_companion">Persona: Cyber Companion</option>
             </select>
+            <button onclick="createNewSession()" class="px-2.5 py-1 bg-violet-950/60 hover:bg-violet-900/60 text-violet-300 rounded border border-violet-800/60 transition" title="Start a new chat session">📝 New Chat</button>
+            <button onclick="toggleSessionsPanel(true)" class="px-2.5 py-1 bg-blue-950/60 hover:bg-blue-900/60 text-blue-300 rounded border border-blue-800/60 transition" title="View past chat sessions">💬 Sessions</button>
             <button onclick="toggleModelModal(true)" class="px-2.5 py-1 bg-cyan-950/60 hover:bg-cyan-900/60 text-cyan-300 rounded border border-cyan-800/60 transition">Model Hub</button>
             <button onclick="loadWorkspaceDir('')" class="px-2.5 py-1 bg-emerald-950/60 hover:bg-emerald-900/60 text-emerald-300 rounded border border-emerald-800/60 transition">📁 Workspace</button>
             <button onclick="toggleSettingsModal(true)" class="px-2.5 py-1 bg-indigo-950/60 hover:bg-indigo-900/60 text-indigo-300 rounded border border-indigo-800/60 transition">⚙️ Settings</button>
@@ -620,6 +630,34 @@ HTML_PAGE = """<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Sessions Panel -->
+    <div id="sessions-panel" class="fixed inset-y-0 left-0 w-80 bg-slate-950/95 backdrop-blur-sm z-40 border-r border-blue-900/40 transform -translate-x-full transition-transform duration-300 flex flex-col">
+        <div class="p-4 border-b border-blue-900/30 flex items-center justify-between">
+            <h2 class="text-sm font-bold text-blue-400 uppercase tracking-wider">💬 Chat Sessions</h2>
+            <button onclick="toggleSessionsPanel(false)" class="text-slate-400 hover:text-white font-bold text-lg">✕</button>
+        </div>
+
+        <!-- New Session Button -->
+        <div class="p-3 border-b border-slate-800">
+            <button onclick="createNewSession()" class="w-full px-3 py-2 bg-violet-950/60 hover:bg-violet-900/60 text-violet-300 rounded-lg text-xs font-semibold border border-violet-800/60 transition flex items-center justify-center gap-2">
+                <span>📝</span> New Chat Session
+            </button>
+        </div>
+
+        <!-- Session List -->
+        <div id="session-list" class="flex-1 overflow-y-auto p-2 space-y-1">
+            <div class="text-slate-500 text-xs text-center py-4">Loading sessions...</div>
+        </div>
+
+        <!-- Current Session Info -->
+        <div class="p-3 border-t border-slate-800 text-[10px] text-slate-500 text-center">
+            <span id="current-session-label">No active session</span>
+        </div>
+    </div>
+
+    <!-- Sessions Panel Overlay -->
+    <div id="sessions-overlay" class="fixed inset-0 bg-black/30 z-30 hidden" onclick="toggleSessionsPanel(false)"></div>
+
     <!-- Main Workspace -->
     <div class="flex-1 flex overflow-hidden z-10">
         <!-- Sidebar Telemetry & Quick Actions -->
@@ -740,6 +778,42 @@ HTML_PAGE = """<!DOCTYPE html>
         function toggleSettingsModal(show) {
             const modal = document.getElementById('settings-modal');
             modal.style.display = show ? 'flex' : 'none';
+        }
+
+        function toggleSessionsPanel(show) {
+            const panel = document.getElementById('sessions-panel');
+            const overlay = document.getElementById('sessions-overlay');
+            panel.style.transform = show ? 'translateX(0)' : '-translate-x-full';
+            overlay.style.display = show ? 'block' : 'none';
+            if (show) loadSessionList();
+        }
+
+        // Render helpers for loading session history
+        function renderUserMessage(msg) {
+            return `
+                <div class="flex items-start space-x-4 max-w-4xl">
+                    <div class="w-8 h-8 rounded bg-slate-700/50 border border-slate-600 flex items-center justify-center font-bold text-xs text-slate-300 shrink-0 mt-1">U</div>
+                    <div class="bg-slate-900/90 border border-slate-700/60 rounded-xl p-4 text-slate-200 text-sm shadow-xl"><p>${msg.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</p></div>
+                </div>`;
+        }
+
+        function renderAssistantResponse(content) {
+            // Strip think tags for display, extract thought vs final answer
+            let cleanContent = content;
+            let thoughtText = '';
+            const thinkMatch = content.match(/(<think>)([\s\S]*?)(<\/think>)/);
+            if (thinkMatch) {
+                thoughtText = thinkMatch[1].trim();
+                cleanContent = content.substring(thinkMatch.index + thinkMatch[0].length).trim();
+            }
+            return `
+                <div class="flex items-start space-x-4 max-w-4xl">
+                    <div class="w-8 h-8 rounded bg-cyan-600/20 border border-cyan-500 flex items-center justify-center font-bold text-xs text-cyan-400 shrink-0 mt-1">Ω</div>
+                    <div class="bg-slate-900/90 border border-indigo-900/60 rounded-xl p-4 text-slate-200 text-sm shadow-xl space-y-2">
+                        ${thoughtText ? `<details class="text-[10px] text-slate-500"><summary>Ashen AI Reasoning</summary><pre class="whitespace-pre-wrap mt-1">${thoughtText.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre></details>` : ''}
+                        <div class="prose prose-invert prose-sm max-w-none">${cleanContent.replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}</div>
+                    </div>
+                </div>`;
         }
 
         let currentDirPath = '';
@@ -1216,6 +1290,147 @@ HTML_PAGE = """<!DOCTYPE html>
             a.click();
         }
 
+        // --- Session Management ---
+        async function loadSessionList() {
+            try {
+                const res = await fetch('/api/sessions');
+                const data = await res.json();
+                const listEl = document.getElementById('session-list');
+                const labelEl = document.getElementById('current-session-label');
+
+                if (!listEl) return;
+
+                if (data.sessions && data.sessions.length > 0) {
+                    listEl.innerHTML = '';
+                    data.sessions.forEach(s => {
+                        const item = document.createElement('div');
+                        const isCurrent = s.id === data.current;
+                        const dateStr = s.updated ? new Date(s.updated).toLocaleString() : '';
+                        item.className = `p-2 rounded cursor-pointer transition flex items-center justify-between ${isCurrent ? 'bg-blue-950/40 border border-blue-800/60' : 'bg-slate-900/50 hover:bg-slate-800 border border-transparent'}`;
+                        item.innerHTML = `
+                            <div class="flex-1 min-w-0">
+                                <div class="text-xs font-semibold ${isCurrent ? 'text-blue-300' : 'text-slate-300'} truncate">${s.name || 'Untitled'}</div>
+                                <div class="text-[10px] text-slate-500">${s.message_count} msgs · ${dateStr}</div>
+                            </div>
+                            <div class="flex gap-1 ml-2 shrink-0">
+                                ${!isCurrent ? `<button onclick="event.stopPropagation(); loadSession('${s.id}')" class="text-[10px] px-1.5 py-0.5 bg-blue-950 hover:bg-blue-900 text-blue-300 rounded border border-blue-800/40">Load</button>` : '<span class="text-[10px] text-blue-400">● Active</span>'}
+                                <button onclick="event.stopPropagation(); renameSessionPrompt('${s.id}')" class="text-[10px] px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded">✎</button>
+                                <button onclick="event.stopPropagation(); deleteSessionConfirm('${s.id}')" class="text-[10px] px-1.5 py-0.5 bg-red-950 hover:bg-red-900 text-red-300 rounded">×</button>
+                            </div>`;
+                        item.onclick = () => loadSession(s.id);
+                        listEl.appendChild(item);
+                    });
+                } else {
+                    listEl.innerHTML = '<div class="text-slate-500 text-xs text-center py-4">No past sessions</div>';
+                }
+
+                if (labelEl && data.current) {
+                    const currentData = data.sessions.find(s => s.id === data.current);
+                    labelEl.textContent = currentData ? `Active: ${currentData.name}` : 'No active session';
+                }
+            } catch (e) { /* non-blocking */ }
+        }
+
+        async function createNewSession() {
+            try {
+                const res = await fetch('/api/sessions/new', { method: 'POST' });
+                const data = await res.json();
+                if (data.status === 'created') {
+                    // Clear chat UI
+                    const container = document.getElementById('chat-container');
+                    container.innerHTML = `
+                        <div class="flex items-start space-x-4 max-w-4xl">
+                            <div class="w-8 h-8 rounded bg-cyan-600/20 border border-cyan-500 flex items-center justify-center font-bold text-xs text-cyan-400 shrink-0">Ω</div>
+                            <div class="bg-slate-900/90 border border-indigo-900/60 rounded-xl p-4 text-slate-200 text-sm shadow-xl space-y-2">
+                                <p class="font-bold text-cyan-400">New Chat Started</p>
+                                <p class="text-xs text-slate-300">Fresh session ready for your next prompt.</p>
+                            </div>
+                        </div>`;
+                    // Reset workspace context indicator
+                    const ctxLabel = document.getElementById('workspace-context-label');
+                    if (ctxLabel) { ctxLabel.textContent = '📁 None'; ctxLabel.title = 'No workspace context active'; }
+                    toggleSessionsPanel(false);
+                    loadSessionList();
+                }
+            } catch (e) { alert('Failed to create session.'); }
+        }
+
+        async function loadSession(sid) {
+            try {
+                const res = await fetch('/api/sessions/load', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sid })
+                });
+                const data = await res.json();
+                if (data.status === 'loaded') {
+                    // Restore chat history in UI
+                    const container = document.getElementById('chat-container');
+                    const messages = data.session.history || [];
+                    let html = '';
+                    if (messages.length === 0) {
+                        html = `<div class="flex items-start space-x-4 max-w-4xl">
+                            <div class="w-8 h-8 rounded bg-cyan-600/20 border border-cyan-500 flex items-center justify-center font-bold text-xs text-cyan-400 shrink-0">Ω</div>
+                            <div class="bg-slate-900/90 border border-indigo-900/60 rounded-xl p-4 text-slate-200 text-sm shadow-xl">
+                                <p class="font-bold text-cyan-400">Loaded "${data.session.name}"</p>
+                                <p class="text-xs text-slate-300 mt-1">This session has no messages yet.</p>
+                            </div></div>`;
+                    } else {
+                        messages.forEach(m => {
+                            html += renderUserMessage(m.user);
+                            const respContent = m.assistant || '';
+                            html += renderAssistantResponse(respContent);
+                        });
+                    }
+                    container.innerHTML = html;
+                    container.scrollTop = container.scrollHeight;
+                    toggleSessionsPanel(false);
+                    loadSessionList();
+                }
+            } catch (e) { alert('Failed to load session.'); }
+        }
+
+        async function deleteSessionConfirm(sid) {
+            const session = list_sessions_cache?.find(s => s.id === sid);
+            const name = session ? session.name : 'this session';
+            if (!confirm(`Delete session "${name}"? This cannot be undone.`)) return;
+            try {
+                const res = await fetch('/api/sessions/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sid })
+                });
+                const data = await res.json();
+                if (data.status === 'deleted') {
+                    const container = document.getElementById('chat-container');
+                    container.innerHTML = `<div class="flex items-center justify-center text-red-400 text-xs">Session deleted.</div>`;
+                    const ctxLabel = document.getElementById('workspace-context-label');
+                    if (ctxLabel) { ctxLabel.textContent = '📁 None'; ctxLabel.title = 'No workspace context active'; }
+                    loadSessionList();
+                }
+            } catch (e) { alert('Failed to delete session.'); }
+        }
+
+        async function renameSessionPrompt(sid) {
+            const session = list_sessions_cache?.find(s => s.id === sid);
+            const name = session ? session.name : 'Untitled';
+            const newName = prompt('Rename session:', name);
+            if (!newName || newName.trim() === '') return;
+            try {
+                await fetch('/api/sessions/rename', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ session_id: sid, name: newName.trim() })
+                });
+                loadSessionList();
+            } catch (e) { alert('Failed to rename session.'); }
+        }
+
+        let list_sessions_cache = null;
+        // Cache & periodically refresh session list
+        loadSessionList();
+        setInterval(loadSessionList, 30000);
+
         // Initialize workspace file tree on page load
         loadWorkspaceDir('');
     </script>
@@ -1283,6 +1498,94 @@ def get_directory_listing(dir_path):
         'items': items
     }
 
+# --- Session Management Helpers ---
+
+def _session_file(session_id):
+    return os.path.join(SESSIONS_DIR, f"{session_id}.json")
+
+def save_session(session_id, data):
+    """Save a full session (history + workspace context + settings + persona) to disk."""
+    filepath = _session_file(session_id)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def load_session(session_id):
+    """Load a session from disk. Returns dict or None."""
+    filepath = _session_file(session_id)
+    if not os.path.exists(filepath):
+        return None
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def list_sessions():
+    """Return a list of all sessions sorted by date (newest first)."""
+    sessions = []
+    for fname in os.listdir(SESSIONS_DIR):
+        if not fname.endswith('.json'):
+            continue
+        sid = fname[:-5]  # strip .json
+        filepath = os.path.join(SESSIONS_DIR, fname)
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            sessions.append({
+                'id': sid,
+                'name': data.get('name', 'Untitled'),
+                'created': data.get('created_at', ''),
+                'updated': data.get('updated_at', ''),
+                'message_count': len(data.get('history', [])),
+                'persona': data.get('persona', 'ashen_ai_agent'),
+                'size_bytes': os.path.getsize(filepath)
+            })
+        except Exception:
+            pass
+    sessions.sort(key=lambda s: s.get('updated', ''), reverse=True)
+    return sessions
+
+def delete_session(session_id):
+    """Delete a session file. Returns True if deleted."""
+    filepath = _session_file(session_id)
+    if os.path.exists(filepath):
+        os.remove(filepath)
+        return True
+    return False
+
+def create_new_session():
+    """Create a new session ID and return it."""
+    global current_session_id
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    current_session_id = f"session_{ts}"
+    # Save initial blank session
+    save_session(current_session_id, {
+        'name': 'Untitled',
+        'created_at': datetime.datetime.now().isoformat(),
+        'updated_at': datetime.datetime.now().isoformat(),
+        'persona': 'ashen_ai_agent',
+        'settings': {
+            'temperature': 0.7,
+            'top_k': 40,
+            'top_p': 0.9,
+            'max_new_tokens': 250,
+            'context_length': 8192,
+            'gpu_layers': 16,
+            'repeat_penalty': 1.1
+        },
+        'history': [],
+        'workspace_context': ''
+    })
+    return current_session_id
+
+def append_to_session(session_id, user_msg, assistant_msg):
+    """Append a message pair to the session's history."""
+    global current_session_id
+    data = load_session(session_id)
+    if not data:
+        return
+    data['history'].append({'user': user_msg, 'assistant': assistant_msg})
+    data['updated_at'] = datetime.datetime.now().isoformat()
+    save_session(session_id, data)
+    current_session_id = session_id
+
 class ChatHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         parsed_url = urlparse(self.path)
@@ -1325,6 +1628,12 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(json.dumps({'models': hf_models}).encode('utf-8'))
+        elif path == '/api/sessions':
+            sessions = list_sessions()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({'sessions': sessions, 'current': current_session_id}).encode('utf-8'))
         elif path == '/api/workspace/list':
             dir_path = query.get('dir', [''])[0]
             listing = get_directory_listing(dir_path)
@@ -1352,15 +1661,28 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
-        global model, reasoner, current_model_filename
+        global model, reasoner, current_model_filename, current_session_id
         if self.path == '/api/chat':
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length)
             data = json.loads(body.decode('utf-8'))
             message = data.get('message', '')
 
+            # Auto-create session if none active
+            if not current_session_id:
+                current_session_id = create_new_session()
+                reasoner.session_id = current_session_id
+                # Auto-name session from first message
+                sdata = load_session(current_session_id)
+                if sdata and sdata.get('name', 'Untitled') == 'Untitled':
+                    preview = message[:50].replace('\n', ' ')
+                    sdata['name'] = preview + ('...' if len(message) > 50 else '')
+                    save_session(current_session_id, sdata)
+
             try:
                 thought, response = reasoner.solve_with_agent(message)
+                # Save to session
+                append_to_session(current_session_id, message, f"<think>\n{thought}\n</think>\n{response}")
                 resp_data = {'thought': thought, 'response': response}
             except Exception as e:
                 resp_data = {'thought': 'Error during Ashen AI execution', 'response': str(e)}
@@ -1371,6 +1693,23 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps(resp_data).encode('utf-8'))
 
         elif self.path == '/api/clear':
+            # Save current session before clearing
+            if current_session_id and load_session(current_session_id):
+                save_session(current_session_id, {
+                    'name': load_session(current_session_id)['name'],
+                    'persona': reasoner.persona,
+                    'settings': {
+                        'temperature': reasoner.temperature,
+                        'top_k': reasoner.top_k,
+                        'top_p': reasoner.top_p,
+                        'max_new_tokens': reasoner.max_new_tokens,
+                        'context_length': reasoner.context_length,
+                        'gpu_layers': reasoner.gpu_layers,
+                        'repeat_penalty': reasoner.repeat_penalty
+                    },
+                    'history': list(reasoner.history),
+                    'workspace_context': reasoner.workspace_context
+                })
             reasoner.clear_history()
             reasoner.set_workspace_context("")
             self.send_response(200)
@@ -1398,6 +1737,85 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(json.dumps({'status': 'success'}).encode('utf-8'))
+
+        # --- Session Management Endpoints ---
+        elif self.path == '/api/sessions/new':
+            sid = create_new_session()
+            self.send_response(201)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({'status': 'created', 'session_id': sid}).encode('utf-8'))
+
+        elif self.path == '/api/sessions':
+            sessions = list_sessions()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({'sessions': sessions, 'current': current_session_id}).encode('utf-8'))
+
+        elif self.path == '/api/sessions/load':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+            sid = data.get('session_id', '')
+            session_data = load_session(sid)
+            if session_data:
+                # Restore reasoner state from session
+                current_session_id = sid
+                reasoner.session_id = sid
+                reasoner.persona = session_data.get('persona', 'ashen_ai_agent')
+                reasoner.history = list(session_data.get('history', []))
+                ws_ctx = session_data.get('workspace_context', '')
+                if ws_ctx:
+                    reasoner.set_workspace_context(ws_ctx)
+                resp = {'status': 'loaded', 'session': session_data}
+            else:
+                resp = {'status': 'error', 'message': 'Session not found'}
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp).encode('utf-8'))
+
+        elif self.path == '/api/sessions/delete':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+            sid = data.get('session_id', '')
+            if delete_session(sid):
+                if current_session_id == sid:
+                    current_session_id = None
+                    reasoner.session_id = None
+                    reasoner.clear_history()
+                    reasoner.set_workspace_context("")
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'deleted'}).encode('utf-8'))
+            else:
+                self.send_response(404)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'error', 'message': 'Session not found'}).encode('utf-8'))
+
+        elif self.path == '/api/sessions/rename':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+            sid = data.get('session_id', '')
+            name = data.get('name', 'Untitled')
+            sdata = load_session(sid)
+            if sdata:
+                sdata['name'] = name
+                save_session(sid, sdata)
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'renamed'}).encode('utf-8'))
+            else:
+                self.send_response(404)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'error', 'message': 'Session not found'}).encode('utf-8'))
 
         elif self.path == '/api/workspace/context':
             # Push current workspace directory listing into model context
