@@ -328,6 +328,74 @@ class AshenAIAgenticEngine:
                 output = res.stdout if res.returncode == 0 else res.stderr
                 return output[:2000] if output else "Command executed with no output."
 
+            elif tool_name == 'web_search':
+                query = kwargs.get('query', '')
+                try:
+                    url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    }
+                    resp = requests.get(url, headers=headers, timeout=10)
+                    if resp.status_code == 200:
+                        from html.parser import HTMLParser
+                        
+                        class TitleExtractor(HTMLParser):
+                            def __init__(self):
+                                super().__init__()
+                                self.in_title = False
+                                self.title = ""
+                            
+                            def handle_starttag(self, tag, attrs):
+                                if tag == 'title':
+                                    self.in_title = True
+                            
+                            def handle_data(self, data):
+                                if self.in_title:
+                                    self.title += data
+                            
+                            def handle_endtag(self, tag):
+                                if tag == 'title':
+                                    self.in_title = False
+                        
+                        # Extract titles from results
+                        titles = []
+                        for match in re.finditer(r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', resp.text, re.DOTALL):
+                            title_text = re.sub(r'<[^>]+>', '', match.group(1))
+                            if title_text.strip():
+                                titles.append(title_text.strip())
+                        
+                        if titles:
+                            result = f"DuckDuckGo search results for '{query}':\n\n"
+                            for i, title in enumerate(titles[:5], 1):
+                                result += f"{i}. {title}\n"
+                            result += f"\nFound {len(titles)} results total. Use browse_url to get full content of specific pages."
+                            return result
+                        else:
+                            return f"No results found for '{query}'"
+                    else:
+                        return f"Search failed with status code {resp.status_code}"
+                except Exception as e:
+                    return f"Web search error: {str(e)}"
+
+            elif tool_name == 'browse_url':
+                url = kwargs.get('url', '')
+                try:
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                    }
+                    resp = requests.get(url, headers=headers, timeout=15)
+                    if resp.status_code == 200:
+                        # Strip HTML tags and extract readable content
+                        content = re.sub(r'<[^>]+>', ' ', resp.text)
+                        content = re.sub(r'\s+', ' ', content).strip()
+                        # Take first 2000 chars to stay within token limits
+                        readable_content = content[:2000]
+                        return f"Content from {url}:\n\n{readable_content}"
+                    else:
+                        return f"Failed to fetch URL: Status code {resp.status_code}"
+                except Exception as e:
+                    return f"Browse error: {str(e)}"
+
             else:
                 return f"Unknown tool: {tool_name}"
         except Exception as e:
@@ -357,6 +425,8 @@ class AshenAIAgenticEngine:
             "- glob(pattern='...')\n"
             "- grep_search(pattern='...')\n"
             "- run_shell_command(command='...')\n"
+            "- web_search(query='...') — Search DuckDuckGo for information\n"
+            "- browse_url(url='...') — Fetch and extract text from a webpage\n"
             "To use a tool, output: [TOOL: tool_name(arg1=val1, arg2=val2)]\n"
             "After observing tool output, continue reasoning until you give your final answer.\n\n"
         )
@@ -709,6 +779,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     <button onclick="sendQuickPrompt('Check git status and diff')" class="p-2 text-left text-xs bg-slate-900 hover:bg-indigo-950/50 text-indigo-300 rounded border border-indigo-900/50 transition">📦 Git Status</button>
                     <button onclick="sendQuickPrompt('List workspace files using glob')" class="p-2 text-left text-xs bg-slate-900 hover:bg-indigo-950/50 text-indigo-300 rounded border border-indigo-900/50 transition">🔍 File Glob</button>
                     <button onclick="sendQuickPrompt('Search codebase for reasoning engine')" class="p-2 text-left text-xs bg-slate-900 hover:bg-indigo-950/50 text-indigo-300 rounded border border-indigo-900/50 transition">🔎 Grep Search</button>
+                    <button onclick="sendQuickPrompt('Search DuckDuckGo for PyTorch 2.0 features')" class="p-2 text-left text-xs bg-emerald-900/50 hover:bg-emerald-950/50 text-emerald-300 rounded border border-emerald-800/50 transition">🌐 Web Search</button>
+                    <button onclick="sendQuickPrompt('Browse https://pytorch.org/docs/stable/index.html')" class="p-2 text-left text-xs bg-purple-900/50 hover:bg-purple-950/50 text-purple-300 rounded border border-purple-800/50 transition">📖 Browse URL</button>
                 </div>
             </div>
 
