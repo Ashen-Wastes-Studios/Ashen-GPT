@@ -996,26 +996,25 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     const editor = document.getElementById('code-editor');
                     const codeEl = document.getElementById('highlighted-code');
                     console.log('[DEBUG] editor:', !!editor, 'codeEl:', !!codeEl, 'content length:', data.content?.length || 0);
-                    console.log('[DEBUG] codeEl before:', codeEl ? codeEl.outerHTML.substring(0, 100) : 'null');
                     
                     if (editor) {
                         editor.value = data.content;
                     }
                     
                     if (codeEl) {
-                        // First set the text, then delay highlighting
+                        // Set text and force re-render before highlighting
                         codeEl.textContent = data.content;
-                        console.log('[DEBUG] codeEl after setText:', codeEl.className);
+                        void codeEl.offsetWidth; // Force reflow
                         
-                        setTimeout(() => {
-                            if (typeof Prism !== 'undefined' && Prism.highlightElement) {
-                                Prism.highlightElement(codeEl);
-                                console.log('[DEBUG] After highlight:', codeEl.outerHTML.substring(0, 200));
+                        // Use requestAnimationFrame then Prism.highlightAll()
+                        requestAnimationFrame(() => {
+                            if (typeof Prism !== 'undefined') {
+                                Prism.highlightAll();
+                                console.log('[DEBUG] Prism.highlightAll() called');
                             } else {
-                                console.warn('[DEBUG] Prism not available or highlightElement missing');
-                                console.log('[DEBUG] typeof Prism:', typeof Prism);
+                                console.warn('[DEBUG] Prism not loaded');
                             }
-                        }, 100);
+                        });
                     }
                     if (!editor && !codeEl) {
                         console.error('[DEBUG] ERROR: code-editor or highlighted-code element not found!');
