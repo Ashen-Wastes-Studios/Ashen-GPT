@@ -51,6 +51,32 @@ Ashen GPT is tuned for **consumer GPUs (8GB+ VRAM)** with strict memory protecti
 - 8 diverse tasks (Python, JavaScript, Go, concept explanations) over 3 epochs at `lr=5e-5`.
 - Outputs follow a `### Instruction:` / `### Response:` format that primes the agent's ReAct loop.
 
+### Phase 3 — Reinforcement Learning (Direct Preference Optimization)
+
+| Parameter | Value | Purpose |
+|---|---|---|
+| **Algorithm** | DPO (Rafael et al., 2023) | Align outputs with preferences via direct reward optimization |
+| **Learning Rate** | `1e-5` | Conservative fine-tuning to preserve SFT knowledge |
+| **Beta** | `0.1` | Controls alignment pressure vs. reference model deviation |
+| **Epochs** | 2 | Full pass over preference dataset |
+| **Context Window** | 4K tokens | Balanced for instruction-response pairs |
+
+**How it works:**
+1. Preference pairs: `(chosen_response, rejected_response)` for each instruction
+2. Computes log-probabilities for both responses under current policy
+3. Optimizes using DPO loss: maximizes `β × (log π_chosen - log π_rejected)` via negative log-sigmoid
+4. No separate reward model needed — directly optimizes policy from human feedback signals
+
+**Preference Dataset (6 examples):**
+- Python decorators → detailed explanation vs one-liner
+- Binary search → full implementation with comments vs broken code
+- Transfer learning → thorough ML explanation vs vague definition
+- LRU Cache → complete OrderedDict implementation vs empty class stub
+- REST vs GraphQL → comprehensive technical comparison vs dismissive answer
+- Gradient Descent → mathematical formulation vs oversimplified analogy
+
+**Output:** Saves aligned model as `ashen_gpt_model_dpo.pk1` while preserving original SFT checkpoint as `ashen_gpt_model.pk1`.
+
 ---
 
 ## 🤖 Agentic Chatbot Interfaces
@@ -170,10 +196,11 @@ Sessions are stored as JSON files in `sessions/` and include: conversation histo
 ## 📁 Project Structure
 
 ```
-ashen_gpt_trainer.py    # Full training pipeline (pre-train + SFT)
+ashen_gpt_trainer.py    # Full training pipeline (Pre-training → SFT → DPO)
 chatbot.py              # CLI agentic chatbot (sessions, workspace context, /cd)
 web_chatbot.py          # Web UI agentic chatbot (cyberpunk, sessions, workspace context)
-ashen_gpt_model.pk1     # Saved model checkpoint (generated after training)
+ashen_gpt_model.pk1     # SFT-aligned model (~127M params, 8K context)
+ashen_gpt_model_dpo.pk1 # RL-aligned model (DPO preference optimization)
 training_logs.txt       # Auto-generated training log
 sessions/               # Web chatbot sessions (JSON with history, settings, context)
 sessions_cli/           # CLI chatbot sessions (JSON with history, workspace context)
