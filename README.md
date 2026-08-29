@@ -1,92 +1,141 @@
 # Ashen GPT
 
-Ashen GPT is a high-performance, custom PyTorch implementation of a **Qwen-like Transformer architecture** trained from scratch on a hybrid dataset of literature and multi-language open-source code. It is specifically optimized for consumer hardware (tuned for 8GB+ VRAM GPUs with strict memory protection against shared memory bleeding).
+Ashen GPT is a high-performance, custom PyTorch implementation of a **Qwen-like Transformer architecture** trained from scratch on a hybrid dataset of literature and multi-language open-source code. It features a ~127M-parameter sparse Mixture-of-Experts model with progressive context extension, chain-of-thought reasoning, and autonomous tool-execution agents — all running locally on consumer hardware (8GB+ VRAM).
 
 ---
 
 ## 🚀 Key Architectural Features
 
-- **RMSNorm**: Replaces standard LayerNorm for enhanced training stability and efficiency.
-- **Rotary Position Embeddings (RoPE)**: Features Dynamic NTK-aware scaling for robust length extrapolation across extended contexts.
-- **QK-Norm**: Applies RMS normalization directly to Query and Key projections prior to attention score calculations.
-- **SwiGLU Mixture of Experts (MoE)**: Features sparse MoE feed-forward networks with Top-2 expert routing and SwiGLU activation (`SiLU(gate) * up`).
-- **Memory-Efficient Attention**: Utilizes PyTorch's optimized `scaled_dot_product_attention` combined with self-attention gradient checkpointing.
+| Component | Detail |
+|---|---|
+| **Architecture** | Qwen-style decoder-only Transformer with causal self-attention |
+| **Normalization** | RMSNorm (no mean-centering; scales by root mean square) |
+| **Position Encoding** | Rotary Embeddings (RoPE) with Dynamic NTK-aware scaling for extrapolation beyond training context |
+| **Attention** | QK-Norm + `torch.nn.functional.scaled_dot_product_attention` (causal mask, dropout) |
+| **Feed-Forward** | SwiGLU MoE — 4 experts, Top-2 gating, `SiLU(gate) * up` fusion |
+| **Tokenizer** | GPT-2 BPE via `tiktoken` (50,257 vocab) |
+| **Max Context** | 8,192 tokens (trained progressively 512 → 2K → 8K) |
+| **Model Scale** | `n_embd=512`, `n_layer=8`, `n_head=8` (~127M params) |
+| **Optimizer** | AdamW with cosine LR decay, gradient clipping (norm ≤ 1.0), mixed-precision autocast |
 
 ---
 
-## ⚙️ Hardware Optimization (~127M Scale & Shared Memory Protection)
+## ⚙️ Hardware Optimization
 
-Training large models from scratch on consumer GPUs is heavily constrained by activation memory and optimizer states. Ashen GPT is tuned to **~127 Million parameters** (`n_embd = 512`, `n_layer = 8`, `n_head = 8`) for lightning-fast, OOM-free training on consumer GPUs:
-- **Zero Shared Memory Bleeding**: Implements strict self-attention gradient checkpointing (`torch.utils.checkpoint`), periodic CUDA cache clearing (`torch.cuda.empty_cache()`), and garbage collection (`gc.collect()`) to ensure training stays 100% inside dedicated VRAM.
-- **Progressive Context Staging (512 -> 2K -> 8K)**: Safely scales context length through progressive stages to prevent quadratic ($O(T^2)$) attention memory spikes.
+Ashen GPT is tuned for **consumer GPUs (8GB+ VRAM)** with strict memory protection:
 
----
-
-## 🔄 Automatic Checkpoint Detection & Training Logs
-
-- **2x Depth Upscaling**: Automatically detects existing checkpoints (`ashen_gpt_model.pk1`) and doubles transformer layer depth (e.g., 8 -> 16 layers) while preserving weights.
-- **Automated Training Logging (`training_logs.txt`)**: All training output, step losses, evaluation results, generation tests, and fine-tuning epochs are automatically captured and streamed to `training_logs.txt` with timestamped run sessions while remaining visible in your terminal.
+- **Gradient Checkpointing**: Activates during Stage 3 training (context > 2048) to trade compute for VRAM in the attention sub-layer.
+- **CUDA Cache Management**: Periodic `torch.cuda.empty_cache()` + `gc.collect()` after every step and evaluation block.
+- **Progressive Context Staging**: Safely scales through three context lengths (512 → 2K → 8K) to prevent $O(T^2)$ attention memory spikes.
+- **Auto Upscaling**: On re-run, existing checkpoints (`ashen_gpt_model.pk1`) are detected and depth-doubled (8 → 16 layers) before continued training.
 
 ---
 
-## 🤖 Ashen AI Cybernetic Hub & Agentic CLI Chatbots
+## 🔄 Training Pipeline
 
-Ashen GPT includes both a multi-turn CLI chatbot and a feature-rich, cybernetic **Ashen AI Web Interface** equipped with **full agentic capabilities (ReAct tool execution loop)**.
+### Phase 1 — Pre-training (5,000 iterations)
 
-### ⚡ Ashen AI Web Hub Features
-- **Cyberpunk / Retro-Gaming Aesthetic**: Deep dark theme with neon accents and toggleable CRT scanline visual effects (`CRT FX: ON/OFF`).
-- **Model Hub & Checkpoint Manager**: A dedicated modal window allowing users to **view local model checkpoints**, **upload new model weights (`.pk1` / `.pt`)**, and **instantly switch active models** in memory.
-- **Live System Telemetry**: Real-time display of active model name, PyTorch CUDA backend, and 8K token context window.
-- **Persona Switcher**: Switch between *Ashen AI Agent*, *Code Architect*, and *Cyber Companion* personas on the fly.
-- **Quick Action Chips**: One-click execution for common tasks (*Run Tests*, *Git Status*, *File Glob*, *Grep Search*).
-- **Session Export & Purge**: Export chat sessions as Markdown (`.md`) or purge memory instantly.
+| Stage | Iterations | Context | Batch | Gradient Accumulation |
+|---|---|---|---|---|
+| Core Training | 0–3,000 | 512 | 8 | 2 |
+| Intermediate Extension | 3,001–4,500 | 2,048 | 2 | 8 |
+| Extreme Extension | 4,501–5,000 | 8,192 | 1 | 16 |
 
-### 🛠️ Agentic Tool Execution
-The model can autonomously reason over tasks and invoke the following tools:
-- `read_file(file_path="...")` — Read file contents from the workspace.
-- `write_file(file_path="...", content="...")` — Create or modify files.
-- `glob(pattern="...")` — Discover files matching glob patterns.
-- `grep_search(pattern="...")` — Search for code patterns across project files.
-- `run_shell_command(command="...")` — Execute terminal operations (e.g. `pytest`, `git status`).
+- Evaluation & generation tests run every 250 iterations.
+- Auto-detects and doubles checkpoint depth if `ashen_gpt_model.pk1` already exists.
+- Training logs stream to both terminal and `training_logs.txt` (timestamped sessions).
 
----
+### Phase 2 — Supervised Fine-Tuning (SFT)
 
-## 📊 Hybrid Training & Evaluation
-
-### 1. Progressive Staged Training Pipeline (5,000 Max Iters)
-- **Stage 1 (Core Training)**: 512 context length (`iters 0-3000`)
-- **Stage 2 (Intermediate Extension)**: 2,048 context length (`iters 3001-4500`)
-- **Stage 3 (Extreme Extension)**: 8,192 (8K) context length (`iters 4501-5000`)
-
-### 2. Hybrid Data Pipeline
-Combines literature (`train_split.txt`, `val_split.txt`) and scraped multi-language open-source code (`code_train_split.txt`) using robust BPE tokenization (`tiktoken` GPT-2 encoding) and memory-mapped streaming.
-
-### 3. Supervised Fine-Tuning (SFT)
-- **Curated Instruction Dataset**: Diverse instruction-following and coding tasks structured with explicit `<think>` reasoning traces.
+- Curated instruction/response pairs with explicit `<think>` reasoning traces.
+- 8 diverse tasks (Python, JavaScript, Go, concept explanations) over 3 epochs at `lr=5e-5`.
+- Outputs follow a `### Instruction:` / `### Response:` format that primes the agent's ReAct loop.
 
 ---
 
-## 🚀 Getting Started & Usage
+## 🤖 Agentic Chatbot Interfaces
+
+Both chatbots ship with **chain-of-thought reasoning** and a **ReAct tool loop** (max 5 reasoning steps per turn). The model autonomously emits `[TOOL: name(args)]` directives and continues until it reaches a final answer.
+
+### CLI Chatbot (`chatbot.py`)
+
+```cmd
+run_chatbot.bat
+```
+
+**Commands:** `/clear` · `/help` · `/exit`
+
+**Tools:**
+- `read_file(file_path='...')` — Read workspace files.
+- `write_file(file_path='...', content='...')` — Create/overwrite files.
+- `glob(pattern='...')` — File discovery.
+- `grep_search(pattern='...')` — Content search across `.py`, `.md`, `.txt`, `.bat`.
+- `run_shell_command(command='...')` — Run any shell command (30s timeout).
+
+### Web Chatbot (`web_chatbot.py`) — Cyberpunk UI
+
+```cmd
+run_web_chatbot.bat   →   http://localhost:5000
+```
+
+**Features:**
+
+- **Cyberpunk aesthetic** — dark theme, neon accents, toggleable CRT scanline overlay.
+- **Persona switcher** — *Ashen AI Agent*, *Code Architect*, *Cyber Companion*.
+- **Model Hub modal** — browse local `.pk1` checkpoints, upload new weights, swap models live.
+- **Quick-action chips** — one-click buttons for common agent tools (*File Glob*, *Grep*, *Git Status*, *Run Tests*).
+- **Adjustable settings** — temperature, top-k, max tokens, context length, GPU layer count, repeat penalty.
+- **Session management** — export chats as Markdown or purge history instantly.
+- **Workspace browser** — navigate project directory directly from the UI.
+
+---
+
+## 📊 Data Pipeline
+
+- **Literature**: `train_split.txt` / `val_split.txt` (validation split).
+- **Code**: `code_train_split.txt` (scraped from public GitHub repos).
+- Memory-mapped streaming (`mmap.mmap`) for O(1) RAM regardless of dataset size.
+- Hybrid random selection between text and code splits during training.
+
+---
+
+## 🚀 Getting Started
 
 ### Prerequisites
+
 - Python 3.10+
-- PyTorch with CUDA support
-- `tiktoken`, `requests`
+- PyTorch (with CUDA if available)
+- `pip install tiktoken requests`
 
-### Running the Scripts
+### Quick Start
 
-- **Train / Upscale Custom ~127M Model (Logs to `training_logs.txt`)**:
-  ```cmd
-  run_ashen_gpt.bat
-  ```
-- **Interact via Agentic CLI Chatbot (`chatbot.py`)**:
-  ```cmd
-  run_chatbot.bat
-  ```
-- **Launch Ashen AI Cybernetic Web Hub (`http://localhost:5000`)**:
-  ```cmd
-  run_web_chatbot.bat
-  ```
+| Script | Description | Command |
+|---|---|---|
+| `ashen_gpt_trainer.py` | Train / upscaling pre-training + SFT | `python ashen_gpt_trainer.py` or `run_ashen_gpt.bat` |
+| `chatbot.py` | Terminal-based agentic chatbot | `python chatbot.py` or `run_chatbot.bat` |
+| `web_chatbot.py` | Browser-based cyberpunk UI (port 5000) | `python web_chatbot.py` or `run_web_chatbot.bat` |
+
+### Workflow
+
+1. **Train** → produces `ashen_gpt_model.pk1` (~127M params, 8K context).
+2. **Chat** → launch CLI or Web interface; the model loads the saved checkpoint automatically.
+3. **Agent mode** → ask the model to inspect files, run commands, or explore your workspace.
+
+---
+
+## 📁 Project Structure
+
+```
+ashen_gpt_trainer.py    # Full training pipeline (pre-train + SFT)
+chatbot.py              # CLI agentic chatbot
+web_chatbot.py          # Web UI agentic chatbot (cyberpunk)
+ashen_gpt_model.pk1     # Saved model checkpoint (generated after training)
+training_logs.txt       # Auto-generated training log
+train_split.txt         # Literature training data
+val_split.txt           # Validation data
+code_train_split.txt    # Scraped code training data
+run_*.bat               # Windows launch scripts
+```
 
 ---
 
