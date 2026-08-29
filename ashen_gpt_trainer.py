@@ -21,13 +21,13 @@ import copy
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using optimized device: {device}")
 
-# --- Progressive Multi-Hop Staged Training Configuration (Fast 500 Max Iters) ---
-max_iters = 500                 # Reduced max_iters for lightning-fast training completion
-eval_interval = 100             # Frequent evaluation checkpoints
+# --- Progressive Multi-Hop Staged Training Configuration (5,000 Max Iters) ---
+max_iters = 5000                # Robust multi-thousand iteration pre-training run
+eval_interval = 250             # Evaluation checkpoints
 learning_rate = 4e-4
 min_learning_rate = 3e-5
-warmup_iters = 100
-eval_iters = 100
+warmup_iters = 200
+eval_iters = 50
 n_embd = 512
 n_layer = 8
 n_head = 8
@@ -349,8 +349,8 @@ def estimate_loss(current_block_size, current_batch_size):
     model.train()
     return out
 
-# --- PROGRESSIVE STAGED TRAINING LOOP (2k -> 8k -> 32k scaled to 500 iters) ---
-print("=== Starting Lightning-Fast Progressive Staged Training Pipeline (500 Iters) ===", flush=True)
+# --- PROGRESSIVE STAGED TRAINING LOOP (512 -> 2k -> 8k scaled to 5,000 iters) ---
+print("=== Starting Progressive Staged Training Pipeline (5,000 Iters) ===", flush=True)
 optimizer.zero_grad(set_to_none=True)
 
 for iter in range(max_iters):
@@ -359,13 +359,13 @@ for iter in range(max_iters):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # Determine current training stage based on iteration (scaled for 500 max_iters)
-    if iter <= 300:
+    # Determine current training stage based on iteration (scaled for 5,000 max_iters)
+    if iter <= 3000:
         stage_name = "Stage 1: Core Training"
         current_block_size = 512
         current_batch_size = 8
         gradient_accumulation_steps = 2
-    elif iter <= 450:
+    elif iter <= 4500:
         stage_name = "Stage 2: Intermediate Extension"
         current_block_size = 2048
         current_batch_size = 2
@@ -446,11 +446,35 @@ SFT_DATASET = [
     {
         "instruction": "What is attention in transformers?",
         "response": "<think>\nAttention computes relationships between tokens using Query, Key, and Value vectors.\n</think>\nAttention is a core transformer mechanism that calculates how much focus one token should place on other tokens in a sequence."
+    },
+    {
+        "instruction": "Write a Python function to calculate factorial.",
+        "response": "<think>\nTo calculate factorial, we can use recursion or iteration. Recursion is clean: base case n <= 1 return 1, else n * factorial(n-1).\n</think>\ndef factorial(n):\n    if n <= 1:\n        return 1\n    return n * factorial(n - 1)"
+    },
+    {
+        "instruction": "What is RMSNorm?",
+        "response": "<think>\nRMSNorm is Root Mean Square normalization, a simplified alternative to LayerNorm that scales by root mean square.\n</think>\nRMSNorm is a normalization technique that scales activations based on the root mean square of the input tensor, improving training efficiency without mean-centering."
+    },
+    {
+        "instruction": "Write a JavaScript function to check if a string is a palindrome.",
+        "response": "<think>\nClean the string by removing non-alphanumeric chars and lowercasing, then compare with its reverse.\n</think>\nfunction isPalindrome(str) {\n    const cleaned = str.toLowerCase().replace(/[^a-z0-9]/g, '');\n    return cleaned === cleaned.split('').reverse().join('');\n}"
+    },
+    {
+        "instruction": "Explain Rotary Position Embeddings (RoPE).",
+        "response": "<think>\nRoPE encodes relative position by rotating query and key vectors in complex planes.\n</think>\nRotary Position Embeddings (RoPE) multiply query and key representations by rotation matrices based on token positions, allowing the model to naturally capture relative distances."
+    },
+    {
+        "instruction": "Write a Go hello world function.",
+        "response": "<think>\nGo uses the main package and fmt.Println for printing.\n</think>\npackage main\nimport \"fmt\"\nfunc main() {\n    fmt.Println(\"Hello, World!\")\n}"
+    },
+    {
+        "instruction": "What is Mixture of Experts (MoE)?",
+        "response": "<think>\nMoE routes tokens to subsets of expert FFN networks using a gating router.\n</think>\nMixture of Experts (MoE) is a neural network architecture where multiple feed-forward expert sub-networks process tokens routed by a learned gating function, increasing capacity without proportional compute cost."
     }
 ]
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5, fused=True if device == 'cuda' else False)
-sft_epochs = 2
+sft_epochs = 3
 
 for epoch in range(sft_epochs):
     total_sft_loss = 0.0

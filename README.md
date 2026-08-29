@@ -33,16 +33,17 @@ The training script features an intelligent model upscaling mechanism:
 
 ## 📊 Hybrid Training & Evaluation
 
-### 1. Progressive Staged Training Pipeline (500 Max Iters)
-- **Stage 1 (Core Training)**: 512 context length (`eval_iters = 100`)
-- **Stage 2 (Intermediate Extension)**: 2,048 context length (`eval_iters = 100`)
-- **Stage 3 (Extreme Extension)**: 8,192 (8K) context length (`eval_iters = 100`)
+### 1. Progressive Staged Training Pipeline (5,000 Max Iters)
+- **Stage 1 (Core Training)**: 512 context length (`iters 0-3000`, `eval_iters = 50`)
+- **Stage 2 (Intermediate Extension)**: 2,048 context length (`iters 3001-4500`, `eval_iters = 50`)
+- **Stage 3 (Extreme Extension)**: 8,192 (8K) context length (`iters 4501-5000`, `eval_iters = 50`)
 
 ### 2. Hybrid Data Pipeline
-Combines literature (`train_split.txt`, `val_split.txt`) and scraped multi-language open-source code (`code_train_split.txt`) using robust BPE tokenization (`tiktoken` GPT-2 encoding).
+Combines literature (`train_split.txt`, `val_split.txt`) and scraped multi-language open-source code (`code_train_split.txt`) using robust BPE tokenization (`tiktoken` GPT-2 encoding) and memory-mapped streaming.
 
-### 3. Multi-Language Code Evaluation Suite
-During pre-training evaluations, the model is tested across 6 programming languages (Python, JavaScript/TypeScript, Go, Rust, C++, Ruby) alongside natural language concept tests.
+### 3. Supervised Fine-Tuning (SFT)
+- **Curated Instruction Dataset**: 8 diverse instruction-following and coding tasks (Python, JavaScript, Go, Math, Transformers, etc.), each structured with explicit `<think>` reasoning traces.
+- **SFT Epochs**: 3 epochs of supervised fine-tuning.
 
 ---
 
@@ -64,7 +65,7 @@ The inference chatbot features an 8K context window, intent-based code filtering
 
 ### Running the Scripts
 
-- **Train / Upscale Custom ~127M Model (512 -> 2K -> 8K Pre-training + SFT + Auto-Upscaling)**:
+- **Train / Upscale Custom ~127M Model (5,000 Pre-training Iters + SFT + Auto-Upscaling)**:
   ```cmd
   run_ashen_gpt.bat
   ```
