@@ -12,6 +12,13 @@ import os
 import re
 import subprocess
 import glob as glob_module
+import json
+import datetime
+
+# --- Session Storage ---
+SESSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'sessions_cli')
+os.makedirs(SESSIONS_DIR, exist_ok=True)
+current_session_id = None
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
@@ -232,9 +239,24 @@ class AgenticReasoningEngine:
         self.device = device
         self.max_steps = max_steps
         self.history = []
+        self.workspace_context = ""
+        self.session_id = None
 
     def clear_history(self):
         self.history = []
+
+    def set_workspace_context(self, dir_path):
+        if not dir_path:
+            self.workspace_context = ""
+        else:
+            try:
+                items = []
+                for entry in os.scandir(dir_path):
+                    prefix = "📁 " if entry.is_dir() else "📄 "
+                    items.append(f"  {prefix}{entry.name}")
+                self.workspace_context = f"Directory: {os.path.abspath(dir_path)}\n" + "\n".join(items)
+            except Exception as e:
+                self.workspace_context = f"Error scanning directory: {e}"
 
     def execute_tool(self, tool_name, kwargs):
         try:
@@ -303,6 +325,9 @@ class AgenticReasoningEngine:
             "To use a tool, output: [TOOL: tool_name(arg1=val1, arg2=val2)]\n"
             "After observing tool output, continue reasoning until you give your final answer.\n\n"
         )
+
+        if self.workspace_context:
+            system_instructions += f"\n### Current Workspace Context\n{self.workspace_context}\n\n"
 
         conversation_context = system_instructions
         for h_user, h_resp in self.history[-2:]:
@@ -377,37 +402,243 @@ class AgenticReasoningEngine:
 
 reasoner = AgenticReasoningEngine(m, decode, encode, device)
 
+# --- Session Management Helpers ---
+
+def _session_file(session_id):
+    return os.path.join(SESSIONS_DIR, f"{session_id}.json")
+
+def save_session(session_id, data):
+    filepath = _session_file(session_id)
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+
+def load_session(session_id):
+    filepath = _session_file(session_id)
+    if not os.path.exists(filepath):
+        return None
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+def list_sessions():
+    sessions = []
+    for fname in os.listdir(SESSIONS_DIR):
+        if not fname.endswith('.json'):
+            continue
+        sid = fname[:-5]
+        filepath = os.path.join(SESSIONS_DIR, fname)
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            sessions.append({
+                'id': sid,
+                'name': data.get('name', 'Untitled'),
+                'updated': data.get('updated_at', ''),
+                'message_count': len(data.get('history', [])),
+                'workspace_context': data.get('workspace_context', '')
+            })
+        except Exception:
+            pass
+    sessions.sort(key=lambda s: s.get('updated', ''), reverse=True)
+    return sessions
+
+def delete_session(session_id):
+    filepath = _session_file(session_id)
+    if os.path.exists(filepath):
+        os.remove(filepath)
+        return True
+    return False
+
+def create_new_session(name=None):
+    global current_session_id
+    ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+    current_session_id = f"session_{ts}"
+    save_session(current_session_id, {
+        'name': name or 'Untitled',
+        'created_at': datetime.datetime.now().isoformat(),
+        'updated_at': datetime.datetime.now().isoformat(),
+        'history': [],
+        'workspace_context': ''
+    })
+    return current_session_id
+
+def append_to_session(session_id, user_msg, assistant_resp):
+    global current_session_id
+    data = load_session(session_id)
+    if not data:
+        return
+    data['history'].append({'user': user_msg, 'assistant': assistant_resp})
+    data['updated_at'] = datetime.datetime.now().isoformat()
+    save_session(session_id, data)
+    current_session_id = session_id
+
+def rename_session(session_id, name):
+    data = load_session(session_id)
+    if data:
+        data['name'] = name
+        save_session(session_id, data)
+        return True
+    return False
+
+reasoner.session_id = None  # Track session on reasoner
+
 if __name__ == "__main__":
     print("\n--- Ashen GPT Fully Functional Agentic CLI Chatbot Ready ---")
     print("Capabilities: Chain-of-Thought + Tool Execution (read_file, write_file, glob, grep_search, run_shell_command)")
+    print("Session & Workspace: /sessions, /new, /load <id>, /delete <id>, /rename <name>, /workspace <path>, /wctx off")
     print("Commands: /clear (reset conversation), /help (show help), /exit or /quit (exit)")
+    
+    # Auto-create first session
+    current_session_id = create_new_session("Initial Session")
+    reasoner.session_id = current_session_id
+    
     while True:
         try:
             prompt = input("\nUser:\n> ")
             if not prompt.strip():
                 continue
             cmd = prompt.strip().lower()
+            
+            # Session management commands
             if cmd in ['exit', 'quit', '/exit', '/quit']:
                 print("Goodbye!")
                 break
             if cmd == '/clear':
+                # Save before clearing
+                if current_session_id and load_session(current_session_id):
+                    save_session(current_session_id, {
+                        'name': load_session(current_session_id)['name'],
+                        'history': list(reasoner.history),
+                        'workspace_context': reasoner.workspace_context
+                    })
                 reasoner.clear_history()
+                reasoner.set_workspace_context("")
                 print("[Conversation history cleared]")
                 continue
+            if cmd == '/sessions':
+                sessions = list_sessions()
+                if not sessions:
+                    print("\nNo sessions found.")
+                else:
+                    print(f"\n{'ID':<25} {'Name':<20} {'Msgs':>6} {'Workspace':>10}  Updated")
+                    print("-" * 90)
+                    for s in sessions:
+                        wctx = "📁" if s.get('workspace_context') else "—"
+                        updated = s['updated'][:16] if s['updated'] else ''
+                        print(f"{s['id']:<25} {s['name']:<20} {s['message_count']:>6} {wctx:>10}  {updated}")
+                    print(f"\nTotal: {len(sessions)} sessions | Active: {current_session_id or 'None'}")
+                continue
+            if cmd == '/new':
+                current_session_id = create_new_session("New Session")
+                reasoner.session_id = current_session_id
+                reasoner.history = []
+                reasoner.workspace_context = ""
+                print(f"[Created new session: {current_session_id}]")
+                continue
+            if cmd.startswith('/load '):
+                sid = cmd[6:].strip()
+                if not sid:
+                    print("[Usage: /load <session_id>]")
+                    continue
+                data = load_session(sid)
+                if data:
+                    current_session_id = sid
+                    reasoner.session_id = sid
+                    reasoner.history = [(m['user'], m['assistant']) for m in data.get('history', [])]
+                    reasoner.set_workspace_context('')
+                    if data.get('workspace_context'):
+                        reasoner.workspace_context = data['workspace_context']
+                    print(f"[Loaded session '{data['name']}' with {len(data['history'])} messages]")
+                else:
+                    print(f"[Session not found: {sid}]")
+                continue
+            if cmd.startswith('/delete '):
+                sid = cmd[8:].strip()
+                if not sid:
+                    print("[Usage: /delete <session_id>]")
+                    continue
+                if delete_session(sid):
+                    if current_session_id == sid:
+                        current_session_id = None
+                        reasoner.session_id = None
+                        reasoner.history = []
+                        reasoner.workspace_context = ""
+                    print(f"[Deleted session: {sid}]")
+                else:
+                    print(f"[Session not found: {sid}]")
+                continue
+            if cmd.startswith('/rename '):
+                name = cmd[8:].strip()
+                if not name:
+                    print("[Usage: /rename <new_name>]")
+                    continue
+                if rename_session(current_session_id, name):
+                    print(f"[Renamed session to '{name}'")
+                else:
+                    print("[Failed to rename session]")
+                continue
+            if cmd.startswith('/workspace '):
+                dir_path = cmd[11:].strip()
+                if os.path.isdir(dir_path):
+                    reasoner.set_workspace_context(dir_path)
+                    print(f"[Workspace context set: {dir_path}]")
+                    # Update session
+                    if current_session_id:
+                        save_session(current_session_id, {
+                            'name': load_session(current_session_id)['name'] if load_session(current_session_id) else 'Untitled',
+                            'history': list(reasoner.history),
+                            'workspace_context': reasoner.workspace_context
+                        })
+                else:
+                    print(f"[Invalid directory: {dir_path}]")
+                continue
+            if cmd == '/wctx off' or cmd == '/workspace off':
+                reasoner.set_workspace_context('')
+                print("[Workspace context cleared]")
+                if current_session_id:
+                    save_session(current_session_id, {
+                        'name': load_session(current_session_id)['name'] if load_session(current_session_id) else 'Untitled',
+                        'history': list(reasoner.history),
+                        'workspace_context': ''
+                    })
+                continue
             if cmd == '/help':
-                print("Ashen GPT Agentic CLI Help:")
-                print("  - Ask questions or request actions (e.g. 'Run pytest' or 'Check files').")
-                print("  - /clear : Clear conversation memory.")
-                print("  - /help  : Show this help message.")
-                print("  - /exit  : Exit the CLI.")
+                print("""Ashen GPT Agentic CLI Help:
+  - Ask questions or request actions (e.g. 'Run pytest' or 'Check files').
+  - /clear : Clear conversation memory.
+  - /help  : Show this help message.
+  - /exit  : Exit the CLI.
+
+Session Management:
+  - /sessions     : List all saved sessions.
+  - /new          : Create a fresh session.
+  - /load <id>    : Load a session by ID (shown in /sessions).
+  - /delete <id>  : Delete a session.
+  - /rename <name>: Rename current session.
+
+Workspace Context:
+  - /workspace <path> : Scan a directory and inject its file tree into prompts.
+  - /wctx off         : Clear workspace context.""")
                 continue
 
             GREY = "\033[90m"
             RESET = "\033[0m"
             
+            # Auto-name first message in session
+            if not current_session_id:
+                current_session_id = create_new_session("Untitled")
+                reasoner.session_id = current_session_id
+                sdata = load_session(current_session_id)
+                if sdata and sdata.get('name', 'Untitled') == 'Untitled':
+                    preview = prompt[:40].replace('\n', ' ')
+                    sdata['name'] = preview + ('...' if len(prompt) > 40 else '')
+                    save_session(current_session_id, sdata)
+
             thought, answer = reasoner.solve_with_agent(prompt, max_new_tokens=250)
             print(f"\n{GREY}<think>\n{thought}\n</think>{RESET}")
             print(f"\nAssistant:\n{answer}")
+            
+            # Save to session
+            append_to_session(current_session_id, prompt, f"<think>\n{thought}\n</think>\n{answer}")
         except (KeyboardInterrupt, EOFError):
             print("\nGoodbye!")
             break
