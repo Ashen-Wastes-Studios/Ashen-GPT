@@ -27,6 +27,80 @@ SESSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'session
 os.makedirs(SESSIONS_DIR, exist_ok=True)
 current_session_id = None
 
+# --- Settings Persistence ---
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
+
+def load_settings_from_json():
+    """Load saved settings from JSON file."""
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"[Settings] Failed to load: {e}", flush=True)
+    return {}
+
+def save_settings_to_json(settings_data):
+    """Save settings to JSON file."""
+    try:
+        with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(settings_data, f, indent=2)
+        return True
+    except Exception as e:
+        print(f"[Settings] Failed to save: {e}", flush=True)
+        return False
+
+def scan_available_models():
+    """Scan project directory and common locations for model checkpoints."""
+    models = []
+    
+    # Scan current directory
+    search_dirs = ['.', os.path.expanduser('~/.cache/huggingface/hub')]
+    
+    for search_dir in search_dirs:
+        if not os.path.exists(search_dir):
+            continue
+        
+        for root, dirs, files in os.walk(search_dir):
+            # Skip hidden directories
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            
+            for file in files:
+                if file.endswith(('.pk1', '.pt', '.pth', '.gguf')):
+                    full_path = os.path.abspath(os.path.join(root, file))
+                    size_mb = round(os.path.getsize(full_path) / (1024 * 1024), 1)
+                    is_active = (full_path == os.path.abspath(current_model_filename))
+                    
+                    models.append({
+                        'path': full_path,
+                        'name': file,
+                        'size_mb': size_mb,
+                        'active': is_active
+                    })
+    
+    return sorted(models, key=lambda m: m['active'], reverse=True)
+
+def set_default_model(model_path):
+    """Set a model as the default (active) model."""
+    global current_model_filename
+    
+    if os.path.exists(model_path):
+        current_model_filename = model_path
+        return True
+    else:
+        print(f"[Model] Path not found: {model_path}", flush=True)
+        return False
+
+settings = load_settings_from_json()
+
+# Load saved model selection if available
+saved_model_path = settings.get('current_model', current_model_filename)
+if os.path.exists(saved_model_path):
+    current_model_filename = saved_model_path
+    print(f"[Model] Loading saved model: {current_model_filename}", flush=True)
+else:
+    print(f"[Model] Saved model not found, using default: {current_model_filename}", flush=True)
+
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
@@ -1746,20 +1820,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
             settings.precision = document.getElementById('setting-precision').value;
             settings.cpu_offload_layers = parseInt(document.getElementById('setting-cpu-offload').value);
             
+            // Also save current model path
+            settings.current_model = window.currentModelFilename || '{{current_model_filename}}';
+            
             const statusEl = document.getElementById('settings-status');
             statusEl.textContent = 'Updating settings...';
 
             try {
-                const res = await fetch('/api/settings', {
+                // Save to API endpoint (also persists to JSON)
+                const res = await fetch('/api/settings/save', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(settings)
                 });
                 const data = await res.json();
-                if (data.status === 'success') {
-                    statusEl.textContent = 'Settings updated successfully!';
-                    document.getElementById('sidebar-gpu').textContent = settings.gpu_layers + ' Layers';
-                    document.getElementById('sidebar-ctx').textContent = settings.context_length.toLocaleString() + ' Tokens';
+                
+                if (data.status === 'saved') {
+                    statusEl.textContent = 'Settings saved successfully!';
                     setTimeout(() => toggleSettingsModal(false), 1000);
                 } else {
                     statusEl.textContent = 'Error saving settings.';
@@ -1799,7 +1876,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                             <span class="text-slate-600 text-[10px] ml-2 block">${m.path}</span>
                             ${m.active ? '<span class="mt-1 inline-block px-1.5 py-0.5 bg-emerald-950 text-emerald-300 text-[10px] rounded border border-emerald-800">ACTIVE</span>' : ''}
                         </div>
-                        ${!m.active ? `<button onclick="switchModel('${m.name}')" class="px-2.5 py-1 bg-indigo-900 hover:bg-indigo-800 text-indigo-200 rounded text-[11px] transition">ACTIVATE</button>` : ''}
+                        ${!m.active ? `<button onclick="setDefaultModel('${m.path}')" class="px-2.5 py-1 bg-violet-900 hover:bg-violet-800 text-violet-200 rounded text-[11px] transition">SET DEFAULT</button>` : ''}
                     `;
                     listEl.appendChild(item);
                 });
@@ -1818,6 +1895,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 loadModelsList();
             } catch (err) {
                 statusEl.textContent = 'PC scan failed.';
+            }
+        }
+
+        async function setDefaultModel(modelPath) {
+            try {
+                const res = await fetch('/api/models/set-default', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: modelPath })
+                });
+                const data = await res.json();
+                if (data.status === 'set') {
+                    window.currentModelFilename = modelPath;
+                    document.getElementById('active-model-name').textContent = data.model.split('\\').pop().split('/').pop();
+                    alert(`Default model set to: ${modelPath.split('\\').pop().split('/').pop()}`);
+                    loadModelsList(); // Refresh list to update ACTIVE badges
+                } else {
+                    alert('Failed to set default model.');
+                }
+            } catch (err) {
+                alert('Error setting default model.');
             }
         }
 
@@ -2210,6 +2308,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
 
         // Initialize workspace file tree on page load
         loadWorkspaceDir('');
+        
+        // Set current model filename in JS scope
+        window.currentModelFilename = '{{current_model_filename}}';
     </script>
 </body>
 </html>
@@ -2640,6 +2741,74 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.end_headers()
                 self.wfile.write(json.dumps({'status': 'error', 'message': 'Session not found'}).encode('utf-8'))
+
+        # --- Settings Persistence Endpoints ---
+        elif self.path == '/api/settings/save':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+            
+            # Save all settings to JSON
+            success = save_settings_to_json(data)
+            
+            if success:
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'saved'}).encode('utf-8'))
+            else:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'error'}).encode('utf-8'))
+
+        elif self.path == '/api/settings/load':
+            try:
+                loaded = load_settings_from_json()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'success', 'settings': loaded}).encode('utf-8'))
+            except Exception as e:
+                self.send_response(500)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'error', 'message': str(e)}).encode('utf-8'))
+
+        elif self.path == '/api/models/set-default':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+            model_path = data.get('path', '')
+            
+            if set_default_model(model_path):
+                # Also save to settings file
+                current_settings = load_settings_from_json()
+                current_settings['current_model'] = model_path
+                save_settings_to_json(current_settings)
+                
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({
+                    'status': 'set',
+                    'model': current_model_filename
+                }).encode('utf-8'))
+            else:
+                self.send_response(404)
+                self.send_header('Content-Type', 'application/json; charset=utf-8')
+                self.end_headers()
+                self.wfile.write(json.dumps({'status': 'error', 'message': 'Model not found'}).encode('utf-8'))
+
+        elif self.path == '/api/models/list':
+            models = scan_available_models()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'models': models,
+                'current': current_model_filename
+            }).encode('utf-8'))
 
         elif self.path == '/api/workspace/context':
             # Push current workspace directory listing into model context
