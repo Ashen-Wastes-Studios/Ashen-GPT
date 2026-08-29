@@ -29,9 +29,17 @@ Training large models from scratch on consumer GPUs is heavily constrained by ac
 
 ---
 
-## 🤖 Fully Functional Agentic CLI & Web Chatbots
+## 🤖 Ashen AI Cybernetic Hub & Agentic CLI Chatbots
 
-Ashen GPT includes both a multi-turn CLI chatbot and a sleek Web Interface equipped with **full agentic capabilities (ReAct tool execution loop)**.
+Ashen GPT includes both a multi-turn CLI chatbot and a feature-rich, cybernetic **Ashen AI Web Interface** equipped with **full agentic capabilities (ReAct tool execution loop)**.
+
+### ⚡ Ashen AI Web Hub Features
+- **Cyberpunk / Retro-Gaming Aesthetic**: Deep dark theme with neon accents and toggleable CRT scanline visual effects (`CRT FX: ON/OFF`).
+- **Model Hub & Checkpoint Manager**: A dedicated modal window allowing users to **view local model checkpoints**, **upload new model weights (`.pk1` / `.pt`)**, and **instantly switch active models** in memory.
+- **Live System Telemetry**: Real-time display of active model name, PyTorch CUDA backend, and 8K token context window.
+- **Persona Switcher**: Switch between *Ashen AI Agent*, *Code Architect*, and *Cyber Companion* personas on the fly.
+- **Quick Action Chips**: One-click execution for common tasks (*Run Tests*, *Git Status*, *File Glob*, *Grep Search*).
+- **Session Export & Purge**: Export chat sessions as Markdown (`.md`) or purge memory instantly.
 
 ### 🛠️ Agentic Tool Execution
 The model can autonomously reason over tasks and invoke the following tools:
@@ -75,7 +83,7 @@ Combines literature (`train_split.txt`, `val_split.txt`) and scraped multi-langu
   ```cmd
   run_chatbot.bat
   ```
-- **Launch Agentic Web Chat Interface (`http://localhost:5000`)**:
+- **Launch Ashen AI Cybernetic Web Hub (`http://localhost:5000`)**:
   ```cmd
   run_web_chatbot.bat
   ```
