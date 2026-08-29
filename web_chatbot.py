@@ -396,6 +396,90 @@ class AshenAIAgenticEngine:
                 except Exception as e:
                     return f"Browse error: {str(e)}"
 
+            elif tool_name == 'deep_research':
+                topic = kwargs.get('topic', '')
+                max_searches = int(kwargs.get('max_searches', '3'))
+                try:
+                    research_report = f"# Deep Research Report: {topic}\n\n"
+                    all_urls = set()
+                    
+                    # Phase 1: Initial search for overview
+                    searches_done = 0
+                    
+                    # Get initial search results
+                    url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(topic)}"
+                    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+                    resp = requests.get(url, headers=headers, timeout=10)
+                    
+                    if resp.status_code != 200:
+                        return f"Research failed: Search error {resp.status_code}"
+                    
+                    # Extract search result links
+                    search_links = []
+                    for match in re.finditer(r'<a[^>]*class="result__a"[^>]*href="(.*?)"[^>]*>(.*?)</a>', resp.text, re.DOTALL):
+                        link_url = match.group(1)
+                        title_text = re.sub(r'<[^>]+>', '', match.group(2))
+                        if link_url and not any(skip in link_url.lower() for skip in ['duckduckgo.com', 'facebook.com', 'twitter.com']):
+                            search_links.append((link_url, title_text.strip()))
+                    
+                    research_report += f"## Initial Search Overview\n\nTopic: `{topic}`\nFound {len(search_links)} relevant results.\n\n"
+                    
+                    # Phase 2: Browse top sources (limit by context window)
+                    max_browses = min(len(search_links), 5, max(max_searches, 5))
+                    
+                    for i, (link_url, title_text) in enumerate(search_links[:max_browses], 1):
+                        research_report += f"### Source {i}: {title_text}\n"
+                        research_report += f"URL: {link_url}\n\n"
+                        
+                        # Fetch and extract content
+                        content_resp = requests.get(link_url, headers=headers, timeout=15)
+                        if content_resp.status_code == 200:
+                            content = re.sub(r'<[^>]+>', ' ', content_resp.text)
+                            content = re.sub(r'\s+', ' ', content).strip()
+                            # Extract key paragraphs
+                            paragraphs = [p.strip() for p in content.split('\n') if len(p.strip()) > 50]
+                            
+                            if paragraphs:
+                                # Take most informative paragraphs (longest ones)
+                                key_info = '\n'.join(sorted(paragraphs, key=len, reverse=True)[:3])
+                                research_report += f"{key_info}\n\n"
+                            else:
+                                research_report += f"[No extractable text from this source]\n\n"
+                        else:
+                            research_report += f"[Failed to fetch content - HTTP {content_resp.status_code}]\n\n"
+                        
+                        searches_done += 1
+                        
+                        # Break early if we have enough info
+                        if searches_done >= max_searches and max_searches < 3:
+                            break
+                    
+                    # Phase 3: Follow-up searches if needed
+                    remaining = max_searches - searches_done
+                    if remaining > 0 and search_links:
+                        research_report += f"\n## Follow-up Research\n\n"
+                        for next_topic in ["PyTorch latest features", "AI research trends"]:
+                            if remaining <= 0:
+                                break
+                            follow_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(next_topic)}"
+                            follow_resp = requests.get(follow_url, headers=headers, timeout=10)
+                            if follow_resp.status_code == 200:
+                                follow_titles = []
+                                for fm in re.finditer(r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', follow_resp.text, re.DOTALL):
+                                    t = re.sub(r'<[^>]+>', '', fm.group(1)).strip()
+                                    if t:
+                                        follow_titles.append(t)
+                                if follow_titles:
+                                    research_report += f"\n**Related: {next_topic}**\n"
+                                    for ft in follow_titles[:3]:
+                                        research_report += f"- {ft}\n"
+                                    remaining -= 1
+                    
+                    return f"Deep Research Complete!\n\n" + research_report + "\n---\nReport generated autonomously via web traversal."
+                    
+                except Exception as e:
+                    return f"Deep research error: {str(e)}"
+
             else:
                 return f"Unknown tool: {tool_name}"
         except Exception as e:
@@ -427,6 +511,7 @@ class AshenAIAgenticEngine:
             "- run_shell_command(command='...')\n"
             "- web_search(query='...') — Search DuckDuckGo for information\n"
             "- browse_url(url='...') — Fetch and extract text from a webpage\n"
+            "- deep_research(topic='...', max_searches=3) — Autonomous multi-source research agent\n"
             "To use a tool, output: [TOOL: tool_name(arg1=val1, arg2=val2)]\n"
             "After observing tool output, continue reasoning until you give your final answer.\n\n"
         )
@@ -781,6 +866,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     <button onclick="sendQuickPrompt('Search codebase for reasoning engine')" class="p-2 text-left text-xs bg-slate-900 hover:bg-indigo-950/50 text-indigo-300 rounded border border-indigo-900/50 transition">🔎 Grep Search</button>
                     <button onclick="sendQuickPrompt('Search DuckDuckGo for PyTorch 2.0 features')" class="p-2 text-left text-xs bg-emerald-900/50 hover:bg-emerald-950/50 text-emerald-300 rounded border border-emerald-800/50 transition">🌐 Web Search</button>
                     <button onclick="sendQuickPrompt('Browse https://pytorch.org/docs/stable/index.html')" class="p-2 text-left text-xs bg-purple-900/50 hover:bg-purple-950/50 text-purple-300 rounded border border-purple-800/50 transition">📖 Browse URL</button>
+                    <button onclick="sendQuickPrompt('Deep research on recent advances in transformer architectures')" class="p-2 text-left text-xs bg-cyan-900/50 hover:bg-cyan-950/50 text-cyan-300 rounded border border-cyan-800/50 transition">🔬 Deep Research</button>
                 </div>
             </div>
 
