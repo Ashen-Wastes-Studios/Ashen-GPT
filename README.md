@@ -204,10 +204,6 @@ Enable faster generation using a secondary "draft" model:
 
 - **Temperature**, **Top-K**, **Top-P** (Nucleus Sampling), **Max Output Tokens**, **Context Length**, **GPU Offload Layers**, **Repeat Penalty**.
 
----
-
-#### 💬 Session Management
-
 | Action | Description |
 |---|---|
 | 📝 New Chat | Creates a fresh session; first message auto-names it. |

@@ -72,6 +72,8 @@ def filter_code_output(text):
     text_clean = re.sub(r'`[^`]*`', '', text_no_blocks)
     return text_clean
 
+# --- LIGHTWEIGHT DISK-STREAMED DATA SAMPLING (PREVENTS SYSTEM RAM BLOAT) ---
+
 def get_random_chunk(split, current_block_size):
     if split == 'train':
         train_files = ["train_split.txt"]
@@ -84,7 +86,8 @@ def get_random_chunk(split, current_block_size):
             filename = "train_split.txt"
 
     if not os.path.exists(filename):
-        return torch.tensor(encode("Hello world! Ashen GPT hybrid training test. " * (current_block_size // 10)), dtype=torch.long)
+        fallback_text = "Fallback training sentence for Ashen GPT progressive training pipeline. " * (current_block_size // 10 + 5)
+        return torch.tensor(encode(fallback_text), dtype=torch.long)
 
     with open(filename, 'rb') as f:
         with mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mm:
@@ -106,11 +109,11 @@ def get_batch(split, current_block_size, current_batch_size):
 
     data_chunk = torch.clamp(data_chunk, min=0, max=vocab_size - 1)
 
-    max_idx = len(data_chunk) - current_block_size
+    max_idx = len(data_chunk) - current_block_size - 1
     ix = torch.randint(0, max_idx, (current_batch_size,))
     x = torch.stack([data_chunk[i:i+current_block_size] for i in ix])
     y = torch.stack([data_chunk[i+1:i+current_block_size+1] for i in ix])
-    return x.to(device), y.to(device)
+    return x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
 # --- Qwen-like Architecture Components with Dynamic NTK RoPE Scaling ---
 
@@ -132,6 +135,8 @@ class RotaryEmbedding(nn.Module):
         self.max_seq_len = max_seq_len
         inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer("inv_freq_buf", inv_freq, persistent=False)
+        self.cached_scale = None
+        self.cached_len = 0
         self._set_cos_sin_cache(max_seq_len)
 
     def _set_cos_sin_cache(self, seq_len, scale=1.0):
@@ -141,6 +146,8 @@ class RotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         self.register_buffer("cos_cached", emb.cos(), persistent=False)
         self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        self.cached_scale = scale
+        self.cached_len = seq_len
 
     def forward(self, seq_len, current_block_size=2048):
         base_block_size = 2048
@@ -150,7 +157,7 @@ class RotaryEmbedding(nn.Module):
             scale = 1.0
 
         needed_len = max(seq_len, self.max_seq_len)
-        if needed_len > self.cos_cached.size(0) or scale != 1.0:
+        if needed_len > self.cached_len or self.cached_scale != scale:
             self._set_cos_sin_cache(needed_len, scale=scale)
         return self.cos_cached[:seq_len, :], self.sin_cached[:seq_len, :]
 
@@ -374,7 +381,6 @@ def estimate_loss(current_block_size, current_batch_size):
 
 # --- PROGRESSIVE STAGED TRAINING LOOP (512 -> 2k -> 8k scaled to 5,000 iters) ---
 print("=== Starting Progressive Staged Training Pipeline (5,000 Iters) ===", flush=True)
-optimizer.zero_grad(set_to_none=True)
 
 for iter in range(max_iters):
     iter_start = time.time()
@@ -399,6 +405,7 @@ for iter in range(max_iters):
         current_batch_size = 2              # Increased from 1 (when possible)
         gradient_accumulation_steps = 8     # Balanced accumulation
 
+    optimizer.zero_grad(set_to_none=True)
     loss_accum = 0.0
     for micro_step in range(gradient_accumulation_steps):
         xb, yb = get_batch('train', current_block_size, current_batch_size)
@@ -413,8 +420,6 @@ for iter in range(max_iters):
     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
     scaler.step(optimizer)
     scaler.update()
-    optimizer.zero_grad(set_to_none=False)
-    torch.cuda.empty_cache()
 
     elapsed = time.time() - iter_start
     print(f"[{stage_name} | STEP {iter+1}/{max_iters} | Ctx: {current_block_size}] Loss: {loss_accum:.4f} | LR: {lr:.6f} | Time: {elapsed:.1f}s", flush=True)

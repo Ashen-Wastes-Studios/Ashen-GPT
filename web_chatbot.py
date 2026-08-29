@@ -67,9 +67,10 @@ def scan_available_models():
             
             for file in files:
                 if file.endswith(('.pk1', '.pt', '.pth', '.gguf')):
-                    full_path = os.path.abspath(os.path.join(root, file))
+                    # Convert backslashes to forward slashes for JS safety
+                    full_path = os.path.abspath(os.path.join(root, file)).replace('\\', '/')
                     size_mb = round(os.path.getsize(full_path) / (1024 * 1024), 1)
-                    is_active = (full_path == os.path.abspath(current_model_filename))
+                    is_active = (os.path.normpath(full_path) == os.path.normpath(current_model_filename))
                     
                     models.append({
                         'path': full_path,
@@ -84,37 +85,20 @@ def set_default_model(model_path):
     """Set a model as the default (active) model."""
     global current_model_filename
     
-    if os.path.exists(model_path):
-        current_model_filename = model_path
+    # Normalize path separators
+    normalized_path = os.path.normpath(model_path)
+    if os.path.exists(normalized_path):
+        current_model_filename = normalized_path
         return True
     else:
-        print(f"[Model] Path not found: {model_path}", flush=True)
+        print(f"[Model] Path not found: {normalized_path}", flush=True)
         return False
 
 settings = load_settings_from_json()
 
 # Default model filename
 DEFAULT_MODEL_FILENAME = 'ashen_gpt_model.pk1'
-
-# Load saved model selection if available
-saved_model_path = settings.get('current_model', DEFAULT_MODEL_FILENAME)
-if os.path.exists(saved_model_path):
-    current_model_filename = saved_model_path
-    print(f"[Model] Loading saved model: {current_model_filename}", flush=True)
-else:
-    current_model_filename = DEFAULT_MODEL_FILENAME
-    print(f"[Model] Saved model not found, using default: {current_model_filename}", flush=True)
-
-if os.path.exists(current_model_filename):
-    print(f"Loading Ashen GPT model parameters from {current_model_filename}...")
-    with open(current_model_filename, 'rb') as f:
-        model = pickle.load(f)
-    print("Model loaded successfully!")
-else:
-    print(f"No checkpoint found at {current_model_filename}. Initializing new Ashen GPT model...")
-    model = AshenGPTLanguageModel(vocab_size)
-
-m = model.to(device)
+current_model_filename = settings.get('current_model', DEFAULT_MODEL_FILENAME)
 
 # --- Device and Model Configuration ---
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -302,6 +286,35 @@ class AshenGPTLanguageModel(nn.Module):
             index_next = torch.multinomial(probs, num_samples=1)
             index = torch.cat((index, index_next), dim=-1)
         return index
+
+# Load saved model selection if available
+saved_model_path = settings.get('current_model', DEFAULT_MODEL_FILENAME)
+if os.path.exists(saved_model_path):
+    current_model_filename = saved_model_path
+    print(f"[Model] Loading saved model: {current_model_filename}", flush=True)
+else:
+    current_model_filename = DEFAULT_MODEL_FILENAME
+    print(f"[Model] Saved model not found, using default: {current_model_filename}", flush=True)
+
+if os.path.exists(current_model_filename):
+    print(f"Loading Ashen GPT model parameters from {current_model_filename}...")
+    try:
+        with open(current_model_filename, 'rb') as f:
+            model = pickle.load(f)
+        print("Model loaded successfully via pickle!")
+    except (pickle.UnpicklingError, Exception) as e:
+        print(f"Pickle load failed ({e}). Trying torch.load fallback...")
+        try:
+            model = torch.load(current_model_filename, map_location=device)
+            print("Model loaded successfully via torch.load!")
+        except Exception as torch_e:
+            print(f"Checkpoint unreadable ({torch_e}). Initializing new model...")
+            model = AshenGPTLanguageModel(vocab_size)
+else:
+    print(f"No checkpoint found at {current_model_filename}. Initializing new Ashen GPT model...")
+    model = AshenGPTLanguageModel(vocab_size)
+
+m = model.to(device)
 
 # --- Draft Model Support ---
 draft_model_filename = 'ashen_gpt_model_draft.pk1'  # Default draft model path
@@ -1867,7 +1880,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                             <span class="text-slate-600 text-[10px] ml-2 block">${m.path}</span>
                             ${m.active ? '<span class="mt-1 inline-block px-1.5 py-0.5 bg-emerald-950 text-emerald-300 text-[10px] rounded border border-emerald-800">ACTIVE</span>' : ''}
                         </div>
-                        ${!m.active ? `<button onclick="setDefaultModel('${m.path}')" class="px-2.5 py-1 bg-violet-900 hover:bg-violet-800 text-violet-200 rounded text-[11px] transition">SET DEFAULT</button>` : ''}
+                        ${!m.active ? `<button onclick="setDefaultModel('${m.path.replace(/\\/g, '/')}')" class="px-2.5 py-1 bg-violet-900 hover:bg-violet-800 text-violet-200 rounded text-[11px] transition">SET DEFAULT</button>` : ''}
                     `;
                     listEl.appendChild(item);
                 });

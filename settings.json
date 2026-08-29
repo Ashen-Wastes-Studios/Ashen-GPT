@@ -1,0 +1,13 @@
+{
+  "temperature": 0.7,
+  "top_k": 40,
+  "top_p": 0.9,
+  "max_new_tokens": 250,
+  "context_length": 8192,
+  "gpu_layers": 16,
+  "use_draft_model": false,
+  "low_end_gpu_mode": false,
+  "precision": "fp16",
+  "cpu_offload_layers": 0,
+  "current_model": "{{current_model_filename}}"
+}
