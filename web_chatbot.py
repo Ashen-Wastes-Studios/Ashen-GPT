@@ -249,12 +249,17 @@ class AshenAIAgenticEngine:
         self.context_length = 8192
         self.gpu_layers = 16
         self.repeat_penalty = 1.1
+        self.workspace_context = ""  # injected context from browsed workspace
 
     def clear_history(self):
         self.history = []
 
     def set_persona(self, persona):
         self.persona = persona
+
+    def set_workspace_context(self, workspace_info):
+        """Set the current workspace directory listing as model context."""
+        self.workspace_context = workspace_info
 
     def update_settings(self, settings):
         self.temperature = float(settings.get('temperature', self.temperature))
@@ -334,8 +339,13 @@ class AshenAIAgenticEngine:
         }
         
         base_inst = persona_instructions.get(self.persona, persona_instructions["ashen_ai_agent"])
+        workspace_context_block = ""
+        if self.workspace_context:
+            workspace_context_block = f"\n### Current Workspace Context\n{self.workspace_context}\n\n"
+
         system_instructions = (
             base_inst +
+            workspace_context_block +
             "Available tools:\n"
             "- read_file(file_path='...')\n"
             "- write_file(file_path='...', content='...')\n"
@@ -621,6 +631,10 @@ HTML_PAGE = """<!DOCTYPE html>
                     <div class="flex justify-between"><span>Backend:</span><span class="text-emerald-400 font-bold">PyTorch CUDA</span></div>
                     <div class="flex justify-between"><span>Context Window:</span><span class="text-cyan-400 font-bold" id="sidebar-ctx">8,192 Tokens</span></div>
                     <div class="flex justify-between"><span>GPU Layers:</span><span class="text-amber-400 font-bold" id="sidebar-gpu">16 / 32</span></div>
+                    <div class="flex flex-col gap-1 pt-1 border-t border-slate-800 mt-1">
+                        <span class="text-slate-500">Workspace Context:</span>
+                        <span class="text-emerald-300 font-bold truncate" id="workspace-context-label" title="Currently browsed directory injected into model prompt">📁 None</span>
+                    </div>
                 </div>
 
                 <h2 class="text-xs font-semibold text-cyan-500 uppercase tracking-widest pt-2">Ashen AI Quick Actions</h2>
@@ -786,6 +800,21 @@ HTML_PAGE = """<!DOCTYPE html>
                     }
                     treeEl.appendChild(el);
                 });
+
+                // Push this workspace directory into model context and update UI
+                const ctxLabel = document.getElementById('workspace-context-label');
+                const dirName = dirPath || '(Root)';
+                if (ctxLabel) {
+                    ctxLabel.textContent = `📁 ${dirName}`;
+                    ctxLabel.title = dirName;
+                }
+                try {
+                    await fetch('/api/workspace/context', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ dir: dirPath })
+                    });
+                } catch (e) { /* non-blocking — don't break UI if fails */ }
             } catch (err) {
                 treeEl.innerHTML = '<div class="text-red-400">Failed to load directory.</div>';
             }
@@ -1152,6 +1181,12 @@ HTML_PAGE = """<!DOCTYPE html>
 
         async function clearHistory() {
             await fetch('/api/clear', { method: 'POST' });
+            // Reset workspace context indicator
+            const ctxLabel = document.getElementById('workspace-context-label');
+            if (ctxLabel) {
+                ctxLabel.textContent = '📁 None';
+                ctxLabel.title = 'No workspace context active';
+            }
             const container = document.getElementById('chat-container');
             container.innerHTML = `
                 <div class="flex items-start space-x-4 max-w-4xl">
@@ -1216,7 +1251,7 @@ def scan_local_pc_models():
 
 def get_directory_listing(dir_path):
     if not dir_path:
-        target_dir = os.path.expanduser('~')
+        target_dir = os.getcwd()
     else:
         target_dir = dir_path
 
@@ -1337,6 +1372,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
 
         elif self.path == '/api/clear':
             reasoner.clear_history()
+            reasoner.set_workspace_context("")
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
@@ -1362,6 +1398,24 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(json.dumps({'status': 'success'}).encode('utf-8'))
+
+        elif self.path == '/api/workspace/context':
+            # Push current workspace directory listing into model context
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+            workspace_dir = data.get('dir', '')
+            listing = get_directory_listing(workspace_dir)
+            # Build a compact text representation of the workspace
+            context_lines = [f"Directory: {listing['current_path']}"]
+            for item in listing['items']:
+                prefix = "📁 " if item['is_dir'] else "📄 "
+                context_lines.append(f"  {prefix}{item['name']}")
+            reasoner.set_workspace_context("\n".join(context_lines))
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({'status': 'success', 'path': listing['current_path']}).encode('utf-8'))
 
         elif self.path == '/api/models/scan-pc':
             models = scan_local_pc_models()
