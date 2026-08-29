@@ -996,12 +996,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     const editor = document.getElementById('code-editor');
                     const codeEl = document.getElementById('highlighted-code');
                     console.log('[DEBUG] editor:', !!editor, 'codeEl:', !!codeEl, 'content length:', data.content?.length || 0);
+                    
                     if (editor) {
                         editor.value = data.content;
                     }
+                    
                     if (codeEl) {
-                        codeEl.textContent = data.content;
-                        Prism.highlightElement(codeEl);
+                        // Delay highlighting to ensure Prism and CSS are ready
+                        setTimeout(() => {
+                            codeEl.textContent = data.content;
+                            if (typeof Prism !== 'undefined' && Prism.highlightElement) {
+                                Prism.highlightElement(codeEl);
+                                console.log('[DEBUG] Highlighting applied to', codeEl.className);
+                            } else {
+                                codeEl.textContent = data.content;
+                                console.warn('[DEBUG] Prism not available');
+                            }
+                        }, 50);
                     }
                     if (!editor && !codeEl) {
                         console.error('[DEBUG] ERROR: code-editor or highlighted-code element not found!');
