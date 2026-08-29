@@ -983,12 +983,15 @@ HTML_PAGE = r"""<!DOCTYPE html>
             codeEl.className = langMap[ext] || 'language-python';
 
             try {
+                console.log('[DEBUG] Opening file:', filepath);
                 const res = await fetch('/api/workspace/read', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ path: filepath })
                 });
+                console.log('[DEBUG] Response status:', res.status);
                 const data = await res.json();
+                console.log('[DEBUG] Response:', data);
                 if (data.status === 'success') {
                     editor.value = data.content;
                     codeEl.textContent = data.content;
@@ -1721,22 +1724,38 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             data = json.loads(body.decode('utf-8'))
             file_path = data.get('path', '')
             
+            # Debug logging
+            import sys
+            print(f"[DEBUG] Read request for: {repr(file_path)}", file=sys.stderr, flush=True)
+            print(f"[DEBUG] cwd: {repr(os.getcwd())}", file=sys.stderr, flush=True)
+            
             if not file_path:
                 resp_data = {'status': 'error', 'message': 'No file path provided'}
             else:
                 target_path = None
                 
-                # Strategy 1: Use path as-is (absolute path)
-                if os.path.isfile(file_path):
+                # Strategy 1: Use path as-is (should be absolute)
+                exists1 = os.path.isfile(file_path)
+                print(f"[DEBUG] Strategy 1 (as-is): exists={exists1}", file=sys.stderr, flush=True)
+                
+                if exists1:
                     target_path = file_path
                 
-                # Strategy 2: Try with backslash normalization (Windows)
-                elif '/' in file_path and os.path.isfile(file_path.replace('/', '\\')):
-                    target_path = file_path.replace('/', '\\')
+                # Strategy 2: Try backslash normalization (C:/path -> C:\path)
+                elif '/' in file_path:
+                    win_path = file_path.replace('/', '\\')
+                    exists2 = os.path.isfile(win_path)
+                    print(f"[DEBUG] Strategy 2 (backslash): {repr(win_path)} exists={exists2}", file=sys.stderr, flush=True)
+                    if exists2:
+                        target_path = win_path
                 
                 # Strategy 3: Join with cwd for relative paths
-                elif not os.path.isabs(file_path) and os.path.isfile(os.path.join(os.getcwd(), file_path)):
-                    target_path = os.path.join(os.getcwd(), file_path)
+                if not target_path:
+                    joined = os.path.join(os.getcwd(), file_path)
+                    exists3 = os.path.isfile(joined)
+                    print(f"[DEBUG] Strategy 3 (joined): {repr(joined)} exists={exists3}", file=sys.stderr, flush=True)
+                    if exists3:
+                        target_path = joined
                 
                 if target_path and os.path.exists(target_path) and os.path.isfile(target_path):
                     try:
@@ -1746,11 +1765,13 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                             content = raw_bytes.decode('utf-8')
                         except UnicodeDecodeError:
                             content = raw_bytes.decode('latin-1')
+                        print(f"[DEBUG] SUCCESS: read {len(raw_bytes)} bytes from {target_path}", file=sys.stderr, flush=True)
                         resp_data = {'status': 'success', 'content': content}
                     except Exception as e:
+                        print(f"[DEBUG] ERROR reading file: {e}", file=sys.stderr, flush=True)
                         resp_data = {'status': 'error', 'message': str(e)}
                 else:
-                    resp_data = {'status': 'error', 'message': f'File not found: {file_path}'}
+                    resp_data = {'status': 'error', 'message': f'File not found: {repr(file_path)}. Tried all strategies.'}
             
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
