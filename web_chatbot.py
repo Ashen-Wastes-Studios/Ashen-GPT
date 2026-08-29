@@ -93,14 +93,30 @@ def set_default_model(model_path):
 
 settings = load_settings_from_json()
 
+# Default model filename
+DEFAULT_MODEL_FILENAME = 'ashen_gpt_model.pk1'
+
 # Load saved model selection if available
-saved_model_path = settings.get('current_model', current_model_filename)
+saved_model_path = settings.get('current_model', DEFAULT_MODEL_FILENAME)
 if os.path.exists(saved_model_path):
     current_model_filename = saved_model_path
     print(f"[Model] Loading saved model: {current_model_filename}", flush=True)
 else:
+    current_model_filename = DEFAULT_MODEL_FILENAME
     print(f"[Model] Saved model not found, using default: {current_model_filename}", flush=True)
 
+if os.path.exists(current_model_filename):
+    print(f"Loading Ashen GPT model parameters from {current_model_filename}...")
+    with open(current_model_filename, 'rb') as f:
+        model = pickle.load(f)
+    print("Model loaded successfully!")
+else:
+    print(f"No checkpoint found at {current_model_filename}. Initializing new Ashen GPT model...")
+    model = AshenGPTLanguageModel(vocab_size)
+
+m = model.to(device)
+
+# --- Device and Model Configuration ---
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Device: {device}")
 
@@ -117,19 +133,6 @@ vocab_size = enc.n_vocab
 
 encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
 decode = lambda l: enc.decode(l)
-
-def user_wants_code(prompt):
-    code_keywords = [
-        'code', 'write a', 'function', 'script', 'program', 'python', 'javascript',
-        'html', 'css', 'sql', 'syntax', 'class ', 'def ', 'implementation', 'algorithm'
-    ]
-    prompt_lower = prompt.lower()
-    return any(keyword in prompt_lower for keyword in code_keywords)
-
-def filter_code_output(text):
-    text_no_blocks = re.sub(r'```[\s\S]*?```', '[Code logic analyzed internally. Ask me to write code if you want to see the implementation snippet.]', text)
-    text_clean = re.sub(r'`[^`]*`', '', text_no_blocks)
-    return text_clean
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -299,18 +302,6 @@ class AshenGPTLanguageModel(nn.Module):
             index_next = torch.multinomial(probs, num_samples=1)
             index = torch.cat((index, index_next), dim=-1)
         return index
-
-current_model_filename = 'ashen_gpt_model.pk1'
-if os.path.exists(current_model_filename):
-    print(f"Loading Ashen GPT model parameters from {current_model_filename}...")
-    with open(current_model_filename, 'rb') as f:
-        model = pickle.load(f)
-    print("Model loaded successfully!")
-else:
-    print(f"No checkpoint found at {current_model_filename}. Initializing new Ashen GPT model...")
-    model = AshenGPTLanguageModel(vocab_size)
-
-m = model.to(device)
 
 # --- Draft Model Support ---
 draft_model_filename = 'ashen_gpt_model_draft.pk1'  # Default draft model path
