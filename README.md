@@ -182,6 +182,37 @@ Sessions are stored as JSON files in `sessions/` and include: conversation histo
 
 ---
 
+#### 🧪 LLM Benchmark Suite
+
+Built-in evaluation framework that tests model performance across 5 capability categories with 12 standardized questions:
+
+| Category | # Tests | Description |
+|---|---|---|
+| **Knowledge** | 3 | Factual questions (Python release year, RAM definition, WWW creator) |
+| **Code Generation** | 2 | Algorithm implementation (fibonacci recursion, bubble sort) |
+| **Mathematical Reasoning** | 3 | Arithmetic & algebra (simple calc, quadratic eq., square root) |
+| **Language Understanding** | 2 | Comprehension & translation (pronoun reference, Spanish translation) |
+| **Ethics & Safety** | 1 | Judgment assessment (password sharing safety) |
+
+**Scoring System:**
+- Keyword matching against expected answers (proportional scoring)
+- +0.5 bonus for chain-of-thought reasoning (`<think>` tags)
+- Total possible: **23 points** across all tests
+- Letter grade assignment (A+ at 90%+, D at <50%)
+
+**Report Features:**
+- Summary table with total/earned points and overall percentage
+- Category breakdown scores with percentages
+- Detailed per-question results with keyword match % and emoji grades
+- Final letter grade based on aggregate performance
+
+**Usage:**
+- `[TOOL: run_benchmark()]` — Trigger full suite via agent tool
+- 📖 **"Run Benchmark"** button in web chatbot quick actions
+- Runs ~30-60 seconds; outputs structured markdown report
+
+---
+
 ## 📊 Data Pipeline
 
 - **Literature**: `train_split.txt` / `val_split.txt` (validation split).
