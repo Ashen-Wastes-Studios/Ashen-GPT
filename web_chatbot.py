@@ -1708,46 +1708,40 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(json.dumps(listing).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        global model, reasoner, current_model_filename, current_session_id
+        
         if self.path == '/api/workspace/read':
-            # Read file from query params (GET) or request body (POST)
-            file_path = None
-            if 'path' in query and query['path']:
-                file_path = query['path'][0]
-            
-            if not file_path:
-                # Try reading from POST body
-                try:
-                    content_length = int(self.headers.get('Content-Length', 0))
-                    if content_length > 0:
-                        body = self.rfile.read(content_length)
-                        data = json.loads(body.decode('utf-8'))
-                        file_path = data.get('path', '')
-                except:
-                    pass
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+            file_path = data.get('path', '')
             
             if not file_path:
                 resp_data = {'status': 'error', 'message': 'No file path provided'}
             else:
-                # Try multiple path strategies
                 target_path = None
                 
-                # Strategy 1: Use path as-is (might be absolute)
+                # Strategy 1: Use path as-is (absolute path)
                 if os.path.isfile(file_path):
                     target_path = file_path
                 
-                # Strategy 2: If it looks like a relative path, join with cwd
-                elif not os.path.isabs(file_path) and os.path.isfile(os.path.join(os.getcwd(), file_path)):
-                    target_path = os.path.join(os.getcwd(), file_path)
-                
-                # Strategy 3: Try decoding Windows-style forward slashes
+                # Strategy 2: Try with backslash normalization (Windows)
                 elif '/' in file_path and os.path.isfile(file_path.replace('/', '\\')):
                     target_path = file_path.replace('/', '\\')
+                
+                # Strategy 3: Join with cwd for relative paths
+                elif not os.path.isabs(file_path) and os.path.isfile(os.path.join(os.getcwd(), file_path)):
+                    target_path = os.path.join(os.getcwd(), file_path)
                 
                 if target_path and os.path.exists(target_path) and os.path.isfile(target_path):
                     try:
                         with open(target_path, 'rb') as f:
                             raw_bytes = f.read()
-                        # Try UTF-8 first, then latin-1 as fallback
                         try:
                             content = raw_bytes.decode('utf-8')
                         except UnicodeDecodeError:
@@ -1756,17 +1750,14 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                     except Exception as e:
                         resp_data = {'status': 'error', 'message': str(e)}
                 else:
-                    resp_data = {'status': 'error', 'message': f'File not found: {file_path} (tried: {target_path or "any strategy"})'}
+                    resp_data = {'status': 'error', 'message': f'File not found: {file_path}'}
+            
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(json.dumps(resp_data).encode('utf-8'))
-        else:
-            self.send_response(404)
-            self.end_headers()
-
-    def do_POST(self):
-        global model, reasoner, current_model_filename, current_session_id
+            return
+        
         if self.path == '/api/chat':
             content_length = int(self.headers.get('Content-Length', 0))
             body = self.rfile.read(content_length)
