@@ -458,8 +458,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-bash.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markdown.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-javascript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-typescript.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-css.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-yaml.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-markup.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-go.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-rust.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-c.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-cpp.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-java.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-csharp.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-ruby.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-php.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-sql.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-xml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-toml.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-lua.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-swift.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-kotlin.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-powershell.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-docker.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-git.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-regex.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-hcl.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-protobuf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-graphql.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/prism/1.29.0/components/prism-ini.min.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&amp;display=swap" rel="stylesheet">
     <style>
         body { background-color: #050509; color: #e2e8f0; font-family: 'JetBrains Mono', monospace; }
@@ -913,9 +937,48 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 'css': 'language-css',
                 'md': 'language-markdown',
                 'sh': 'language-bash',
-                'bat': 'language-bash',
+                'bat': 'language-powershell',
+                'ps1': 'language-powershell',
                 'yml': 'language-yaml',
-                'yaml': 'language-yaml'
+                'yaml': 'language-yaml',
+                'go': 'language-go',
+                'rs': 'language-rust',
+                'c': 'language-c',
+                'h': 'language-c',
+                'cpp': 'language-cpp',
+                'cc': 'language-cpp',
+                'cxx': 'language-cpp',
+                'hpp': 'language-cpp',
+                'java': 'language-java',
+                'cs': 'language-csharp',
+                'rb': 'language-ruby',
+                'php': 'language-php',
+                'sql': 'language-sql',
+                'xml': 'language-xml',
+                'toml': 'language-toml',
+                'lua': 'language-lua',
+                'swift': 'language-swift',
+                'kt': 'language-kotlin',
+                'kts': 'language-kotlin',
+                'dockerfile': 'language-docker',
+                'dockerignore': 'language-docker',
+                'gitignore': 'language-git',
+                'gitconfig': 'language-git',
+                'regex': 'language-regex',
+                're': 'language-regex',
+                'ini': 'language-ini',
+                'cfg': 'language-ini',
+                'env': 'language-bash',
+                'tf': 'language-hcl',
+                'hcl': 'language-hcl',
+                'proto': 'language-protobuf',
+                'graphql': 'language-graphql',
+                'vue': 'language-markup',
+                'svelte': 'language-markup',
+                'scss': 'language-css',
+                'sass': 'language-css',
+                'jsx': 'language-javascript',
+                'tsx': 'language-typescript',
             };
             codeEl.className = langMap[ext] || 'language-python';
 
