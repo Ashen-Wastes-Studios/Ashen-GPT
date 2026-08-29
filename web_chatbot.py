@@ -1548,7 +1548,7 @@ def get_directory_listing(dir_path):
             is_dir = entry.is_dir()
             items.append({
                 'name': entry.name,
-                'path': entry.path,
+                'path': entry.path.replace('\\', '/'),  # Normalize to forward slashes for URLs
                 'is_dir': is_dir
             })
         items.sort(key=lambda x: (not x['is_dir'], x['name'].lower()))
@@ -1706,15 +1706,27 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self.wfile.write(json.dumps(listing).encode('utf-8'))
         elif path == '/api/workspace/read':
             file_path = query.get('path', [''])[0]
-            if os.path.exists(file_path) and os.path.isfile(file_path):
-                try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                    resp_data = {'status': 'success', 'content': content}
-                except Exception as e:
-                    resp_data = {'status': 'error', 'message': str(e)}
+            # Handle URL-decoded path properly
+            if not file_path:
+                resp_data = {'status': 'error', 'message': 'No file path provided'}
             else:
-                resp_data = {'status': 'error', 'message': 'File not found'}
+                # Try the path as-is first, then try joining with working dir
+                if os.path.isfile(file_path):
+                    target_path = file_path
+                elif os.path.isfile(os.path.join(os.getcwd(), file_path)):
+                    target_path = os.path.join(os.getcwd(), file_path)
+                else:
+                    target_path = None
+                
+                if target_path and os.path.exists(target_path) and os.path.isfile(target_path):
+                    try:
+                        with open(target_path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                        resp_data = {'status': 'success', 'content': content}
+                    except Exception as e:
+                        resp_data = {'status': 'error', 'message': str(e)}
+                else:
+                    resp_data = {'status': 'error', 'message': f'File not found: {file_path}'}
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
