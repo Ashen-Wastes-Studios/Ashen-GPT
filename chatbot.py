@@ -241,9 +241,22 @@ class AgenticReasoningEngine:
         self.history = []
         self.workspace_context = ""
         self.session_id = None
+        self.working_dir = os.getcwd()  # current working directory for tools
 
     def clear_history(self):
         self.history = []
+
+    def change_working_dir(self, dir_path):
+        """Change the working directory for all tool operations."""
+        if not dir_path:
+            return False
+        if not os.path.isdir(dir_path):
+            return False
+        self.working_dir = os.path.abspath(dir_path)
+        return True
+
+    def get_working_dir(self):
+        return self.working_dir
 
     def set_workspace_context(self, dir_path):
         if not dir_path:
@@ -262,46 +275,58 @@ class AgenticReasoningEngine:
         try:
             if tool_name == 'read_file':
                 path = kwargs.get('file_path', '')
-                if os.path.exists(path):
-                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                full_path = path if os.path.isabs(path) else os.path.join(self.working_dir, path)
+                if os.path.exists(full_path):
+                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                         return f.read()[:2000]
                 return f"Error: File not found: {path}"
 
             elif tool_name == 'write_file':
                 path = kwargs.get('file_path', '')
                 content = kwargs.get('content', '')
-                with open(path, 'w', encoding='utf-8') as f:
+                full_path = path if os.path.isabs(path) else os.path.join(self.working_dir, path)
+                with open(full_path, 'w', encoding='utf-8') as f:
                     f.write(content)
                 return f"Successfully wrote to {path}"
 
             elif tool_name == 'glob':
                 pattern = kwargs.get('pattern', '*')
-                matches = glob_module.glob(pattern, recursive=True)
+                old_cwd = os.getcwd()
+                try:
+                    os.chdir(self.working_dir)
+                    matches = glob_module.glob(pattern, recursive=True)
+                finally:
+                    os.chdir(old_cwd)
                 return str(matches[:30])
 
             elif tool_name == 'grep_search':
                 pattern = kwargs.get('pattern', '')
                 results = []
-                for root, dirs, files in os.walk('.'):
-                    if '.git' in root or 'cuda' in root:
-                        continue
-                    for file in files:
-                        if file.endswith(('.py', '.md', '.txt', '.bat')):
-                            fp = os.path.join(root, file)
-                            try:
-                                with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
-                                    for idx, line in enumerate(f):
-                                        if re.search(pattern, line, re.IGNORECASE):
-                                            results.append(f"{fp}:{idx+1}: {line.strip()}")
-                                            if len(results) >= 20:
-                                                break
-                            except:
-                                pass
+                old_cwd = os.getcwd()
+                try:
+                    os.chdir(self.working_dir)
+                    for root, dirs, files in os.walk('.'):
+                        if '.git' in root or 'cuda' in root:
+                            continue
+                        for file in files:
+                            if file.endswith(('.py', '.md', '.txt', '.bat')):
+                                fp = os.path.join(root, file)
+                                try:
+                                    with open(fp, 'r', encoding='utf-8', errors='ignore') as f:
+                                        for idx, line in enumerate(f):
+                                            if re.search(pattern, line, re.IGNORECASE):
+                                                results.append(f"{fp}:{idx+1}: {line.strip()}")
+                                                if len(results) >= 20:
+                                                    break
+                                except:
+                                    pass
+                finally:
+                    os.chdir(old_cwd)
                 return "\n".join(results) if results else "No matches found."
 
             elif tool_name == 'run_shell_command':
                 cmd = kwargs.get('command', '')
-                res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=os.getcwd())
+                res = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30, cwd=self.working_dir)
                 output = res.stdout if res.returncode == 0 else res.stderr
                 return output[:2000] if output else "Command executed with no output."
 
@@ -485,6 +510,7 @@ if __name__ == "__main__":
     print("\n--- Ashen GPT Fully Functional Agentic CLI Chatbot Ready ---")
     print("Capabilities: Chain-of-Thought + Tool Execution (read_file, write_file, glob, grep_search, run_shell_command)")
     print("Session & Workspace: /sessions, /new, /load <id>, /delete <id>, /rename <name>, /workspace <path>, /wctx off")
+    print("Working Directory: /cd <path> (change), /cd (show), /pwd")
     print("Commands: /clear (reset conversation), /help (show help), /exit or /quit (exit)")
     
     # Auto-create first session
@@ -601,6 +627,19 @@ if __name__ == "__main__":
                         'workspace_context': ''
                     })
                 continue
+            if cmd.startswith('/cd '):
+                dir_path = cmd[4:].strip()
+                if not dir_path:
+                    print(f"[Current working directory: {reasoner.working_dir}]")
+                    continue
+                if reasoner.change_working_dir(dir_path):
+                    print(f"[Working directory changed to: {reasoner.working_dir}]")
+                else:
+                    print(f"[Invalid directory: {dir_path}]")
+                continue
+            if cmd == '/pwd':
+                print(f"[Working directory: {reasoner.working_dir}]")
+                continue
             if cmd == '/help':
                 print("""Ashen GPT Agentic CLI Help:
   - Ask questions or request actions (e.g. 'Run pytest' or 'Check files').
@@ -615,10 +654,17 @@ Session Management:
   - /delete <id>  : Delete a session.
   - /rename <name>: Rename current session.
 
+Working Directory:
+  - /cd <path>    : Change working directory for all tool operations.
+  - /cd           : Show current working directory.
+  - /pwd          : Alias for /cd (show current directory).
+
 Workspace Context:
   - /workspace <path> : Scan a directory and inject its file tree into prompts.
   - /wctx off         : Clear workspace context.""")
                 continue
+
+            print("Invalid command. Type /help for usage.")
 
             GREY = "\033[90m"
             RESET = "\033[0m"
