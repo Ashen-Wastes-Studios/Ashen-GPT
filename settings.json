@@ -9,5 +9,5 @@
   "low_end_gpu_mode": false,
   "precision": "fp16",
   "cpu_offload_layers": 0,
-  "current_model": "{{current_model_filename}}"
+  "current_model": "C:/dev/Ashen AI Base/ashen_gpt_model.pk1"
 }

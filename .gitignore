@@ -84,7 +84,7 @@ secrets.json
 *.txt
 !vocab.txt
 
-ashen_gpt_model.pk1
+*.pk1
 *GGUF/
 sessions/
 sessions_cli/
