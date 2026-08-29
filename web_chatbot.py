@@ -238,6 +238,23 @@ else:
 
 m = model.to(device)
 
+# --- Draft Model Support ---
+draft_model_filename = 'ashen_gpt_model_draft.pk1'  # Default draft model path
+draft_model = None
+
+if os.path.exists(draft_model_filename):
+    print(f"Loading Ashen GPT Draft model from {draft_model_filename}...")
+    try:
+        with open(draft_model_filename, 'rb') as f:
+            draft_model = pickle.load(f)
+        draft_model = draft_model.to(device)
+        print("Draft model loaded successfully!")
+    except Exception as e:
+        print(f"Failed to load draft model: {e}")
+        draft_model = None
+else:
+    print(f"No draft model found at {draft_model_filename}. Using main model only.")
+
 class AshenAIAgenticEngine:
     def __init__(self, model, decode_fn, encode_fn, device, max_steps=5):
         self.model = model
@@ -255,6 +272,9 @@ class AshenAIAgenticEngine:
         self.gpu_layers = 16
         self.repeat_penalty = 1.1
         self.workspace_context = ""  # injected context from browsed workspace
+        self.session_id = None
+        self.use_draft_model = False  # Toggle for speculative decoding
+        self.draft_temperature = 0.6  # Lower temp for draft proposals
 
     def clear_history(self):
         self.history = []
@@ -274,6 +294,113 @@ class AshenAIAgenticEngine:
         self.context_length = int(settings.get('context_length', self.context_length))
         self.gpu_layers = int(settings.get('gpu_layers', self.gpu_layers))
         self.repeat_penalty = float(settings.get('repeat_penalty', self.repeat_penalty))
+        
+        # Add draft model support
+        if 'use_draft_model' in settings:
+            self.use_draft_model = bool(settings['use_draft_model'])
+        if 'draft_temperature' in settings:
+            self.draft_temperature = float(settings['draft_temperature'])
+
+    @torch.no_grad()
+    def generate_with_speculative_decoding(self, input_ids, max_new_tokens):
+        """Generate tokens using main + draft model for faster inference."""
+        global draft_model
+        
+        if not draft_model or not self.use_draft_model:
+            # Fall back to normal generation
+            return self.model.generate(
+                input_ids,
+                max_new_tokens=max_new_tokens,
+                current_block_size=self.context_length,
+                temperature=self.temperature,
+                top_k=self.top_k
+            )
+        
+        print(f"[Speculative Decoding] Using draft model + main model", flush=True)
+        
+        # Speculative decoding: draft proposes N tokens, main verifies K
+        draft_steps = 8  # How many tokens draft generates at once
+        accept_threshold = 0.5  # Minimum confidence to accept draft token
+        
+        generated = input_ids.clone()
+        
+        for step in range(max_new_tokens // draft_steps + 1):
+            # Draft model generates proposal sequence
+            draft_output = draft_model.generate(
+                generated,
+                max_new_tokens=draft_steps,
+                current_block_size=self.context_length,
+                temperature=self.draft_temperature,
+                top_k=30
+            )
+            
+            # Get draft proposals (excluding the original prompt)
+            draft_proposals = draft_output[0, len(input_ids[0]):].tolist()
+            
+            # Main model verifies each draft token
+            accepted_count = 0
+            final_tokens = []
+            
+            for draft_token in draft_proposals:
+                # Main model computes probability for draft token
+                draft_tensor = torch.tensor([[draft_token]], dtype=torch.long, device=device)
+                
+                with torch.autocast('cuda' if device == 'cuda' else 'cpu'):
+                    logits = self.model.forward(draft_tensor, current_block_size=self.context_length)[0]
+                    probs = F.softmax(logits[0, -1], dim=-1)
+                    accept_prob = probs[draft_token].item()
+                
+                # Accept draft if random number < acceptance probability
+                if random.random() < min(accept_prob / accept_threshold, 1.0):
+                    final_tokens.append(draft_token)
+                    accepted_count += 1
+                    
+                    # Update generated sequence
+                    generated = torch.cat([generated, torch.tensor([[draft_token]])], dim=1)
+                    
+                    # Check if we've reached max context
+                    if len(generated[0]) >= self.context_length:
+                        break
+                else:
+                    # Reject: sample from main model's distribution adjusted by draft
+                    main_logits = self.model.forward(generated, current_block_size=self.context_length)[0]
+                    adjusted_probs = F.log_softmax(main_logits[0, -1], dim=-1).exp()
+                    adjusted_probs = adjusted_probs * (1.0 - accept_threshold) + (probs * accept_threshold)
+                    adjusted_probs = adjusted_probs / adjusted_probs.sum()
+                    
+                    # Sample from adjusted distribution
+                    next_token = torch.multinomial(adjusted_probs, 1).item()
+                    final_tokens.append(next_token)
+                    
+                    generated = torch.cat([generated, torch.tensor([[next_token]])], dim=1)
+                    break
+            
+            if not final_tokens:
+                break
+            
+            # Stop if we've generated enough tokens
+            if len(final_tokens) >= max_new_tokens:
+                break
+        
+        final_len = len(generated[0])
+        print(f"[Speculative Decoding] Generated {final_len} tokens ({accepted_count} accepted out of {len(draft_proposals)} drafted)", flush=True)
+        
+        return generated
+
+    def update_settings(self, settings):
+        self.temperature = float(settings.get('temperature', self.temperature))
+        self.top_k = int(settings.get('top_k', self.top_k))
+        self.top_p = float(settings.get('top_p', self.top_p))
+        self.max_new_tokens = int(settings.get('max_new_tokens', self.max_new_tokens))
+        self.context_length = int(settings.get('context_length', self.context_length))
+        self.gpu_layers = int(settings.get('gpu_layers', self.gpu_layers))
+        self.repeat_penalty = float(settings.get('repeat_penalty', self.repeat_penalty))
+        
+        # Add draft model support
+        if 'use_draft_model' in settings:
+            self.use_draft_model = bool(settings['use_draft_model'])
+        if 'draft_temperature' in settings:
+            self.draft_temperature = float(settings['draft_temperature'])
         
         global m, device
         target_dev = 'cuda' if (self.gpu_layers > 0 and torch.cuda.is_available()) else 'cpu'
@@ -734,13 +861,20 @@ class AshenAIAgenticEngine:
                 encoded = encoded[-self.context_length:]
             input_ids = torch.tensor([encoded], dtype=torch.long, device=device)
 
-            output_ids = self.model.generate(
-                input_ids, 
-                max_new_tokens=self.max_new_tokens, 
-                current_block_size=self.context_length, 
-                temperature=self.temperature, 
-                top_k=self.top_k
-            )
+            # Use speculative decoding if draft model is enabled, otherwise normal generation
+            if self.use_draft_model and draft_model is not None:
+                output_ids = self.generate_with_speculative_decoding(
+                    input_ids,
+                    max_new_tokens=self.max_new_tokens
+                )
+            else:
+                output_ids = self.model.generate(
+                    input_ids,
+                    max_new_tokens=self.max_new_tokens,
+                    current_block_size=self.context_length,
+                    temperature=self.temperature,
+                    top_k=self.top_k
+                )
             raw_generated = self.decode(output_ids[0].tolist())
 
             if raw_generated.startswith(current_prompt):
@@ -1006,6 +1140,48 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     <input type="range" id="setting-gpu-layers" min="0" max="32" step="1" value="16" oninput="document.getElementById('gpu-layers-val').textContent=this.value" class="w-full accent-cyan-500 bg-slate-950">
                 </div>
 
+                <!-- Draft Model Settings -->
+                <div class="pt-4 border-t border-slate-800">
+                    <h3 class="text-sm font-semibold text-violet-300 mb-3 flex items-center gap-2">
+                        <span class="inline-block w-2 h-2 rounded-full bg-violet-400"></span>
+                        📝 Draft Model Configuration
+                    </h3>
+                    
+                    <div class="space-y-3">
+                        <!-- Enable Speculative Decoding -->
+                        <div class="flex items-center justify-between p-3 bg-slate-950/50 rounded-lg border border-slate-800">
+                            <div>
+                                <div class="text-slate-300 font-medium">Enable Speculative Decoding</div>
+                                <div class="text-slate-500 text-[10px]">Use draft model for faster token generation via speculative decoding</div>
+                            </div>
+                            <label class="relative inline-flex items-center cursor-pointer">
+                                <input type="checkbox" id="setting-draft-enabled" onchange="toggleDraftSettings()" class="sr-only peer">
+                                <div class="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-violet-600"></div>
+                            </label>
+                        </div>
+
+                        <!-- Draft Temperature (hidden until enabled) -->
+                        <div id="draft-temp-section" class="hidden space-y-1 pl-4 border-l-2 border-violet-800">
+                            <div class="flex justify-between">
+                                <span class="text-slate-300 font-medium">Draft Model Temperature</span>
+                                <span id="draft-temp-val" class="text-violet-400 font-mono">0.6</span>
+                            </div>
+                            <input type="range" id="setting-draft-temp" min="0.1" max="1.0" step="0.05" value="0.6" oninput="document.getElementById('draft-temp-val').textContent=this.value" class="w-full accent-violet-500 bg-slate-950" disabled>
+                            <div class="text-slate-500 text-[10px]">Lower temperature = more deterministic drafts</div>
+                        </div>
+
+                        <!-- Draft Model Info -->
+                        <div class="p-3 bg-amber-950/30 rounded-lg border border-amber-800/50">
+                            <div class="text-amber-300 text-xs font-semibold mb-1">ℹ️ Requirements</div>
+                            <ul class="text-[10px] text-slate-400 space-y-0.5 list-disc list-inside">
+                                <li>Draft model file: <code class="text-violet-300">ashen_gpt_model_draft.pk1</code></li>
+                                <li>Recommended: smaller/faster version of main model</li>
+                                <li>Load manually via Model Hub → Upload or place in project directory</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="pt-4 flex justify-end space-x-3 border-t border-slate-800">
                     <button onclick="toggleSettingsModal(false)" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg font-bold transition">CANCEL</button>
                     <button onclick="saveSettings()" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold transition">SAVE SETTINGS</button>
@@ -1172,9 +1348,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         function toggleSessionsPanel(show) {
             const panel = document.getElementById('sessions-panel');
             const overlay = document.getElementById('sessions-overlay');
-            
+
             console.log('[DEBUG] toggleSessionsPanel:', show);
-            
+
             if (panel) {
                 if (show) {
                     panel.classList.remove('-translate-x-full');
@@ -1189,6 +1365,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 overlay.style.display = show ? 'block' : 'none';
             }
             if (show) loadSessionList();
+        }
+
+        // Toggle draft model settings visibility
+        function toggleDraftSettings() {
+            const enabled = document.getElementById('setting-draft-enabled').checked;
+            const section = document.getElementById('draft-temp-section');
+            const slider = document.getElementById('setting-draft-temp');
+            
+            if (enabled) {
+                section.classList.remove('hidden');
+                slider.disabled = false;
+            } else {
+                section.classList.add('hidden');
+                slider.disabled = true;
+            }
         }
 
         // Render helpers for loading session history
@@ -1450,6 +1641,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 context_length: parseInt(document.getElementById('setting-context').value),
                 gpu_layers: parseInt(document.getElementById('setting-gpu-layers').value)
             };
+            
+            // Add draft model settings
+            const draftEnabled = document.getElementById('setting-draft-enabled').checked;
+            if (draftEnabled) {
+                settings.use_draft_model = true;
+                settings.draft_temperature = parseFloat(document.getElementById('setting-draft-temp').value);
+            } else {
+                settings.use_draft_model = false;
+            }
+            
             const statusEl = document.getElementById('settings-status');
             statusEl.textContent = 'Updating settings...';
 
