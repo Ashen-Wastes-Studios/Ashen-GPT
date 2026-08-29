@@ -655,7 +655,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
 
     <!-- Sessions Panel -->
-    <div id="sessions-panel" class="fixed inset-y-0 left-0 w-80 bg-slate-950/95 backdrop-blur-sm z-40 border-r border-blue-900/40 transform -translate-x-full transition-transform duration-300 flex flex-col">
+    <div id="sessions-panel" class="fixed inset-y-0 left-0 w-80 bg-slate-950/95 backdrop-blur-sm z-40 border-r border-blue-900/40 -translate-x-full transition-transform duration-300 ease-in-out flex flex-col">
         <div class="p-4 border-b border-blue-900/30 flex items-center justify-between">
             <h2 class="text-sm font-bold text-blue-400 uppercase tracking-wider">💬 Chat Sessions</h2>
             <button onclick="toggleSessionsPanel(false)" class="text-slate-400 hover:text-white font-bold text-lg">✕</button>
@@ -809,16 +809,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
             const overlay = document.getElementById('sessions-overlay');
             
             console.log('[DEBUG] toggleSessionsPanel:', show);
-            console.log('[DEBUG] panel found:', !!panel);
-            console.log('[DEBUG] overlay found:', !!overlay);
             
             if (panel) {
-                panel.style.transform = show ? 'translateX(0)' : '-translate-x-full';
-                console.log('[DEBUG] panel transform set to:', panel.style.transform);
+                if (show) {
+                    panel.classList.remove('-translate-x-full');
+                    panel.classList.add('translate-x-0');
+                } else {
+                    panel.classList.remove('translate-x-0');
+                    panel.classList.add('-translate-x-full');
+                }
+                console.log('[DEBUG] panel classes:', panel.className);
             }
             if (overlay) {
                 overlay.style.display = show ? 'block' : 'none';
-                console.log('[DEBUG] overlay display set to:', overlay.style.display);
             }
             if (show) loadSessionList();
         }
