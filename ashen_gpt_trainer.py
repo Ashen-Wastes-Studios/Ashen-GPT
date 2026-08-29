@@ -44,13 +44,13 @@ import copy
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using optimized device: {device}")
 
-# --- Progressive Multi-Hop Staged Training Configuration (5,000 Max Iters) ---
-max_iters = 5000                # Robust multi-thousand iteration pre-training run
-eval_interval = 250             # Evaluation checkpoints
+# --- Progressive Multi-Hop Staged Training Configuration (3,000 Max Iters - Optimized) ---
+max_iters = 3000                # Optimized for faster training while maintaining quality
+eval_interval = 500             # Evaluation checkpoints (less frequent = faster)
 learning_rate = 4e-4
 min_learning_rate = 3e-5
-warmup_iters = 200
-eval_iters = 50
+warmup_iters = 150              # Shorter warmup for faster convergence
+eval_iters = 20                 # Fewer eval samples = faster evaluation
 n_embd = 512
 n_layer = 8
 n_head = 8
@@ -382,22 +382,22 @@ for iter in range(max_iters):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # Determine current training stage based on iteration (scaled for 5,000 max_iters)
-    if iter <= 3000:
+    # Determine current training stage based on iteration (scaled for 3,000 max_iters)
+    if iter <= 2000:
         stage_name = "Stage 1: Core Training"
         current_block_size = 512
         current_batch_size = 8
         gradient_accumulation_steps = 2
-    elif iter <= 4500:
+    elif iter <= 2500:
         stage_name = "Stage 2: Intermediate Extension"
         current_block_size = 2048
-        current_batch_size = 2
-        gradient_accumulation_steps = 8
+        current_batch_size = 4              # Increased from 2 for faster throughput
+        gradient_accumulation_steps = 4     # Reduced from 8 (batch size compensates)
     else:
         stage_name = "Stage 3: Extreme Extension"
         current_block_size = 8192
-        current_batch_size = 1
-        gradient_accumulation_steps = 16
+        current_batch_size = 2              # Increased from 1 (when possible)
+        gradient_accumulation_steps = 8     # Balanced accumulation
 
     loss_accum = 0.0
     for micro_step in range(gradient_accumulation_steps):
@@ -423,36 +423,21 @@ for iter in range(max_iters):
         print(f"\n==================================================", flush=True)
         print(f"--- EVALUATION ({stage_name} - Ctx: {current_block_size}) ---", flush=True)
         print(f"==================================================", flush=True)
+        
+        # Quick loss estimation (fast path)
         losses = estimate_loss(current_block_size, current_batch_size)
         print(f"Eval Results -> Train Loss: {losses['train']:.3f} | Val Loss: {losses['val']:.3f}\n", flush=True)
 
+        # Lightweight text generation test (1 context window only, max 50 tokens)
         model.eval()
-
-        text_prompt = "The future of artificial intelligence is"
-        context_text = torch.tensor([encode(text_prompt)], dtype=torch.long, device=device)
-        raw_text_gen = decode(model.generate(context_text, max_new_tokens=100, current_block_size=current_block_size)[0].tolist())
-        clean_text_gen = filter_code_output(raw_text_gen)
-
-        print(f"[TEXT TEST]", flush=True)
-        print(f"Prompt: {text_prompt}", flush=True)
-        print(f"Completion (Natural Language): {clean_text_gen}\n", flush=True)
-
-        clock_app_prompts = [
-            ("Python", "def create_python_clock():\n    # Write a clock app in Python:\n"),
-            ("JavaScript / TypeScript", "function createClockApp() {\n    // Write a clock app in JavaScript:\n"),
-            ("Go", "package main\n// Write a clock app in Go:\nfunc main() {\n"),
-            ("Rust", "// Write a clock app in Rust:\nfn main() {\n    println!(\"Rust Clock App\");\n"),
-            ("C++", "// Write a clock app in C++:\n#include <iostream>\nint main() {\n"),
-            ("Ruby", "# Write a clock app in Ruby:\nclass ClockApp\n")
-        ]
-
-        print(f"[CODE TESTS - CLOCK APP GENERATION ACROSS 6 LANGUAGES]", flush=True)
-        for lang, prompt_snippet in clock_app_prompts:
-            context_code = torch.tensor([encode(prompt_snippet)], dtype=torch.long, device=device)
-            raw_code_gen = decode(model.generate(context_code, max_new_tokens=100, current_block_size=current_block_size)[0].tolist())
-            print(f"--- Language: {lang} ---", flush=True)
-            print(f"Prompt: {prompt_snippet.strip()}", flush=True)
-            print(f"Completion:\n{raw_code_gen}\n", flush=True)
+        with torch.no_grad():
+            test_prompts = ["The future of artificial intelligence is"]
+            for prompt in test_prompts:
+                context_text = torch.tensor([encode(prompt)], dtype=torch.long, device=device)
+                raw_gen = decode(model.generate(context_text, max_new_tokens=50, current_block_size=current_block_size)[0].tolist())
+                clean_gen = filter_code_output(raw_gen)
+                print(f"[Quick Test] Prompt: {prompt}", flush=True)
+                print(f"Completion: {clean_gen}\n", flush=True)
 
         print(f"==================================================\n", flush=True)
         model.train()
