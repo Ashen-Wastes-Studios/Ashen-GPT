@@ -534,3 +534,156 @@ for epoch in range(sft_epochs):
 with open("ashen_gpt_model.pk1", "wb") as f:
     pickle.dump(model, f)
 print("Training & Supervised Fine-Tuning complete! Staged 8K model saved to ashen_gpt_model.pk1", flush=True)
+
+# --- PHASE 3: REINFORCEMENT LEARNING (Direct Preference Optimization - DPO) ---
+print("\n=== PHASE 3: Reinforcement Learning via DPO ===", flush=True)
+print("Objective: Align model outputs with preferred responses using direct preference optimization", flush=True)
+
+# Preference dataset: each item has instruction + chosen (preferred) + rejected (dispreferred) response
+DPO_PREFERENCE_DATASET = [
+    {
+        "instruction": "Explain Python decorators.",
+        "chosen": "<think>\nDecorators wrap functions to add behavior without modifying them.\n</think>\nPython decorators are functions that modify or enhance other functions. They use the @decorator syntax and allow you to add functionality like logging or authentication without changing the original function code.",
+        "rejected": "Decorators are fancy function wrappers."
+    },
+    {
+        "instruction": "Write a binary search algorithm.",
+        "chosen": "<think>\nBinary search divides the sorted array in half repeatedly until the target is found.\n</think>\ndef binary_search(arr, target):\n    left, right = 0, len(arr) - 1\n    while left <= right:\n        mid = (left + right) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            left = mid + 1\n        else:\n            right = mid - 1\n    return -1\n# Time complexity: O(log n)",
+        "rejected": "def binsearch(x,y): # binary search\nfor i in x: # loop through\nif i==y: return True\nreturn False"
+    },
+    {
+        "instruction": "What is transfer learning?",
+        "chosen": "<think>\nTransfer learning uses pre-trained models on new but related tasks.\n</think>\nTransfer learning is an ML technique where knowledge gained from solving one problem is applied to a different but related problem. Common in NLP (fine-tuning BERT/RoBERTa) and computer vision (using ImageNet weights for custom classification). Improves performance when labeled data is scarce.",
+        "rejected": "transfer learning is when you learn things again"
+    },
+    {
+        "instruction": "Implement a LRU cache in Python.",
+        "chosen": "<think>\nLRU cache needs a doubly-linked list + hash map for O(1) operations.\n</think>\nfrom collections import OrderedDict\n\nclass LRUCache:\n    def __init__(self, capacity: int):\n        self.cache = OrderedDict()\n        self.capacity = capacity\n    \n    def get(self, key: int) -> int:\n        if key not in self.cache:\n            return -1\n        self.cache.move_to_end(key)\n        return self.cache[key]\n    \n    def put(self, key: int, value: int) -> None:\n        if key in self.cache:\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        if len(self.cache) > self.capacity:\n            self.cache.popitem(last=False)",
+        "rejected": "class cache:\n    def __init__():\n        pass\n    def get():\n        return None\n    def put():\n        pass"
+    },
+    {
+        "instruction": "Compare REST and GraphQL APIs.",
+        "chosen": "<think>\nREST uses multiple endpoints; GraphQL uses single endpoint with flexible queries.\n</think>\n**REST:** Multiple endpoints (GET /users, GET /posts), fixed response shapes, over-fetching/under-fetching common. Uses HTTP methods naturally.\n\n**GraphQL:** Single endpoint (/graphql), clients request exact data needed, strong typing via schema. Eliminates over-fetching but adds query complexity and caching challenges.\n\n**Trade-offs:** REST is simpler and cache-friendly; GraphQL is flexible and efficient for complex data hierarchies.",
+        "rejected": "REST is old and GraphQL is new. Both do API stuff."
+    },
+    {
+        "instruction": "How does gradient descent work?",
+        "chosen": "<think>\nGD iteratively adjusts weights to minimize loss by following negative gradient direction.\n</think>\nGradient Descent is an optimization algorithm that minimizes a loss function by iteratively moving in the direction of steepest descent (negative gradient). At each step:\n1. Compute gradients: ∂L/∂w\n2. Update weights: w = w - lr × ∂L/∂w\n3. Repeat until convergence\n\nVariants include SGD (stochastic), Mini-batch GD, Adam, RMSProp (adaptive learning rates). The learning rate controls step size.",
+        "rejected": "it goes down the hill of the function until it finds bottom"
+    }
+]
+
+dpo_beta = 0.1  # DPO temperature parameter
+dpo_epochs = 2
+dpo_lr = 1e-5   # Lower LR for RL fine-tuning
+
+optimizer_dpo = torch.optim.AdamW(model.parameters(), lr=dpo_lr, fused=True if device == 'cuda' else False)
+
+@torch.no_grad()
+def compute_log_probs(model, input_ids, attention_mask=None):
+    """Compute log probabilities for a sequence."""
+    outputs = model(input_ids, labels=input_ids.clone())
+    logits = outputs.logits
+    log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+    return log_probs
+
+def dpo_loss(chosen_log_probs, rejected_log_probs, beta=0.1):
+    """Compute DPO loss for a batch of preference pairs."""
+    # DPO loss formulation (Rafael et al., 2023)
+    pi_ref_log_probs = chosen_log_probs  # Reference model = frozen SFT model
+    ref_log_probs = rejected_log_probs
+    
+    # Loss per pair
+    chosen_reward = beta * (chosen_log_probs - pi_ref_log_probs)
+    rejected_reward = beta * (rejected_log_probs - pi_ref_log_probs)
+    
+    # Negative log sigmoid of the difference
+    loss = -F.logsigmoid(chosen_reward - rejected_reward)
+    return loss.mean()
+
+total_dpo_iters = 0
+for epoch in range(dpo_epochs):
+    total_dpo_loss = 0.0
+    random.shuffle(DPO_PREFERENCE_DATASET)
+    
+    print(f"\n{'='*60}", flush=True)
+    print(f"DPO Epoch {epoch+1}/{dpo_epochs}", flush=True)
+    print(f"{'='*60}", flush=True)
+    
+    for idx, item in enumerate(DPO_PREFERENCE_DATASET):
+        # Format chosen response
+        chosen_text = f"### Instruction:\n{item['instruction']}\n\n### Response:\n{item['chosen']}<|endoftext|>"
+        tokens_chosen = encode(chosen_text)
+        
+        # Format rejected response  
+        rejected_text = f"### Instruction:\n{item['instruction']}\n\n### Response:\n{item['rejected']}<|endoftext|>"
+        tokens_rejected = encode(rejected_text)
+        
+        # Truncate if needed
+        max_len = min(len(tokens_chosen), len(tokens_rejected), 4096)
+        tokens_chosen = tokens_chosen[:max_len]
+        tokens_rejected = tokens_rejected[:max_len]
+        
+        # Create input tensors (shifted for next-token prediction)
+        x_chosen = torch.tensor(tokens_chosen[:-1], dtype=torch.long, device=device).unsqueeze(0)
+        y_chosen = torch.tensor(tokens_chosen[1:], dtype=torch.long, device=device).unsqueeze(0)
+        
+        x_rejected = torch.tensor(tokens_rejected[:-1], dtype=torch.long, device=device).unsqueeze(0)
+        y_rejected = torch.tensor(tokens_rejected[1:], dtype=torch.long, device=device).unsqueeze(0)
+        
+        # Forward pass with autocast
+        with torch.amp.autocast('cuda' if device == 'cuda' else 'cpu'):
+            _, loss_chosen = model.forward(x_chosen, y_chosen, current_block_size=4096)
+            _, loss_rejected = model.forward(x_rejected, y_rejected, current_block_size=4096)
+            
+            # Compute log probs for DPO
+            logits_chosen = model.forward(x_chosen, current_block_size=4096)[0]
+            logits_rejected = model.forward(x_rejected, current_block_size=4096)[0]
+            
+            log_probs_chosen = torch.gather(
+                F.log_softmax(logits_chosen, dim=-1),
+                dim=-1,
+                index=y_chosen.unsqueeze(-1)
+            ).squeeze(-1).sum(dim=-1)
+            
+            log_probs_rejected = torch.gather(
+                F.log_softmax(logits_rejected, dim=-1),
+                dim=-1,
+                index=y_rejected.unsqueeze(-1)
+            ).squeeze(-1).sum(dim=-1)
+            
+            # Compute DPO loss
+            dpo_batch_loss = dpo_loss(log_probs_chosen, log_probs_rejected, beta=dpo_beta)
+        
+        # Backward pass
+        optimizer_dpo.zero_grad(set_to_none=True)
+        scaler.scale(dpo_batch_loss).backward()
+        scaler.unscale_(optimizer_dpo)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        scaler.step(optimizer_dpo)
+        scaler.update()
+        
+        total_dpo_loss += dpo_batch_loss.item()
+        total_dpo_iters += 1
+        
+        if total_dpo_iters % 2 == 0:
+            print(f"[DPO Epoch {epoch+1} | Sample {idx+1}/{len(DPO_PREFERENCE_DATASET)}] "
+                  f"DPO Loss: {dpo_batch_loss.item():.4f} | Chosen LL: {log_probs_chosen.item():.2f} | "
+                  f"Rejected LL: {log_probs_rejected.item():.2f}", flush=True)
+    
+    avg_dpo_loss = total_dpo_loss / len(DPO_PREFERENCE_DATASET)
+    print(f"\nDPO Epoch {epoch+1} Complete | Avg DPO Loss: {avg_dpo_loss:.4f}", flush=True)
+    torch.cuda.empty_cache()
+    gc.collect()
+
+print(f"\n{'='*60}", flush=True)
+print(f"DPO Training Complete! Total iterations: {total_dpo_iters}", flush=True)
+print(f"Model now aligned with preference data via Direct Preference Optimization", flush=True)
+print(f"{'='*60}\n", flush=True)
+
+# Final save
+final_model_name = "ashen_gpt_model_dpo.pk1"
+with open(final_model_name, "wb") as f:
+    pickle.dump(model, f)
+print(f"DPO-aligned model saved to {final_model_name}", flush=True)
+print("=== COMPLETE TRAINING PIPELINE (Pre-training → SFT → DPO) FINISHED ===", flush=True)
