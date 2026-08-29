@@ -33,17 +33,18 @@ Ashen GPT is tuned for **consumer GPUs (8GB+ VRAM)** with strict memory protecti
 
 ## 🔄 Training Pipeline
 
-### Phase 1 — Pre-training (5,000 iterations)
+### Phase 1 — Pre-training (Optimized: 3,000 iterations)
 
-| Stage | Iterations | Context | Batch | Gradient Accumulation |
-|---|---|---|---|---|
-| Core Training | 0–3,000 | 512 | 8 | 2 |
-| Intermediate Extension | 3,001–4,500 | 2,048 | 2 | 8 |
-| Extreme Extension | 4,501–5,000 | 8,192 | 1 | 16 |
+| Stage | Iterations | Context | Batch | Gradient Accumulation | Effective Batch Size |
+|---|---|---|---|---|---|
+| Core Training | 0–2,000 | 512 | 8 | 2 | 16 |
+| Intermediate Extension | 2,001–2,500 | 2,048 | 4 | 4 | 16 |
+| Extreme Extension | 2,501–3,000 | 8,192 | 2 | 8 | 16 |
 
-- Evaluation & generation tests run every 250 iterations.
+- Evaluation runs every 500 iterations (quick loss estimation + lightweight text test).
 - Auto-detects and doubles checkpoint depth if `ashen_gpt_model.pk1` already exists.
 - Training logs stream to both terminal and `training_logs.txt` (timestamped sessions).
+- Optimized for ~40-50% faster training: reduced from 5,000 to 3,000 iterations, higher batch utilization, streamlined evaluations.
 
 ### Phase 2 — Supervised Fine-Tuning (SFT)
 
