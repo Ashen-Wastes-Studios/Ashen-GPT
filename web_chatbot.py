@@ -983,7 +983,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
             codeEl.className = langMap[ext] || 'language-python';
 
             try {
-                const res = await fetch(`/api/workspace/read?path=${encodeURIComponent(filepath)}`);
+                const res = await fetch('/api/workspace/read', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ path: filepath })
+                });
                 const data = await res.json();
                 if (data.status === 'success') {
                     editor.value = data.content;
@@ -1704,29 +1708,55 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(json.dumps(listing).encode('utf-8'))
-        elif path == '/api/workspace/read':
-            file_path = query.get('path', [''])[0]
-            # Handle URL-decoded path properly
+        if self.path == '/api/workspace/read':
+            # Read file from query params (GET) or request body (POST)
+            file_path = None
+            if 'path' in query and query['path']:
+                file_path = query['path'][0]
+            
+            if not file_path:
+                # Try reading from POST body
+                try:
+                    content_length = int(self.headers.get('Content-Length', 0))
+                    if content_length > 0:
+                        body = self.rfile.read(content_length)
+                        data = json.loads(body.decode('utf-8'))
+                        file_path = data.get('path', '')
+                except:
+                    pass
+            
             if not file_path:
                 resp_data = {'status': 'error', 'message': 'No file path provided'}
             else:
-                # Try the path as-is first, then try joining with working dir
+                # Try multiple path strategies
+                target_path = None
+                
+                # Strategy 1: Use path as-is (might be absolute)
                 if os.path.isfile(file_path):
                     target_path = file_path
-                elif os.path.isfile(os.path.join(os.getcwd(), file_path)):
+                
+                # Strategy 2: If it looks like a relative path, join with cwd
+                elif not os.path.isabs(file_path) and os.path.isfile(os.path.join(os.getcwd(), file_path)):
                     target_path = os.path.join(os.getcwd(), file_path)
-                else:
-                    target_path = None
+                
+                # Strategy 3: Try decoding Windows-style forward slashes
+                elif '/' in file_path and os.path.isfile(file_path.replace('/', '\\')):
+                    target_path = file_path.replace('/', '\\')
                 
                 if target_path and os.path.exists(target_path) and os.path.isfile(target_path):
                     try:
-                        with open(target_path, 'r', encoding='utf-8', errors='ignore') as f:
-                            content = f.read()
+                        with open(target_path, 'rb') as f:
+                            raw_bytes = f.read()
+                        # Try UTF-8 first, then latin-1 as fallback
+                        try:
+                            content = raw_bytes.decode('utf-8')
+                        except UnicodeDecodeError:
+                            content = raw_bytes.decode('latin-1')
                         resp_data = {'status': 'success', 'content': content}
                     except Exception as e:
                         resp_data = {'status': 'error', 'message': str(e)}
                 else:
-                    resp_data = {'status': 'error', 'message': f'File not found: {file_path}'}
+                    resp_data = {'status': 'error', 'message': f'File not found: {file_path} (tried: {target_path or "any strategy"})'}
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
