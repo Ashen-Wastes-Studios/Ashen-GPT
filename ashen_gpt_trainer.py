@@ -44,8 +44,8 @@ import copy
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using optimized device: {device}")
 
-# --- Progressive Multi-Hop Staged Training Configuration (3,000 Max Iters - Optimized) ---
-max_iters = 3000                # Optimized for faster training while maintaining quality
+# --- Progressive Multi-Hop Staged Training Configuration (5,000 Max Iters - Optimized) ---
+max_iters = 5000                # Optimized for faster training while maintaining quality
 eval_interval = 500             # Evaluation checkpoints (less frequent = faster)
 learning_rate = 4e-4
 min_learning_rate = 3e-5
@@ -388,22 +388,22 @@ for iter in range(max_iters):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
-    # Determine current training stage based on iteration (scaled for 3,000 max_iters)
-    if iter <= 2000:
+    # Determine current training stage based on iteration (scaled for 5,000 max_iters)
+    if iter <= 5000:
         stage_name = "Stage 1: Core Training"
         current_block_size = 512
         current_batch_size = 8
         gradient_accumulation_steps = 2
-    elif iter <= 2500:
-        stage_name = "Stage 2: Intermediate Extension"
-        current_block_size = 2048
-        current_batch_size = 4              # Increased from 2 for faster throughput
-        gradient_accumulation_steps = 4     # Reduced from 8 (batch size compensates)
-    else:
-        stage_name = "Stage 3: Extreme Extension"
-        current_block_size = 8192
-        current_batch_size = 2              # Increased from 1 (when possible)
-        gradient_accumulation_steps = 8     # Balanced accumulation
+    #elif iter <= 4000:
+    #    stage_name = "Stage 2: Intermediate Extension"
+    #    current_block_size = 2048
+    #    current_batch_size = 4              # Increased from 2 for faster throughput
+    #    gradient_accumulation_steps = 4     # Reduced from 8 (batch size compensates)
+    #else:
+    #    stage_name = "Stage 3: Extreme Extension"
+    #    current_block_size = 8192
+    #    current_batch_size = 2              # Increased from 1 (when possible)
+    #    gradient_accumulation_steps = 8     # Balanced accumulation
 
     optimizer.zero_grad(set_to_none=True)
     loss_accum = 0.0
