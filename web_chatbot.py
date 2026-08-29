@@ -996,23 +996,26 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     const editor = document.getElementById('code-editor');
                     const codeEl = document.getElementById('highlighted-code');
                     console.log('[DEBUG] editor:', !!editor, 'codeEl:', !!codeEl, 'content length:', data.content?.length || 0);
+                    console.log('[DEBUG] codeEl before:', codeEl ? codeEl.outerHTML.substring(0, 100) : 'null');
                     
                     if (editor) {
                         editor.value = data.content;
                     }
                     
                     if (codeEl) {
-                        // Delay highlighting to ensure Prism and CSS are ready
+                        // First set the text, then delay highlighting
+                        codeEl.textContent = data.content;
+                        console.log('[DEBUG] codeEl after setText:', codeEl.className);
+                        
                         setTimeout(() => {
-                            codeEl.textContent = data.content;
                             if (typeof Prism !== 'undefined' && Prism.highlightElement) {
                                 Prism.highlightElement(codeEl);
-                                console.log('[DEBUG] Highlighting applied to', codeEl.className);
+                                console.log('[DEBUG] After highlight:', codeEl.outerHTML.substring(0, 200));
                             } else {
-                                codeEl.textContent = data.content;
-                                console.warn('[DEBUG] Prism not available');
+                                console.warn('[DEBUG] Prism not available or highlightElement missing');
+                                console.log('[DEBUG] typeof Prism:', typeof Prism);
                             }
-                        }, 50);
+                        }, 100);
                     }
                     if (!editor && !codeEl) {
                         console.error('[DEBUG] ERROR: code-editor or highlighted-code element not found!');
