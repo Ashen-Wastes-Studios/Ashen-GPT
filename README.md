@@ -63,10 +63,42 @@ Both chatbots ship with **chain-of-thought reasoning** and a **ReAct tool loop**
 run_chatbot.bat
 ```
 
-**Commands:** `/clear` · `/help` · `/exit`
+**Core Commands:** `/clear` · `/help` · `/exit`
 
-**Tools:**
-- `read_file(file_path='...')` — Read workspace files.
+#### Session Management
+
+| Command | Description |
+|---|---|
+| `/sessions` | List all saved sessions with message counts & timestamps. |
+| `/new` | Create a fresh session. |
+| `/load <id>` | Load a session by ID (from `/sessions`). |
+| `/delete <id>` | Delete a session permanently. |
+| `/rename <name>` | Rename current session. |
+
+Sessions are stored as JSON files in `sessions_cli/` and include: conversation history, workspace context, and generation settings. Auto-named from first message.
+
+#### Working Directory
+
+| Command | Description |
+|---|---|
+| `/cd <path>` | Change working directory for all tool operations. |
+| `/cd` (no args) | Show current working directory. |
+| `/pwd` | Alias for `/cd`. |
+
+Relative file paths in tools resolve from this directory. All tool executions (`read_file`, `write_file`, `glob`, `grep_search`, `run_shell_command`) operate within this context.
+
+#### Workspace Context
+
+| Command | Description |
+|---|---|
+| `/workspace <path>` | Scan a directory and inject its file tree into system prompts. |
+| `/wctx off` | Clear workspace context. |
+
+Gives the agent situational awareness of which files/folders you're examining without manually copying-pasting contents.
+
+#### Tools (Agent Executable via `[TOOL: name(args)]`)
+
+- `read_file(file_path='...')` — Read workspace files (relative to working dir).
 - `write_file(file_path='...', content='...')` — Create/overwrite files.
 - `glob(pattern='...')` — File discovery.
 - `grep_search(pattern='...')` — Content search across `.py`, `.md`, `.txt`, `.bat`.
@@ -139,11 +171,12 @@ Sessions are stored as JSON files in `sessions/` and include: conversation histo
 
 ```
 ashen_gpt_trainer.py    # Full training pipeline (pre-train + SFT)
-chatbot.py              # CLI agentic chatbot
-web_chatbot.py          # Web UI agentic chatbot (cyberpunk)
+chatbot.py              # CLI agentic chatbot (sessions, workspace context, /cd)
+web_chatbot.py          # Web UI agentic chatbot (cyberpunk, sessions, workspace context)
 ashen_gpt_model.pk1     # Saved model checkpoint (generated after training)
 training_logs.txt       # Auto-generated training log
-sessions/               # Persistent chat sessions (JSON files with history, settings, context)
+sessions/               # Web chatbot sessions (JSON with history, settings, context)
+sessions_cli/           # CLI chatbot sessions (JSON with history, workspace context)
 train_split.txt         # Literature training data
 val_split.txt           # Validation data
 code_train_split.txt    # Scraped code training data
