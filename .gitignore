@@ -86,3 +86,4 @@ secrets.json
 
 ashen_gpt_model.pk1
 *GGUF/
+sessions/
