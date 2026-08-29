@@ -993,16 +993,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 const data = await res.json();
                 console.log('[DEBUG] Response:', data);
                 if (data.status === 'success') {
-                    editor.value = data.content;
-                    codeEl.textContent = data.content;
-                    Prism.highlightElement(codeEl);
+                    const editor = document.getElementById('code-editor');
+                    const codeEl = document.getElementById('highlighted-code');
+                    console.log('[DEBUG] editor:', !!editor, 'codeEl:', !!codeEl, 'content length:', data.content?.length || 0);
+                    if (editor) {
+                        editor.value = data.content;
+                    }
+                    if (codeEl) {
+                        codeEl.textContent = data.content;
+                        Prism.highlightElement(codeEl);
+                    }
+                    if (!editor && !codeEl) {
+                        console.error('[DEBUG] ERROR: code-editor or highlighted-code element not found!');
+                    }
                 } else {
-                    editor.value = 'Error: ' + data.message;
-                    codeEl.textContent = 'Error: ' + data.message;
+                    console.error('[DEBUG] Server returned error:', data.message);
+                    const editor = document.getElementById('code-editor');
+                    if (editor) {
+                        editor.value = 'Error: ' + data.message;
+                    }
                 }
             } catch (err) {
-                editor.value = 'Failed to load file content.';
-                codeEl.textContent = 'Failed to load file content.';
+                console.error('[DEBUG] Exception:', err);
+                const editor = document.getElementById('code-editor');
+                if (editor) {
+                    editor.value = 'Failed to load file content: ' + err.message;
+                }
             }
         }
 
