@@ -130,6 +130,9 @@ Gives the agent situational awareness of which files/folders you're examining wi
 - `glob(pattern='...')` — File discovery.
 - `grep_search(pattern='...')` — Content search across `.py`, `.md`, `.txt`, `.bat`.
 - `run_shell_command(command='...')` — Run any shell command (30s timeout).
+- `web_search(query='...')` — Search DuckDuckGo for real-time information (returns top 5 result titles).
+- `browse_url(url='...')` — Fetch webpage content, strip HTML tags, extract readable text.
+- `deep_research(topic='...', max_searches=3)` — Autonomous multi-source research agent that searches, browses, and synthesizes findings into a structured markdown report.
 
 ### Web Chatbot (`web_chatbot.py`) — Cyberpunk UI
 
@@ -142,7 +145,25 @@ run_web_chatbot.bat   →   http://localhost:5000
 - **Cyberpunk aesthetic** — dark theme, neon accents, toggleable CRT scanline overlay.
 - **Persona switcher** — *Ashen AI Agent*, *Code Architect*, *Cyber Companion*.
 - **Model Hub modal** — browse local `.pk1` checkpoints, upload new weights, swap models live.
-- **Quick-action chips** — one-click buttons for common agent tools (*File Glob*, *Grep*, *Git Status*, *Run Tests*).
+- **Quick-action chips** — one-click buttons for common agent tools (*File Glob*, *Grep*, *Git Status*, *Run Tests*, *Web Search*, *Browse URL*, *Deep Research*).
+
+#### 🌐 Web Browsing & Research
+
+The model can autonomously access live internet data:
+
+| Tool | Description |
+|---|---|
+| `web_search` | Searches DuckDuckGo HTML interface, returns top 5 result titles with links. |
+| `browse_url` | Fetches any webpage, strips HTML tags, extracts readable text (2K char limit). |
+| `deep_research` | Autonomous multi-step research agent: searches → browses → synthesizes into markdown report. |
+
+**Deep Research Workflow:**
+1. **Phase 1**: Initial DuckDuckGo search for topic overview
+2. **Phase 2**: Browses top sources, extracts key paragraphs ranked by informativeness
+3. **Phase 3**: Follow-up searches on related topics
+4. **Output**: Structured markdown report with source URLs and citations
+
+Configurable depth via `max_searches` parameter. New quick-action buttons in sidebar for instant web research.
 - **Adjustable settings** — temperature, top-k, max tokens, context length, GPU layer count, repeat penalty.
 - **Session export & purge** — export chats as Markdown (`.md`) or purge history instantly.
 - **Workspace browser** — navigate project directory directly from the UI.
