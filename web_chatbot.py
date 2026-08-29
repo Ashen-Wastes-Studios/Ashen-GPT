@@ -275,6 +275,9 @@ class AshenAIAgenticEngine:
         self.session_id = None
         self.use_draft_model = False  # Toggle for speculative decoding
         self.draft_temperature = 0.6  # Lower temp for draft proposals
+        self.low_end_gpu_mode = False  # Enable memory optimizations for low-end GPUs
+        self.precision = 'fp32'  # 'fp32', 'fp16', 'bf16'
+        self.cpu_offload_layers = 0  # Number of layers to offload to CPU
 
     def clear_history(self):
         self.history = []
@@ -388,6 +391,9 @@ class AshenAIAgenticEngine:
         return generated
 
     def update_settings(self, settings):
+        # Move all globals to top
+        global m, device
+        
         self.temperature = float(settings.get('temperature', self.temperature))
         self.top_k = int(settings.get('top_k', self.top_k))
         self.top_p = float(settings.get('top_p', self.top_p))
@@ -402,11 +408,24 @@ class AshenAIAgenticEngine:
         if 'draft_temperature' in settings:
             self.draft_temperature = float(settings['draft_temperature'])
         
-        global m, device
-        target_dev = 'cuda' if (self.gpu_layers > 0 and torch.cuda.is_available()) else 'cpu'
-        if target_dev != device:
-            device = target_dev
-            m = self.model.to(device)
+        # Low-end GPU optimization settings
+        if 'low_end_gpu_mode' in settings:
+            self.low_end_gpu_mode = bool(settings['low_end_gpu_mode'])
+        if 'precision' in settings:
+            self.precision = settings['precision']  # 'fp16', 'bf16', 'fp32'
+        if 'cpu_offload_layers' in settings:
+            self.cpu_offload_layers = int(settings['cpu_offload_layers'])
+        
+        # Apply precision setting after updating values
+        try:
+            if self.precision == 'fp16':
+                m.half()
+                print("[Precision] Switched to FP16 (half precision)", flush=True)
+            elif self.precision == 'bf16':
+                m.bfloat16()
+                print("[Precision] Switched to BF16 (bfloat16 precision)", flush=True)
+        except Exception as e:
+            print(f"[Precision] Precision change failed: {e}", flush=True)
 
     def execute_tool(self, tool_name, kwargs):
         try:
@@ -1182,6 +1201,64 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     </div>
                 </div>
 
+                <!-- Low-end GPU Optimization Settings -->
+                <div class="pt-4 border-t border-slate-800">
+                    <h3 class="text-sm font-semibold text-emerald-300 mb-3 flex items-center gap-2">
+                        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400"></span>
+                        🔧 Low-End GPU Optimization
+                    </h3>
+                    
+                    <div class="space-y-3">
+                        <!-- Low-End Mode Toggle -->
+                        <div class="flex items-center justify-between p-3 bg-slate-950/50 rounded-lg border border-slate-800">
+                            <div>
+                                <div class="text-slate-300 font-medium">Low-End GPU Mode</div>
+                                <div class="text-slate-500 text-[10px]">Aggressive memory optimizations for GPUs with &lt;8GB VRAM</div>
+                            </div>
+                            <label class="relative inline-flex items-center cursor-pointer">
+                                <input type="checkbox" id="setting-low-end" onchange="updateLowEndSettings()" class="sr-only peer">
+                                <div class="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-emerald-600"></div>
+                            </label>
+                        </div>
+
+                        <!-- Precision Setting (hidden until low-end mode enabled) -->
+                        <div id="low-end-settings-section" class="hidden space-y-3 pl-4 border-l-2 border-emerald-800">
+                            <!-- Precision Selector -->
+                            <div class="space-y-1">
+                                <span class="text-slate-300 font-medium">Model Precision</span>
+                                <select id="setting-precision" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-cyan-200">
+                                    <option value="fp32">FP32 (Standard - Best Quality)</option>
+                                    <option value="fp16" selected>FP16 (Half - Good Performance)</option>
+                                    <option value="bf16">BF16 (BFloat16 - Balanced)</option>
+                                </select>
+                                <div class="text-slate-500 text-[10px]">FP16/BF16 reduces VRAM usage by ~50%</div>
+                            </div>
+
+                            <!-- CPU Offload Sliders -->
+                            <div class="space-y-1 pt-2 border-t border-slate-800">
+                                <div class="flex justify-between">
+                                    <div>
+                                        <span class="text-slate-300 font-medium">CPU Offload Layers</span>
+                                        <div class="text-slate-500 text-[10px]">Move layers to system RAM (slower but saves VRAM)</div>
+                                    </div>
+                                    <span id="cpu-offload-val" class="text-emerald-400 font-mono">0</span>
+                                </div>
+                                <input type="range" id="setting-cpu-offload" min="0" max="16" step="1" value="0" oninput="document.getElementById('cpu-offload-val').textContent=this.value" class="w-full accent-emerald-500 bg-slate-950">
+                            </div>
+
+                            <!-- Optimizations Info Card -->
+                            <div class="p-3 bg-blue-950/30 rounded-lg border border-blue-800/50">
+                                <div class="text-blue-300 text-xs font-semibold mb-1">💡 When to Enable</div>
+                                <ul class="text-[10px] text-slate-400 space-y-0.5 list-disc list-inside">
+                                    <li>&lt; 8GB VRAM → Enable low-end mode + FP16</li>
+                                    <li>&lt; 4GB VRAM → Enable low-end mode + offload 4-8 layers</li>
+                                    <li>Inference will be slower but functional</li>
+                                </ul>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
                 <div class="pt-4 flex justify-end space-x-3 border-t border-slate-800">
                     <button onclick="toggleSettingsModal(false)" class="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg font-bold transition">CANCEL</button>
                     <button onclick="saveSettings()" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg font-bold transition">SAVE SETTINGS</button>
@@ -1379,6 +1456,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
             } else {
                 section.classList.add('hidden');
                 slider.disabled = true;
+            }
+        }
+
+        // Toggle low-end GPU optimization settings visibility
+        function updateLowEndSettings() {
+            const enabled = document.getElementById('setting-low-end').checked;
+            const section = document.getElementById('low-end-settings-section');
+            
+            if (enabled) {
+                section.classList.remove('hidden');
+            } else {
+                section.classList.add('hidden');
             }
         }
 
@@ -1650,6 +1739,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
             } else {
                 settings.use_draft_model = false;
             }
+            
+            // Add low-end GPU optimization settings
+            const lowEndEnabled = document.getElementById('setting-low-end').checked;
+            settings.low_end_gpu_mode = lowEndEnabled;
+            settings.precision = document.getElementById('setting-precision').value;
+            settings.cpu_offload_layers = parseInt(document.getElementById('setting-cpu-offload').value);
             
             const statusEl = document.getElementById('settings-status');
             statusEl.textContent = 'Updating settings...';
