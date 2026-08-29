@@ -169,6 +169,43 @@ Configurable depth via `max_searches` parameter. New quick-action buttons in sid
 - **Workspace browser** — navigate project directory directly from the UI.
 - **Workspace context injection** — browsing any folder automatically injects its file tree into the model's system prompt so the agent is aware of which files you're examining.
 
+#### ⚙️ Advanced Model & Inference Settings
+
+##### Low-End GPU Optimization
+
+For running larger models on GPUs with limited VRAM (&lt;8GB):
+
+| Setting | Description | VRAM Savings |
+|---|---|---|
+| **Low-End GPU Mode** | Enables aggressive memory optimizations | ~30% |
+| **FP16 Precision** | Half-precision floating point (~50% less VRAM) | ~40% |
+| **BF16 Precision** | BFloat16 precision (balanced quality/performance) | ~40% |
+| **CPU Offload Layers** | Moves transformer layers to system RAM | Scales with layer count |
+
+**Recommended Configurations:**
+
+| GPU VRAM | Precision | CPU Offload | Expected Speed |
+|---|---|---|---|
+| **2-4GB** | FP16 | 8-12 layers | Slow but functional |
+| **6GB** | FP16 | 4-8 layers | Moderate |
+| **8GB+** | BF16/FP32 | 0-2 layers | Good |
+
+Configurable via ⚙️ Settings modal → 🔧 Low-End GPU Optimization section.
+
+##### Draft Model & Speculative Decoding
+
+Enable faster generation using a secondary "draft" model:
+
+- **Speculative Decoding**: Draft model proposes tokens, main model verifies them in parallel
+- **Configuration**: Enable toggle + adjust draft temperature in Settings modal
+- **Requirement**: Place draft model at `ashen_gpt_model_draft.pk1` or upload via Model Hub
+
+##### Standard Settings
+
+- **Temperature**, **Top-K**, **Top-P** (Nucleus Sampling), **Max Output Tokens**, **Context Length**, **GPU Offload Layers**, **Repeat Penalty**.
+
+---
+
 #### 💬 Session Management
 
 | Action | Description |
