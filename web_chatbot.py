@@ -3,12 +3,16 @@ import io
 if hasattr(sys.stdout, 'reconfigure'):
     sys.stdout.reconfigure(encoding='utf-8')
 
+import os
+import json
+import http.server
+import socketserver
+import threading
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import tiktoken
 import pickle
-import os
 import re
 import subprocess
 import glob as glob_module
@@ -350,7 +354,6 @@ class AgenticReasoningEngine:
                 for arg_match in re.finditer(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(["\'])(.*?)\2', args_str):
                     kwargs[arg_match.group(1)] = arg_match.group(3)
 
-                print(f"\n[Agent executing tool: {tool_name}({args_str})...]")
                 tool_obs = self.execute_tool(tool_name, kwargs)
                 tool_observations.append(f"Tool: {tool_name}({args_str})\nObservation:\n{tool_obs}")
 
@@ -377,37 +380,250 @@ class AgenticReasoningEngine:
 
 reasoner = AgenticReasoningEngine(m, decode, encode, device)
 
-if __name__ == "__main__":
-    print("\n--- Ashen GPT Fully Functional Agentic CLI Chatbot Ready ---")
-    print("Capabilities: Chain-of-Thought + Tool Execution (read_file, write_file, glob, grep_search, run_shell_command)")
-    print("Commands: /clear (reset conversation), /help (show help), /exit or /quit (exit)")
-    while True:
-        try:
-            prompt = input("\nUser:\n> ")
-            if not prompt.strip():
-                continue
-            cmd = prompt.strip().lower()
-            if cmd in ['exit', 'quit', '/exit', '/quit']:
-                print("Goodbye!")
-                break
-            if cmd == '/clear':
-                reasoner.clear_history()
-                print("[Conversation history cleared]")
-                continue
-            if cmd == '/help':
-                print("Ashen GPT Agentic CLI Help:")
-                print("  - Ask questions or request actions (e.g. 'Run pytest' or 'Check files').")
-                print("  - /clear : Clear conversation memory.")
-                print("  - /help  : Show this help message.")
-                print("  - /exit  : Exit the CLI.")
-                continue
+HTML_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ashen GPT - Agentic Web Chat Interface</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.js"></script>
+    <style>
+        body { background-color: #0f172a; color: #f8fafc; font-family: ui-sans-serif, system-ui, sans-serif; }
+        .chat-container::-webkit-scrollbar { width: 6px; }
+        .chat-container::-webkit-scrollbar-thumb { background: #334155; border-radius: 3px; }
+    </style>
+</head>
+<body class="h-screen flex flex-col">
+    <!-- Header -->
+    <header class="bg-slate-900 border-b border-slate-800 px-6 py-4 flex items-center justify-between shadow-md">
+        <div class="flex items-center space-x-3">
+            <div class="w-3 h-3 bg-emerald-500 rounded-full animate-pulse"></div>
+            <h1 class="text-xl font-bold tracking-tight text-white">Ashen GPT <span class="text-xs px-2 py-0.5 bg-indigo-900 text-indigo-200 rounded-full">Agentic MoE &amp; 8K Context</span></h1>
+        </div>
+        <div class="flex items-center space-x-4">
+            <button onclick="clearHistory()" class="px-3 py-1.5 text-xs font-medium bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg transition border border-slate-700">Clear Chat</button>
+            <span class="text-xs text-slate-400">Agent Tools: <span class="text-emerald-400 font-mono">Active</span></span>
+        </div>
+    </header>
 
-            GREY = "\033[90m"
-            RESET = "\033[0m"
+    <!-- Main Content -->
+    <div class="flex-1 flex overflow-hidden">
+        <!-- Sidebar -->
+        <aside class="w-72 bg-slate-900/55 border-r border-slate-800 p-4 hidden md:flex flex-col justify-between">
+            <div class="space-y-4">
+                <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Agentic Capabilities</h2>
+                <div class="bg-slate-800/60 p-3 rounded-xl border border-slate-700/50 space-y-2 text-xs text-slate-300">
+                    <div class="flex justify-between"><span>read_file</span><span class="font-mono text-indigo-400">Enabled</span></div>
+                    <div class="flex justify-between"><span>write_file</span><span class="font-mono text-indigo-400">Enabled</span></div>
+                    <div class="flex justify-between"><span>glob</span><span class="font-mono text-indigo-400">Enabled</span></div>
+                    <div class="flex justify-between"><span>grep_search</span><span class="font-mono text-indigo-400">Enabled</span></div>
+                    <div class="flex justify-between"><span>run_shell_command</span><span class="font-mono text-emerald-400">Enabled</span></div>
+                </div>
+                <div class="space-y-2">
+                    <h2 class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Model Specs</h2>
+                    <ul class="text-xs text-slate-400 space-y-1 pl-2">
+                        <li>• ~127M Parameters</li>
+                        <li>• Mixture of Experts (4 Experts)</li>
+                        <li>• Dynamic RoPE 8K Context</li>
+                        <li>• ReAct Agent Loop</li>
+                    </ul>
+                </div>
+            </div>
+            <div class="text-xs text-slate-500 text-center pt-4 border-t border-slate-800">
+                Ashen GPT Agentic Web &bull; Powered by PyTorch
+            </div>
+        </aside>
+
+        <!-- Chat Area -->
+        <main class="flex-1 flex flex-col bg-slate-950">
+            <div id="chat-container" class="flex-1 overflow-y-auto p-6 space-y-6 chat-container">
+                <!-- Welcome Message -->
+                <div class="flex items-start space-x-4 max-w-3xl">
+                    <div class="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center font-bold text-sm text-white shrink-0">AG</div>
+                    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 text-slate-200 text-sm shadow-sm space-y-2">
+                        <p class="font-semibold text-white">Hello! I am Ashen GPT Agent.</p>
+                        <p>I have full agentic capabilities including tool execution (`read_file`, `write_file`, `glob`, `grep_search`, `run_shell_command`). Ask me to inspect files, search code, or execute tasks!</p>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Input Bar -->
+            <div class="p-4 bg-slate-900 border-t border-slate-800">
+                <div class="max-w-4xl mx-auto flex items-end space-x-3">
+                    <div class="flex-1 bg-slate-950 border border-slate-700 rounded-xl focus-within:border-indigo-500 transition">
+                        <textarea id="user-input" rows="1" placeholder="Type your agent request... (e.g. 'Run pytest' or 'Search for model')" class="w-full bg-transparent p-3 text-slate-100 placeholder-slate-500 text-sm focus:outline-none resize-none max-h-32"></textarea>
+                    </div>
+                    <button id="send-btn" onclick="sendMessage()" class="bg-indigo-600 hover:bg-indigo-500 text-white px-5 py-3 rounded-xl font-medium text-sm transition shadow-lg shrink-0 flex items-center space-x-2">
+                        <span>Send</span>
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>
+                    </button>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        const textarea = document.getElementById('user-input');
+        textarea.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = (this.scrollHeight) + 'px';
+        });
+
+        textarea.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                sendMessage();
+            }
+        });
+
+        function appendMessage(sender, thought, text) {
+            const container = document.getElementById('chat-container');
+            const isUser = sender === 'user';
             
-            thought, answer = reasoner.solve_with_agent(prompt, max_new_tokens=250)
-            print(f"\n{GREY}<think>\n{thought}\n</think>{RESET}")
-            print(f"\nAssistant:\n{answer}")
-        except (KeyboardInterrupt, EOFError):
-            print("\nGoodbye!")
-            break
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `flex items-start space-x-4 max-w-3xl ${isUser ? 'ml-auto flex-row-reverse space-x-reverse' : ''}`;
+            
+            const avatar = document.createElement('div');
+            avatar.className = `w-8 h-8 rounded-full flex items-center justify-center font-bold text-sm text-white shrink-0 ${isUser ? 'bg-emerald-600' : 'bg-indigo-600'}`;
+            avatar.textContent = isUser ? 'U' : 'AG';
+            
+            const contentDiv = document.createElement('div');
+            contentDiv.className = `rounded-2xl p-4 text-sm shadow-sm space-y-3 ${isUser ? 'bg-emerald-900/40 border border-emerald-800 text-emerald-100' : 'bg-slate-900 border border-slate-800 text-slate-200 w-full'}`;
+            
+            if (!isUser && thought) {
+                const thinkDetails = document.createElement('details');
+                thinkDetails.className = 'group bg-slate-950/60 rounded-xl border border-indigo-900/50 overflow-hidden';
+                
+                const summary = document.createElement('summary');
+                summary.className = 'px-3 py-2 text-xs font-medium text-indigo-300 cursor-pointer select-none hover:bg-indigo-950/40 flex items-center justify-between';
+                summary.innerHTML = '<span>🧠 Agentic Reasoning &amp; Tool Observations</span><span class="text-indigo-400 group-open:rotate-180 transition-transform">▼</span>';
+                
+                const thinkBody = document.createElement('div');
+                thinkBody.className = 'p-3 text-xs text-slate-400 font-mono whitespace-pre-wrap border-t border-indigo-900/40 bg-slate-950/90';
+                thinkBody.textContent = thought;
+                
+                thinkDetails.appendChild(summary);
+                thinkDetails.appendChild(thinkBody);
+                contentDiv.appendChild(thinkDetails);
+            }
+            
+            const textBody = document.createElement('div');
+            textBody.className = 'prose prose-invert max-w-none text-slate-200';
+            if (isUser) {
+                textBody.textContent = text;
+            } else {
+                textBody.innerHTML = marked.parse(text);
+            }
+            contentDiv.appendChild(textBody);
+            
+            messageDiv.appendChild(avatar);
+            messageDiv.appendChild(contentDiv);
+            container.appendChild(messageDiv);
+            container.scrollTop = container.scrollHeight;
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('user-input');
+            const msg = input.value.trim();
+            if (!msg) return;
+
+            input.value = '';
+            input.style.height = 'auto';
+
+            appendMessage('user', '', msg);
+
+            const sendBtn = document.getElementById('send-btn');
+            sendBtn.disabled = true;
+            sendBtn.innerHTML = '<svg class="w-4 h-4 animate-spin" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path></svg>';
+
+            try {
+                const res = await fetch('/api/chat', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ message: msg })
+                });
+                const data = await res.json();
+                appendMessage('assistant', data.thought, data.response);
+            } catch (err) {
+                appendMessage('assistant', 'Error', 'Failed to communicate with Ashen GPT agent backend.');
+            } finally {
+                sendBtn.disabled = false;
+                sendBtn.innerHTML = '<span>Send</span><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"></path></svg>';
+            }
+        }
+
+        async function clearHistory() {
+            await fetch('/api/clear', { method: 'POST' });
+            const container = document.getElementById('chat-container');
+            container.innerHTML = `
+                <div class="flex items-start space-x-4 max-w-3xl">
+                    <div class="w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center font-bold text-sm text-white shrink-0">AG</div>
+                    <div class="bg-slate-900 border border-slate-800 rounded-2xl p-4 text-slate-200 text-sm shadow-sm space-y-2">
+                        <p class="font-semibold text-white">Conversation cleared.</p>
+                        <p>Agent memory reset successfully. Ready for new tasks!</p>
+                    </div>
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>
+"""
+
+class ChatHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/' or self.path == '':
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(HTML_PAGE.encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        if self.path == '/api/chat':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+            message = data.get('message', '')
+
+            try:
+                thought, response = reasoner.solve_with_agent(message, max_new_tokens=250)
+                resp_data = {'thought': thought, 'response': response}
+            except Exception as e:
+                resp_data = {'thought': 'Error during agent execution', 'response': str(e)}
+
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp_data).encode('utf-8'))
+
+        elif self.path == '/api/clear':
+            reasoner.clear_history()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({'status': 'cleared'}).encode('utf-8'))
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        return
+
+def run_server(port=5000):
+    server = socketserver.TCPServer(('127.0.0.1', port), ChatHandler)
+    print(f"\n========================================================")
+    print(f" Ashen GPT Agentic Web Interface running at: http://localhost:{port}")
+    print(f" Open your browser to interact with the Agentic MoE Model!")
+    print(f"========================================================\n")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down web server...")
+        server.server_close()
+
+if __name__ == '__main__':
+    run_server(5000)

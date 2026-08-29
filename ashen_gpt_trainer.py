@@ -1,7 +1,30 @@
 import sys
 import io
-if hasattr(sys.stdout, 'reconfigure'):
-    sys.stdout.reconfigure(encoding='utf-8')
+import datetime
+
+class Tee:
+    def __init__(self, filename="training_logs.txt", mode="a"):
+        self.terminal = sys.stdout
+        self.log = open(filename, mode, encoding="utf-8")
+
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+        self.log.flush()
+
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+
+    def isatty(self):
+        return getattr(self.terminal, 'isatty', lambda: False)()
+
+sys.stdout = Tee("training_logs.txt", "a")
+sys.stdout.log.write(f"\n\n--- Training Session Started: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ---\n")
+sys.stdout.log.flush()
+
+if hasattr(sys.stdout.terminal, 'reconfigure'):
+    sys.stdout.terminal.reconfigure(encoding='utf-8')
 
 import torch
 import torch.nn as nn

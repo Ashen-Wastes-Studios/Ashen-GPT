@@ -22,56 +22,62 @@ Training large models from scratch on consumer GPUs is heavily constrained by ac
 
 ---
 
-## 🔄 Automatic Checkpoint Detection & 2x Depth Upscaling
+## 🔄 Automatic Checkpoint Detection & Training Logs
 
-The training script features an intelligent model upscaling mechanism:
-- **Checkpoint Detection**: Automatically detects if an existing checkpoint (`ashen_gpt_model.pk1`) is saved in the working directory.
-- **2x Depth Multiplication**: If detected, it loads the model and automatically **doubles its transformer layer depth** (e.g., stacking layers from 8 to 16) using deep copies.
-- **In-Place Overwrite**: Saves the upscaled model back under the exact same filename (`ashen_gpt_model.pk1`) before continuing training/fine-tuning.
+- **2x Depth Upscaling**: Automatically detects existing checkpoints (`ashen_gpt_model.pk1`) and doubles transformer layer depth (e.g., 8 -> 16 layers) while preserving weights.
+- **Automated Training Logging (`training_logs.txt`)**: All training output, step losses, evaluation results, generation tests, and fine-tuning epochs are automatically captured and streamed to `training_logs.txt` with timestamped run sessions while remaining visible in your terminal.
+
+---
+
+## 🤖 Fully Functional Agentic CLI & Web Chatbots
+
+Ashen GPT includes both a multi-turn CLI chatbot and a sleek Web Interface equipped with **full agentic capabilities (ReAct tool execution loop)**.
+
+### 🛠️ Agentic Tool Execution
+The model can autonomously reason over tasks and invoke the following tools:
+- `read_file(file_path="...")` — Read file contents from the workspace.
+- `write_file(file_path="...", content="...")` — Create or modify files.
+- `glob(pattern="...")` — Discover files matching glob patterns.
+- `grep_search(pattern="...")` — Search for code patterns across project files.
+- `run_shell_command(command="...")` — Execute terminal operations (e.g. `pytest`, `git status`).
 
 ---
 
 ## 📊 Hybrid Training & Evaluation
 
 ### 1. Progressive Staged Training Pipeline (5,000 Max Iters)
-- **Stage 1 (Core Training)**: 512 context length (`iters 0-3000`, `eval_iters = 50`)
-- **Stage 2 (Intermediate Extension)**: 2,048 context length (`iters 3001-4500`, `eval_iters = 50`)
-- **Stage 3 (Extreme Extension)**: 8,192 (8K) context length (`iters 4501-5000`, `eval_iters = 50`)
+- **Stage 1 (Core Training)**: 512 context length (`iters 0-3000`)
+- **Stage 2 (Intermediate Extension)**: 2,048 context length (`iters 3001-4500`)
+- **Stage 3 (Extreme Extension)**: 8,192 (8K) context length (`iters 4501-5000`)
 
 ### 2. Hybrid Data Pipeline
 Combines literature (`train_split.txt`, `val_split.txt`) and scraped multi-language open-source code (`code_train_split.txt`) using robust BPE tokenization (`tiktoken` GPT-2 encoding) and memory-mapped streaming.
 
 ### 3. Supervised Fine-Tuning (SFT)
-- **Curated Instruction Dataset**: 8 diverse instruction-following and coding tasks (Python, JavaScript, Go, Math, Transformers, etc.), each structured with explicit `<think>` reasoning traces.
-- **SFT Epochs**: 3 epochs of supervised fine-tuning.
+- **Curated Instruction Dataset**: Diverse instruction-following and coding tasks structured with explicit `<think>` reasoning traces.
 
 ---
 
-## 🤖 Smart Code-Output Chatbot (`chatbot.py` - 8K Context & Greyed-Out CoT)
-
-The inference chatbot features an 8K context window, intent-based code filtering, and reasoning visualization:
-- **Chain-of-Thought (CoT) Reasoning**: Automatically parses and displays the model's `<think>` reasoning block in **greyed-out terminal text** (`\033[90m`) before outputting the final response.
-- **Conceptual Queries**: Automatically suppresses code blocks and replies in pure natural language.
-- **Code Requests**: Permits code generation only when the user explicitly asks for code, scripts, functions, or syntax.
-
----
-
-## 🛠️ Getting Started & Usage
+## 🚀 Getting Started & Usage
 
 ### Prerequisites
 - Python 3.10+
 - PyTorch with CUDA support
-- `tiktoken`, `transformers`, `accelerate`
+- `tiktoken`, `requests`
 
 ### Running the Scripts
 
-- **Train / Upscale Custom ~127M Model (5,000 Pre-training Iters + SFT + Auto-Upscaling)**:
+- **Train / Upscale Custom ~127M Model (Logs to `training_logs.txt`)**:
   ```cmd
   run_ashen_gpt.bat
   ```
-- **Interact with Custom Chatbot (8K Context & Grey CoT)**:
+- **Interact via Agentic CLI Chatbot (`chatbot.py`)**:
   ```cmd
   run_chatbot.bat
+  ```
+- **Launch Agentic Web Chat Interface (`http://localhost:5000`)**:
+  ```cmd
+  run_web_chatbot.bat
   ```
 
 ---
