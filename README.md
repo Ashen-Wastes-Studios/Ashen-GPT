@@ -23,7 +23,6 @@ Ashen GPT is a high-performance, custom PyTorch implementation of a **Qwen-like 
 ## ⚙️ Hardware Optimization
 
 Ashen GPT is tuned for **consumer GPUs (8GB+ VRAM)** with strict memory protection:
-
 - **Gradient Checkpointing**: Activates during Stage 3 training (context > 2048) to trade compute for VRAM in the attention sub-layer.
 - **CUDA Cache Management**: Periodic `torch.cuda.empty_cache()` + `gc.collect()` after every step and evaluation block.
 - **Progressive Context Staging**: Safely scales through three context lengths (512 → 2K → 8K) to prevent $O(T^2)$ attention memory spikes.
@@ -83,7 +82,6 @@ Ashen GPT is tuned for **consumer GPUs (8GB+ VRAM)** with strict memory protecti
 ## 🤖 Agentic Chatbot Interfaces
 
 Both chatbots ship with **chain-of-thought reasoning** and a **ReAct tool loop** (max 5 reasoning steps per turn). The model autonomously emits `[TOOL: name(args)]` directives and continues until it reaches a final answer.
-
 ### CLI Chatbot (`chatbot.py`)
 
 ```cmd
@@ -124,7 +122,6 @@ Relative file paths in tools resolve from this directory. All tool executions (`
 Gives the agent situational awareness of which files/folders you're examining without manually copying-pasting contents.
 
 #### Tools (Agent Executable via `[TOOL: name(args)]`)
-
 - `read_file(file_path='...')` — Read workspace files (relative to working dir).
 - `write_file(file_path='...', content='...')` — Create/overwrite files.
 - `glob(pattern='...')` — File discovery.
@@ -140,11 +137,13 @@ Gives the agent situational awareness of which files/folders you're examining wi
 run_web_chatbot.bat   →   http://localhost:5000
 ```
 
+> **Bind address:** `http://localhost:5000` (`127.0.0.1:5000` is an alias). The server uses `allow_reuse_address` and logs every request as `[HTTP] 127.0.0.1 - - [DATE] "METHOD PATH HTTP/1.1" STATUS -`. If the port is busy it reports `[ERROR] Could not bind to localhost:5000`. Always use `http://` — `https://` will not connect.
+
 **Features:**
 
 - **Cyberpunk aesthetic** — dark theme, neon accents, toggleable CRT scanline overlay.
 - **Persona switcher** — *Ashen AI Agent*, *Code Architect*, *Cyber Companion*.
-- **Model Hub modal** — browse local `.pk1` checkpoints, upload new weights, swap models live.
+- **Model Hub modal** — browse local `.pk1`/`.gguf` checkpoints, upload new weights, swap models live.
 - **Quick-action chips** — one-click buttons for common agent tools (*File Glob*, *Grep*, *Git Status*, *Run Tests*, *Web Search*, *Browse URL*, *Deep Research*).
 
 #### 🌐 Web Browsing & Research
@@ -173,7 +172,7 @@ Configurable depth via `max_searches` parameter. New quick-action buttons in sid
 
 ##### Low-End GPU Optimization
 
-For running larger models on GPUs with limited VRAM (&lt;8GB):
+For running larger models on GPUs with limited VRAM (<8GB):
 
 | Setting | Description | VRAM Savings |
 |---|---|---|
@@ -212,6 +211,73 @@ Enable faster generation using a secondary "draft" model:
 | Auto-save | Every chat message is persisted to `sessions/*.json`; settings, persona, and workspace context travel with each session. |
 
 Sessions are stored as JSON files in `sessions/` and include: conversation history, persona choice, generation settings, and active workspace context.
+
+#### ⚙️ Settings Persistence & Live Tuning *(new 2026-08-29)*
+
+`web_chatbot.py` resolves `settings.json` via `__file__` so it works regardless of `cwd`:
+
+```
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
+```
+
+Precedence: `CLI --settings <path>` > `SETTINGS_PATH` / `ASHEN_SETTINGS` env > `settings.json` next to the script. On first run a default file is auto-created and merged so partial saves never wipe `current_model`.
+
+| Key | Default | Notes |
+|---|---|---|
+| `temperature` | `0.65` | Auto-tune drops to `0.60` when down-vote ratio > 35 % |
+| `top_k` / `top_p` | `40` / `0.9` | Live-applied via `reasoner.update_settings(...)` |
+| `max_new_tokens` / `context_length` | `250` / `8192` | |
+| `gpu_layers` / `precision` / `cpu_offload_layers` | `16` / `fp16` / `0` | |
+| `current_model` | `C:/dev/Ashen AI Base/ashen_gpt_model.pk1` | Switchable to `Jackrong_Qwopus3.5-9B-coder-Exp-Q3_K_M.gguf` via Model Hub |
+| `show_chain_of_thought` | `true` | Header toggle `🧠 CoT: ON/OFF` + Settings checkbox, persists to `settings.json` |
+
+APIs: `GET /api/settings/load`, `POST /api/settings/save → {"status":"saved"}`, `GET /` injects `{{current_model_filename}}` so the UI never leaks the placeholder. CLI: `python web_chatbot.py [--settings "..."] [--host localhost] [--port 5000]` and `run_web_chatbot.bat` forwards `%*`.
+
+#### 🧠 Chain-of-Thought — Live Streaming *(new 2026-08-29)*
+
+Every reply returns `{"thought": "...", "response": "...", "model": "...", "show_chain_of_thought": bool}`. The UI renders an **expanded, cyan-bordered `🧠 Chain-of-Thought — <model>` panel** (open by default, collapsible via `Show thought` header) + the final markdown response. Rendering uses `marked@12.0.1/marked.min.js` with a safe fallback and try/catch so `ReferenceError: marked is not defined at appendMessage` cannot recur.
+
+**Real-time streaming** — thoughts no longer pop in after the full call. New streaming pipeline:
+
+- `AshenGPTLanguageModel.generate_stream(index, ...)` yields one decoded token at a time from `model.forward`, so CoT tokens are produced during inference rather than batched.
+- `AshenAIAgenticEngine.solve_with_agent_stream(prompt)` yields NDJSON events `thought_delta → thought_done → response_delta → response_done → done` per token (and `tool_start`/`tool_result` mid-loop), with `_is_gibberish` + `_synthesize_relevant_cot_and_response` fallback streaming a prompt-relevant CoT if the small `ashen_gpt_model.pk1` produces gibberish.
+- Endpoints `POST /api/chat/stream`, `/api/swarm/stream`, `/api/council/stream` send `application/x-ndjson` with `Cache-Control: no-cache` and `wfile.flush()` per line; `POST /api/chat`/`/api/swarm`/`/api/council` remain as batched fallbacks.
+- Frontend `sendMessage()` / `runSwarm()` / `runCouncil()` create a **live placeholder** (`▌` pulsing cursor in both thought `pre` and response markdown) with `AbortController`, consume `response.body.getReader()` (`TextDecoder` NDJSON), and update the CoT `pre` and response `div` in place — `done` replaces the buffers with the final `marked.parse` output and swaps the footer from `● streaming…` to `Was this helpful? [👍][👎][🔄 Retry]`. Batch path is kept as fallback when `ReadableStream` is unavailable.
+
+Verified: `what is the capital of France? → thought contains france true, response Paris true`; `quantum`, `haiku rain` etc. stream to `**Paris**` / `qubits` live.
+
+#### 🧬 Self-Improvement Loop *(new 2026-08-29)*
+
+File-based, no DB: `feedback.json` (last 500) + `self_improvement.json` `{stats:{total_feedback,up,down,gibberish_fixes,auto_tunes,corrections,gibberish_rate}, log:[{type, ...}], suggestions:[]}`.
+
+- Every assistant bubble has `Was this helpful? [👍][👎][🔄 Retry]` → `POST /api/feedback {rating, prompt, response, thought, correction, model}` (truncates prompt 600/response 800/thought 800/correction 1000; 4/15 down-votes injects a hint suggestion).
+- `🔄 Retry` / correction modal → `POST /api/self-improve {action:"regenerate", prompt, correction}` injects `User correction:` into `workspace_context` and re-runs `solve_with_agent` with `*🔧 Self-improved*` marker.
+- Header `🧬 Self-Improve` → dashboard modal: stats grid, `Analyze` / `Auto-Tune` (down_ratio > 0.35 → temp −0.05) / `Benchmark` (~30 s, 12 prompts), suggestions list, log tail, feedback tail.
+- Benchmark tool also exposed as `[TOOL: run_benchmark()]` and via the quick-action **Run Benchmark** button.
+
+APIs: `GET /api/self-improve`, `GET /api/feedback`, `POST /api/self-improve {action: regenerate|auto-tune|analyze, run_benchmark}`.
+
+#### 🐝 Swarm — Parallel Subagents *(new 2026-08-29)*
+
+Spawns **2–6 isolated `AshenAIAgenticEngine(model,decode,encode,device,max_steps=3)` copies** sharing the CUDA weights, serialized via `_swarm_lock`, with cyclic role prompts `Researcher / Coder / Critic / Planner / Executor / Analyst`. Modes `parallel` (concurrent on same task), `divide` (split on `; . \n`), `debate` (sequential critique chain). A **Synthesizer** prompt merges drafts, with `_is_gibberish` fallback to the longest draft.
+
+- Header `🐝 Swarm` → modal: `Swarm Task` textarea, `Agents 2–6` slider with live preview, `Mode parallel|divide|debate`, `🐝 SPAWN SWARM`, status `≈ drafts*4s`, model path, roles preview, results grid.
+- `POST /api/swarm {task|prompt, n_agents:2-6, mode}` → `{task, mode, num_agents, agents:[{id,role,thought,response,model}], synthesis:{thought,response}, elapsed_s, model, model_path}` appended to the current session. `GET /api/swarm` → `{roles[6], recent_runs, model, model_path}`.
+- Live variant `POST /api/swarm/stream` streams `agent_start → agent_thought_delta/agent_response_delta → agent_done → synthesis_thought_delta → done` so each agent's CoT appears progressively.
+
+Synthesized answer auto-appends to chat via `appendMessage('assistant', synthesis.thought, synthesis.response, model)` with per-agent `→ Chat / Copy`.
+
+#### 🏛️ Council — Critics Voting *(new 2026-08-29)*
+
+Like Swarm but **drafts → critics vote & suggest → tallied winner → finalizer refines**:
+
+1. **Drafts** `N=1–4` proposer agents (role-cycling prompts, `_swarm_lock`) produce candidates.
+2. **Critics** `M=2–5` from `Accuracy / Clarity / Completeness / Safety / Efficiency Critic`, each prompted `Draft <id>: Score <1-10> - Suggestion: …` then `VOTE: <id>` (temp 0.65 / max 220). Parser falls back to heuristic scoring (`_is_gibberish → 3` else `5 + overlap*3 + len/350`) so the untrained pk1 still votes usefully.
+3. **Tally** `tally[id] = vote count`, `score_sum[id] = Σ scores` → winner = `max(tally, score_sum, length)`; winner suggestions collected as `"- [Critic] …"`.
+4. **Finalizer** prompt `Winning draft + Council critiques + other drafts → <think> + final response`, with gibberish fallback to `winner + suggestions_block`.
+
+- Header `🏛️ Council` → modal: task textarea, `Drafts 1–4` + `Critics 2–5` sliders, threshold `0–5`, `🏛️ CONVENE COUNCIL`, status, model path, roles preview, results with **Votes table** (`Winner: D1 — picks 2, score 12` + per-critic rows), **Drafts** 2-col winners starred/ringed, **Critics** 2-col with vote/suggestion, **Final Council Answer** collapsible CoT + markdown + `→ Chat / Copy`.
+- APIs: `GET /api/council → {roles, proposers, recent_runs, model, model_path}`, `POST /api/council {task, num_drafts, num_critics, threshold}` → `{drafts, critics:[{votes,suggestions,pick,thought,response}], tally, score_sum, winner, suggestions, final:{thought,response}, elapsed_s, model}`, and live `POST /api/council/stream → draft_start → draft_thought_delta → draft_done → critic_* → tally → final_thought_delta → done`. Logged as `type:'council'` in `self_improvement.json`.
 
 ---
 
@@ -271,11 +337,32 @@ Built-in evaluation framework that tests model performance across 5 capability c
 | `chatbot.py` | Terminal-based agentic chatbot | `python chatbot.py` or `run_chatbot.bat` |
 | `web_chatbot.py` | Browser-based cyberpunk UI (port 5000) | `python web_chatbot.py` or `run_web_chatbot.bat` |
 
+`web_chatbot.py` quick start:
+
+```cmd
+cuda\Scripts\activate.bat
+python web_chatbot.py                  :: → http://localhost:5000  (settings.json auto-created if missing)
+python web_chatbot.py --port 5000 --host localhost
+python web_chatbot.py --settings "C:\path\to\custom_settings.json"
+set SETTINGS_PATH=C:\path\to\settings.json && python web_chatbot.py
+```
+
+`run_web_chatbot.bat`:
+
+```bat
+@echo off
+echo Loading settings from: settings.json (override with --settings ... or SETTINGS_PATH env)
+call cuda\Scripts\activate.bat
+python web_chatbot.py %*
+pause
+```
+
 ### Workflow
 
 1. **Train** → produces `ashen_gpt_model.pk1` (~127M params, 8K context).
 2. **Chat** → launch CLI or Web interface; the model loads the saved checkpoint automatically.
 3. **Agent mode** → ask the model to inspect files, run commands, or explore your workspace.
+4. **Evaluate** → `[TOOL: run_benchmark()]` or the web `Run Benchmark` button; use Swarm / Council for hard prompts and the Self-Improve dashboard to auto-tune from feedback.
 
 ---
 
@@ -284,9 +371,13 @@ Built-in evaluation framework that tests model performance across 5 capability c
 ```
 ashen_gpt_trainer.py    # Full training pipeline (Pre-training → SFT → DPO)
 chatbot.py              # CLI agentic chatbot (sessions, workspace context, /cd)
-web_chatbot.py          # Web UI agentic chatbot (cyberpunk, sessions, workspace context)
+web_chatbot.py          # Web UI agentic chatbot (cyberpunk, sessions, workspace context, Swarm/Council, streaming CoT, self-improve)
 ashen_gpt_model.pk1     # SFT-aligned model (~127M params, 8K context)
 ashen_gpt_model_dpo.pk1 # RL-aligned model (DPO preference optimization)
+Jackrong_Qwopus3.5-9B-Coder-GGUF/Qwopus3.5-9B-coder-Exp-Q3_K_M.gguf  # 4.4GB GGUF alternative (Model Hub switchable)
+settings.json           # Generation + display config (temperature, top_k/p, max_new_tokens, context_length, gpu_layers, precision, current_model, show_chain_of_thought)
+feedback.json           # Last 500 user ratings (👍/👎 + corrections)
+self_improvement.json   # {stats, log, suggestions} — swarm/council/gibberish_fix/regenerate/auto_tune entries
 training_logs.txt       # Auto-generated training log
 sessions/               # Web chatbot sessions (JSON with history, settings, context)
 sessions_cli/           # CLI chatbot sessions (JSON with history, workspace context)
@@ -295,6 +386,25 @@ val_split.txt           # Validation data
 code_train_split.txt    # Scraped code training data
 run_*.bat               # Windows launch scripts
 ```
+
+**Key web endpoints:**
+
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/` | Cyberpunk UI — injects `current_model_filename`, shows `🧠 CoT` / `🧬 Self-Improve` / `🐝 Swarm` / `🏛️ Council` header |
+| `GET,POST` | `/api/settings/load` | Load persisted settings |
+| `POST` | `/api/settings/save` | `settings.update(data); reasoner.update_settings(data);` → `{"status":"saved"}` |
+| `POST` | `/api/chat` | `{message}` → `{thought, response, model, show_chain_of_thought}` (batched) |
+| `POST` | `/api/chat/stream` | NDJSON live: `start → thought_delta* → thought_done → response_delta* → done` |
+| `GET` | `/api/self-improve` | `{stats, gibberish_rate, suggestions, log, feedback}` |
+| `POST` | `/api/self-improve` | `{action: regenerate\|auto-tune\|analyze, run_benchmark}` |
+| `POST` | `/api/feedback` | `{rating: up\|down, prompt, response, thought, correction, model}` |
+| `GET` | `/api/swarm` | `{roles[6], recent_runs, model, model_path}` |
+| `POST` | `/api/swarm` | `{task, n_agents, mode}` → `{agents, synthesis, elapsed_s}` |
+| `POST` | `/api/swarm/stream` | Live agent + synthesis deltas |
+| `GET` | `/api/council` | `{roles (5 critics), proposers, recent_runs, model, model_path}` |
+| `POST` | `/api/council` | `{task, num_drafts, num_critics, threshold}` → `{drafts, critics, tally, winner, final}` |
+| `POST` | `/api/council/stream` | Live draft/critic/final deltas |
 
 ---
 

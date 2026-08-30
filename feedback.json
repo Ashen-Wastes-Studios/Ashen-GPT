@@ -1,0 +1,22 @@
+[
+  {
+    "rating": "up",
+    "prompt": "what is the capital of France?",
+    "response": "Paris",
+    "thought": "thinking",
+    "correction": "",
+    "model": "ashen",
+    "sessionId": null,
+    "ts": "2026-08-29T19:30:20.853511"
+  },
+  {
+    "rating": "down",
+    "prompt": "explain quantum",
+    "response": "bad",
+    "thought": "bad",
+    "correction": "should explain superposition",
+    "model": "ashen",
+    "sessionId": null,
+    "ts": "2026-08-29T19:30:21.116188"
+  }
+]

@@ -1,0 +1,340 @@
+{
+  "entries": [
+    {
+      "type": "feedback",
+      "rating": "up",
+      "prompt": "what is the capital of France?",
+      "stats_delta": {
+        "total_feedback": 1,
+        "up": 1
+      },
+      "ts": "2026-08-29T19:30:20.853511"
+    },
+    {
+      "type": "feedback",
+      "rating": "down",
+      "prompt": "explain quantum",
+      "stats_delta": {
+        "total_feedback": 1,
+        "down": 1,
+        "corrections": 1
+      },
+      "ts": "2026-08-29T19:30:21.123466"
+    },
+    {
+      "type": "correction_learned",
+      "prompt": "explain quantum",
+      "correction": "should explain superposition",
+      "stats_delta": {},
+      "ts": "2026-08-29T19:30:21.129743"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what is the capital of France?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:30:30.466238"
+    },
+    {
+      "type": "regenerate",
+      "prompt": "what is the capital of France?",
+      "stats_delta": {
+        "auto_tunes": 1
+      },
+      "ts": "2026-08-29T19:30:30.474315"
+    },
+    {
+      "type": "auto_tune",
+      "changes": {
+        "temperature": 0.65
+      },
+      "down_ratio": 0.5,
+      "stats_delta": {
+        "auto_tunes": 1
+      },
+      "ts": "2026-08-29T19:30:57.865693"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hello",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:31:11.658878"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "explain quantum computing in one sentence and give an analogy\n\n[You are the Rese",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:35:06.167327"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "explain quantum computing in one sentence and give an analogy\n\n[You are the Code",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:35:13.712765"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "You are the Swarm Synthesizer. The user task is: \"explain quantum computing in o",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:35:22.909362"
+    },
+    {
+      "type": "swarm",
+      "prompt": "explain quantum computing in one sentence and give an analogy",
+      "mode": "parallel",
+      "agents": 2,
+      "elapsed": 25.57,
+      "stats_delta": {},
+      "ts": "2026-08-29T19:35:22.918504"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Design a simple todo app: plan, data model, and code skeleton\n\n[Sub-task focus f",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:35:36.738059"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Design a simple todo app: plan, data model, and code skeleton\n\n[Sub-task focus f",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:35:44.635311"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Design a simple todo app: plan, data model, and code skeleton\n\n[Sub-task focus f",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:35:53.065098"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "You are the Swarm Synthesizer. The user task is: \"Design a simple todo app: plan",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:36:14.055737"
+    },
+    {
+      "type": "swarm",
+      "prompt": "Design a simple todo app: plan, data model, and code skeleton",
+      "mode": "divide",
+      "agents": 3,
+      "elapsed": 46.22,
+      "stats_delta": {},
+      "ts": "2026-08-29T19:36:14.063888"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what is the capital of France? one sentence\n\n[Proposer role: Researcher \u2014 You ar",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:43:06.690449"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what is the capital of France? one sentence\n\n[Proposer role: Coder \u2014 You are the",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:43:14.736122"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is the capital of France? one sentence\"\n\nDrafts to evaluate:\n[Draft ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:43:22.296589"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is the capital of France? one sentence\"\n\nDrafts to evaluate:\n[Draft ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:43:30.230464"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is the capital of France? one sentence\"\n\nWinning draft (Draft 1 by R",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:43:41.289669"
+    },
+    {
+      "type": "council",
+      "prompt": "what is the capital of France? one sentence",
+      "drafts": 2,
+      "critics": 2,
+      "winner": 1,
+      "elapsed": 43.46,
+      "stats_delta": {},
+      "ts": "2026-08-29T19:43:41.297792"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what is the capital of France? one sentence",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:49:21.999945"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "explain quantum computing in one sentence\n\n[Role: Researcher \u2014 You are the Resea",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:52:23.086404"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "explain quantum computing in one sentence\n\n[Role: Coder \u2014 You are the Coder suba",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:52:31.988968"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "explain quantum computing in one sentence\n\n[Role: Critic \u2014 You are the Critic su",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:52:40.276740"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "You are the Swarm Synthesizer. The user task is: \"explain quantum computing in o",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:52:54.400272"
+    },
+    {
+      "type": "swarm",
+      "prompt": "explain quantum computing in one sentence",
+      "mode": "parallel",
+      "agents": 3,
+      "elapsed": 0,
+      "stats_delta": {},
+      "ts": "2026-08-29T19:52:54.408559"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what is capital of France? one sentence\n\n[Proposer role: Researcher \u2014 You are th",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:53:03.635152"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what is capital of France? one sentence\n\n[Proposer role: Coder \u2014 You are the Cod",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:53:12.246462"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is capital of France? one sentence\"\n\nDrafts to evaluate:\n[Draft 1 (R",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:53:21.704798"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is capital of France? one sentence\"\n\nDrafts to evaluate:\n[Draft 1 (R",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:53:31.678148"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is capital of France? one sentence\"\n\nWinning draft (Draft 1 by Resea",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:53:43.903058"
+    },
+    {
+      "type": "council",
+      "prompt": "what is capital of France? one sentence",
+      "drafts": 2,
+      "critics": 2,
+      "winner": 1,
+      "elapsed": 0,
+      "stats_delta": {},
+      "ts": "2026-08-29T19:53:43.911217"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hello",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T19:54:51.059198"
+    }
+  ],
+  "stats": {
+    "total_feedback": 2,
+    "up": 1,
+    "down": 1,
+    "corrections": 1,
+    "gibberish_fixes": 25,
+    "auto_tunes": 2
+  },
+  "suggestions": [
+    {
+      "ts": "2026-08-29T19:30:21.129743",
+      "text": "Learned correction for \"explain quantum\" \u2014 next similar prompt should prefer: \"should explain superposition\""
+    },
+    {
+      "ts": "2026-08-29T19:30:30.474315",
+      "text": "Regenerated \"what is the capital of France?\" with critique \u2014 improvement applied."
+    },
+    {
+      "ts": "2026-08-29T19:30:57.865693",
+      "text": "Auto-tuned temperature 0.7 \u2192 0.65 (down-ratio 50%)"
+    },
+    {
+      "ts": "2026-08-29T19:35:22.918504",
+      "text": "Swarm 2\u00d7parallel completed \"explain quantum computing in one sentence and give an analog\" in 25.57s"
+    },
+    {
+      "ts": "2026-08-29T19:36:14.063888",
+      "text": "Swarm 3\u00d7divide completed \"Design a simple todo app: plan, data model, and code skeleto\" in 46.22s"
+    },
+    {
+      "ts": "2026-08-29T19:43:41.297792",
+      "text": "Council 2 drafts + 2 critics \u2192 winner Draft 1 (Researcher) in 43.46s"
+    },
+    {
+      "ts": "2026-08-29T19:52:54.408559",
+      "text": "Swarm 3xparallel streamed"
+    },
+    {
+      "ts": "2026-08-29T19:53:43.911217",
+      "text": "Council 2 drafts + 2 critics streamed"
+    }
+  ]
+}
