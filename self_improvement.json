@@ -1078,11 +1078,21 @@
       "elapsed": 0,
       "stats_delta": {},
       "ts": "2026-08-30T02:10:48.372620"
+    },
+    {
+      "type": "feedback",
+      "rating": "up",
+      "prompt": "Run full Ashen AI benchmark suite",
+      "stats_delta": {
+        "total_feedback": 1,
+        "up": 1
+      },
+      "ts": "2026-08-30T06:57:29.225554"
     }
   ],
   "stats": {
-    "total_feedback": 2,
-    "up": 1,
+    "total_feedback": 3,
+    "up": 2,
     "down": 1,
     "corrections": 1,
     "gibberish_fixes": 107,

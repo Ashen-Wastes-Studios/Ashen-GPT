@@ -18,5 +18,15 @@
     "model": "ashen",
     "sessionId": null,
     "ts": "2026-08-29T19:30:21.116188"
+  },
+  {
+    "rating": "up",
+    "prompt": "Run full Ashen AI benchmark suite",
+    "response": "",
+    "thought": "",
+    "correction": "",
+    "model": "ashen_gpt_model",
+    "sessionId": "session_20260830_061847",
+    "ts": "2026-08-30T06:57:29.222552"
   }
 ]
