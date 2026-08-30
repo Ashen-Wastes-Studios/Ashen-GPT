@@ -293,6 +293,791 @@
         "gibberish_fixes": 1
       },
       "ts": "2026-08-29T19:54:51.059198"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what are your capabilities?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:05:23.632681"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hello",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:05:31.291695"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Deep research on recent advances in transformer architectures",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:07:52.852796"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what is the capital of France? one sentence\n\n[You are the Coder subagent. Focus ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:22:56.661230"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is the capital of France? one sentence\"\n\nDrafts to evaluate:\n[Draft ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:23:08.661586"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is the capital of France? one sentence\"\n\nDrafts to evaluate:\n[Draft ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:23:25.260460"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is the capital of France? one sentence\"\n\nWinning draft (Draft 2 by C",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:23:41.953400"
+    },
+    {
+      "type": "swarm+council",
+      "prompt": "what is the capital of France? one sentence",
+      "mode": "parallel",
+      "agents": 2,
+      "critics": 2,
+      "winner": 2,
+      "elapsed": 61.52,
+      "stats_delta": {},
+      "ts": "2026-08-29T20:23:41.962941"
+    },
+    {
+      "type": "council",
+      "prompt": "what is the capital of France? one sentence",
+      "drafts": 2,
+      "critics": 2,
+      "winner": 2,
+      "elapsed": 61.52,
+      "stats_delta": {},
+      "ts": "2026-08-29T20:23:41.970557"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what is the capital of France? one sentence\n\n[Role: Researcher \u2014 You are the Res",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:23:57.154291"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what is the capital of France? one sentence\n\n[Role: Coder \u2014 You are the Coder su",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:24:06.418381"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is the capital of France? one sentence\"\n\nDrafts to evaluate:\n[Draft ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:24:15.831490"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is the capital of France? one sentence\"\n\nDrafts to evaluate:\n[Draft ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:24:25.986568"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"what is the capital of France? one sentence\"\n\nWinning draft (Draft 1 by R",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:24:36.328874"
+    },
+    {
+      "type": "swarm",
+      "prompt": "what is the capital of France? one sentence",
+      "mode": "parallel",
+      "agents": 2,
+      "elapsed": 0,
+      "stats_delta": {},
+      "ts": "2026-08-29T20:24:36.343077"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hello",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T20:48:09.336395"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hi",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T21:03:16.619239"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hello how are you today?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T21:05:16.240165"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hello",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T21:11:46.172266"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Run full Ashen AI benchmark suite",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T21:14:08.579429"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hi",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T21:38:32.139959"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Check git status and diff",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:02:37.824896"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what are you capable of doing?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:02:47.023164"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hi",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:02:55.877757"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hello",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:12:43.697548"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "What is 2 plus 2?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:20:13.420783"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Name a color.",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:21:25.303964"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "What is 3 times 4?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:25:53.996036"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Name a planet.",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:26:04.423582"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "how are you today",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:27:01.925125"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hi",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:27:13.345572"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what are you capable of doing?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:27:45.507362"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "What is the capital of France?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:35:42.372837"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Explain gravity in one sentence.",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:35:55.412982"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "What is the capital of France?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:36:37.565924"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "What is the capital of France?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:37:22.875791"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Explain gravity in one sentence.",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:37:34.078843"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "What is the capital of France?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:37:56.552352"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "What is the capital of France?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:38:26.373357"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "What is the capital of France?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:39:44.272982"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Explain gravity in one sentence.",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:39:55.054749"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hello",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:40:47.473198"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what are you capable of doing?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:41:07.227558"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "can you go in depth",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:42:01.938236"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "go as in depth as you can about your capablilities",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:42:48.098405"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "go into high detail",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T22:43:29.305672"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hi",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:03:16.751335"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "go in depth about your capabilities",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:03:45.983592"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what are your capabilities?\n\n[Sub-task focus for Researcher: You are the Researc",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:04:32.317838"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what are your capabilities?\n\n[Sub-task focus for Coder: You are the Coder subage",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:04:39.863904"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what are your capabilities?\n\n[Sub-task focus for Critic: You are the Critic suba",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:04:47.650142"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "You are the Swarm Synthesizer. The user task is: \"what are your capabilities?\"\n\n",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:04:56.252242"
+    },
+    {
+      "type": "swarm",
+      "prompt": "what are your capabilities?",
+      "mode": "divide",
+      "agents": 3,
+      "elapsed": 0,
+      "stats_delta": {},
+      "ts": "2026-08-29T23:04:56.263828"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "can you go in depth on your capabilities?\n\n[Proposer role: Researcher \u2014 You are ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:06:15.063512"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "can you go in depth on your capabilities?\n\n[Proposer role: Coder \u2014 You are the C",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:06:22.543058"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "can you go in depth on your capabilities?\n\n[Proposer role: Critic \u2014 You are the ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:06:30.112226"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"can you go in depth on your capabilities?\"\n\nDrafts to evaluate:\n[Draft 1 ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:06:37.584141"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"can you go in depth on your capabilities?\"\n\nDrafts to evaluate:\n[Draft 1 ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:06:45.401437"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"can you go in depth on your capabilities?\"\n\nDrafts to evaluate:\n[Draft 1 ",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:06:53.053154"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Task: \"can you go in depth on your capabilities?\"\n\nWinning draft (Draft 1 by Res",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:07:02.226501"
+    },
+    {
+      "type": "council",
+      "prompt": "can you go in depth on your capabilities?",
+      "drafts": 3,
+      "critics": 3,
+      "winner": 1,
+      "elapsed": 0,
+      "stats_delta": {},
+      "ts": "2026-08-29T23:07:02.235103"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what are your capabilities?\n\n[You are the Researcher subagent. Focus on facts, s",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:08:20.866315"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what are your capabilities?\n\n[You are the Coder subagent. Focus on implementatio",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:08:28.543796"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what are your capabilities?\n\n[You are the Critic subagent. Find flaws, edge case",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:08:36.196907"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "You are the Swarm Synthesizer. The user task is: \"what are your capabilities?\"\n\n",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:08:44.700751"
+    },
+    {
+      "type": "swarm",
+      "prompt": "what are your capabilities?",
+      "mode": "debate",
+      "agents": 3,
+      "elapsed": 0,
+      "stats_delta": {},
+      "ts": "2026-08-29T23:08:44.711452"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hi",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:09:14.528629"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what can you do?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:09:29.596745"
+    },
+    {
+      "type": "auto_tune",
+      "changes": {
+        "temperature": 0.6
+      },
+      "down_ratio": 0.5,
+      "stats_delta": {
+        "auto_tunes": 1
+      },
+      "ts": "2026-08-29T23:10:18.641180"
+    },
+    {
+      "type": "auto_tune",
+      "changes": {
+        "temperature": 0.55
+      },
+      "down_ratio": 0.5,
+      "stats_delta": {
+        "auto_tunes": 1
+      },
+      "ts": "2026-08-29T23:10:24.244939"
+    },
+    {
+      "type": "auto_tune",
+      "changes": {
+        "temperature": 0.5
+      },
+      "down_ratio": 0.5,
+      "stats_delta": {
+        "auto_tunes": 1
+      },
+      "ts": "2026-08-29T23:10:27.076651"
+    },
+    {
+      "type": "benchmark",
+      "stats_delta": {},
+      "ts": "2026-08-29T23:11:49.439474"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hello i would like to know what are you capable of doing",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:52:35.327776"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Deep research on recent advances in transformer architectures",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:53:17.236358"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "can you provide a answer to the request",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-29T23:54:32.154801"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Run full Ashen AI benchmark suite",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T00:23:53.341500"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Run full Ashen AI benchmark suite",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T00:24:52.324566"
+    },
+    {
+      "type": "regenerate",
+      "prompt": "Run full Ashen AI benchmark suite",
+      "stats_delta": {
+        "auto_tunes": 1
+      },
+      "ts": "2026-08-30T00:24:52.335120"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Run full Ashen AI benchmark suite",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T00:25:55.737289"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Run full Ashen AI benchmark suite",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T00:27:52.069025"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Run pytest suite",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T00:28:36.194369"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Browse https://pytorch.org/docs/stable/index.html",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T00:28:55.728742"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what can you tell me about AI alignment research?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T00:55:19.868691"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Search DuckDuckGo for PyTorch 2.0 features",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T00:55:47.351649"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "what can you tell me about AI alignment research?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T00:57:02.522995"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Search DuckDuckGo for PyTorch 2.0 features",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T00:58:09.177794"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "can you provide a answer",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T00:58:46.804860"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "hi",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T01:12:49.032575"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "Deep research on recent advances in transformer architectures",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T01:13:04.965909"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "can you tell me anything you know about the topic?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T01:16:16.733399"
+    },
+    {
+      "type": "regenerate",
+      "prompt": "can you tell me anything you know about the topic?",
+      "stats_delta": {
+        "auto_tunes": 1
+      },
+      "ts": "2026-08-30T01:16:16.744963"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "can you tell me again?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T01:16:50.399201"
+    },
+    {
+      "type": "gibberish_fix",
+      "prompt": "can you tell me anything you know about GPT and transformer architecture?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T01:18:02.460936"
+    },
+    {
+      "type": "empty_response_fallback",
+      "prompt": "Deep research on recent advances in transformer architectures",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T01:26:53.061548"
+    },
+    {
+      "type": "empty_response_fallback",
+      "prompt": "can you code a clock app in python?",
+      "stats_delta": {
+        "gibberish_fixes": 1
+      },
+      "ts": "2026-08-30T01:32:06.049377"
+    },
+    {
+      "type": "swarm",
+      "prompt": "what are you capable of",
+      "mode": "parallel",
+      "agents": 3,
+      "elapsed": 0,
+      "stats_delta": {},
+      "ts": "2026-08-30T02:10:48.372620"
     }
   ],
   "stats": {
@@ -300,8 +1085,8 @@
     "up": 1,
     "down": 1,
     "corrections": 1,
-    "gibberish_fixes": 25,
-    "auto_tunes": 2
+    "gibberish_fixes": 107,
+    "auto_tunes": 7
   },
   "suggestions": [
     {
@@ -335,6 +1120,58 @@
     {
       "ts": "2026-08-29T19:53:43.911217",
       "text": "Council 2 drafts + 2 critics streamed"
+    },
+    {
+      "ts": "2026-08-29T20:23:41.962941",
+      "text": "Swarm+Council 2xparallel + 2 critics -> winner Draft 2 in 61.52s"
+    },
+    {
+      "ts": "2026-08-29T20:23:41.970557",
+      "text": "Council alias 2 drafts + 2 critics"
+    },
+    {
+      "ts": "2026-08-29T20:24:36.343077",
+      "text": "Swarm 2xparallel streamed"
+    },
+    {
+      "ts": "2026-08-29T23:04:56.263828",
+      "text": "Swarm 3xdivide streamed"
+    },
+    {
+      "ts": "2026-08-29T23:07:02.235103",
+      "text": "Council 3 drafts + 3 critics streamed"
+    },
+    {
+      "ts": "2026-08-29T23:08:44.711452",
+      "text": "Swarm 3xdebate streamed"
+    },
+    {
+      "ts": "2026-08-29T23:10:18.641180",
+      "text": "Auto-tuned temperature 0.65 \u2192 0.6 (down-ratio 50%)"
+    },
+    {
+      "ts": "2026-08-29T23:10:24.244939",
+      "text": "Auto-tuned temperature 0.6 \u2192 0.55 (down-ratio 50%)"
+    },
+    {
+      "ts": "2026-08-29T23:10:27.076651",
+      "text": "Auto-tuned temperature 0.55 \u2192 0.5 (down-ratio 50%)"
+    },
+    {
+      "ts": "2026-08-29T23:11:49.439474",
+      "text": "Benchmark executed via self-improve"
+    },
+    {
+      "ts": "2026-08-30T00:24:52.335120",
+      "text": "Regenerated \"Run full Ashen AI benchmark suite\" with critique \u2014 improvement applied."
+    },
+    {
+      "ts": "2026-08-30T01:16:16.744963",
+      "text": "Regenerated \"can you tell me anything you know about the topic?\" with critique \u2014 improvement applied."
+    },
+    {
+      "ts": "2026-08-30T02:10:48.372620",
+      "text": "Swarm 3xparallel streamed"
     }
   ]
 }

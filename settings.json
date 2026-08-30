@@ -1,14 +1,16 @@
 {
-  "temperature": 0.65,
+  "temperature": 1,
   "top_k": 40,
   "top_p": 0.9,
-  "max_new_tokens": 250,
-  "context_length": 8192,
-  "gpu_layers": 16,
+  "max_new_tokens": 1000,
+  "context_length": 32768,
+  "gpu_layers": 24,
   "use_draft_model": false,
-  "low_end_gpu_mode": false,
+  "low_end_gpu_mode": true,
   "precision": "fp16",
-  "cpu_offload_layers": 0,
+  "cpu_offload_layers": 8,
   "show_chain_of_thought": true,
-  "current_model": "C:/dev/Ashen AI Base/ashen_gpt_model.pk1"
+  "auto_swarm_council": true,
+  "auto_web_research": true,
+  "current_model": "C:/dev/Ashen AI Base/ashen_gpt_model"
 }

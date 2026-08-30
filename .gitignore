@@ -85,6 +85,9 @@ secrets.json
 !vocab.txt
 
 *.pk1
+*.bak
 *GGUF/
 sessions/
 sessions_cli/
+Qwen_Qwen3.5-0.8B/
+ashen_gpt_model/

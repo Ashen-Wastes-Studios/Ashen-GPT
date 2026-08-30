@@ -108,6 +108,8 @@ DEFAULT_SETTINGS = {
     "precision": "fp16",
     "cpu_offload_layers": 0,
     "show_chain_of_thought": True,
+    "auto_swarm_council": False,
+    "auto_web_research": False,
     "current_model": "ashen_gpt_model.pk1"
 }
 
@@ -199,35 +201,81 @@ def parse_cli_args():
         sys.exit(0)
     return args
 
+def _is_hf_model_dir(path):
+    """A directory is a HuggingFace model if it has config.json plus weights.
+
+    This is what lets the model hub pick up merged Qwen fine-tunes
+    (e.g. ashen_gpt_model/) and downloaded HF repos, which are directories
+    rather than single .pk1/.gguf files.
+    """
+    if not os.path.isdir(path):
+        return False
+    if not os.path.isfile(os.path.join(path, 'config.json')):
+        return False
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return False
+    if 'model.safetensors' in entries or 'pytorch_model.bin' in entries:
+        return True
+    return any(e.endswith('.safetensors') for e in entries)
+
+
 def scan_available_models():
-    """Scan project directory and common locations for model checkpoints."""
+    """Scan project directory and common locations for model checkpoints.
+
+    Lists both legacy single-file checkpoints (.pk1/.pt/.pth/.gguf) and
+    HuggingFace model DIRECTORIES (config.json + safetensors/bin).
+    """
     models = []
-    
+
     # Scan current directory
     search_dirs = ['.', os.path.expanduser('~/.cache/huggingface/hub')]
-    
+
     for search_dir in search_dirs:
         if not os.path.exists(search_dir):
             continue
-        
+
         for root, dirs, files in os.walk(search_dir):
             # Skip hidden directories
             dirs[:] = [d for d in dirs if not d.startswith('.')]
-            
+
+            # HuggingFace model directory -> represent the dir itself as one
+            # selectable model; don't also list its internal .pt/.safetensors.
+            if _is_hf_model_dir(root):
+                full_path = os.path.abspath(root).replace('\\', '/')
+                try:
+                    size_mb = round(sum(
+                        os.path.getsize(os.path.join(root, f))
+                        for f in os.listdir(root)
+                        if f.endswith('.safetensors') or f.endswith('.bin')
+                    ) / (1024 * 1024), 1)
+                except OSError:
+                    size_mb = 0.0
+                is_active = (os.path.normpath(full_path) == os.path.normpath(current_model_filename))
+                models.append({
+                    'path': full_path,
+                    'name': os.path.basename(root),
+                    'size_mb': size_mb,
+                    'active': is_active,
+                    'type': 'qwen-hf',
+                })
+                continue
+
             for file in files:
                 if file.endswith(('.pk1', '.pt', '.pth', '.gguf')):
                     # Convert backslashes to forward slashes for JS safety
                     full_path = os.path.abspath(os.path.join(root, file)).replace('\\', '/')
                     size_mb = round(os.path.getsize(full_path) / (1024 * 1024), 1)
                     is_active = (os.path.normpath(full_path) == os.path.normpath(current_model_filename))
-                    
+
                     models.append({
                         'path': full_path,
                         'name': file,
                         'size_mb': size_mb,
                         'active': is_active
                     })
-    
+
     return sorted(models, key=lambda m: m['active'], reverse=True)
 
 def set_default_model(model_path):
@@ -275,123 +323,6 @@ vocab_size = enc.n_vocab
 
 encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
 decode = lambda l: enc.decode(l)
-
-def _is_gibberish(text, prompt=""):
-    """Detect random BPE gibberish vs relevant CoT."""
-    if not text or len(text.strip()) < 12:
-        return True
-    txt = text.strip()
-    if len(txt.split()) < 4:
-        return True
-    # mixed-case nonsense like mudASY
-    mixed = len(re.findall(r'[a-z][A-Z]|[A-Z]{3,}', txt))
-    if mixed > 6 and len(txt) < 600:
-        return True
-    # substantive keyword overlap - thought/response must mention *content* words from prompt
-    STOP = {'the','is','a','and','to','of','in','what','how','why','you','i','for','on','with','this','that','it','are','was','were','be','been','have','has','had','do','does','did','will','would','can','could','should','explain','tell','what','who','where','when','one','sentence'}
-    # for relevance check, use prompt content words (len>=3, not stop)
-    if prompt:
-        p_words_full = set(re.findall(r'[a-z]{3,}', prompt.lower()))
-        p_content = {w for w in p_words_full if w not in STOP}
-        # if prompt has content words (e.g. france, quantum), require at least one in text
-        if p_content:
-            t_words = set(re.findall(r'[a-z]{3,}', txt.lower()))
-            # france/quantum/computing etc must appear
-            if len(p_content & t_words) == 0:
-                # no content overlap -> irrelevant unless text is very short generic greeting
-                if len(txt) > 60:
-                    return True
-        # code gibberish when prompt is not code-related
-        if not user_wants_code(prompt):
-            code_markers = ['template<', 'struct ', '#include', 'collections.net', 'Pydantic', 'calc_bson', '::std::', '```', 'def ', 'import ']
-            if any(m.lower() in txt.lower() for m in code_markers) and len(txt) > 40:
-                return True
-    # common English ratio check - gibberish has very low ratio
-    common = {'the','is','a','and','to','of','in','what','how','why','you','i','for','on','with','this','that','it'}
-    words = re.findall(r'[a-z]{2,}', txt.lower())
-    if words:
-        common_ratio = len([w for w in words if w in common]) / max(1, len(words))
-        if common_ratio < 0.02 and len(txt) > 80:
-            return True
-    return False
-
-def _synthesize_relevant_cot_and_response(prompt, original_thought, original_response):
-    """Build a prompt-relevant CoT and a proper answer when model failed."""
-    p = prompt.strip()
-    p_lower = p.lower()
-    # --- relevant CoT ---
-    keywords = ", ".join(p.split()[:10])
-    intent = "question" if "?" in p or p_lower.startswith(("what","who","where","when","why","how","can","is","are","explain","tell","define")) else "request"
-    cot = (
-        f'User prompt: "{p}"\n'
-        f'1. Intent: {intent} — keywords: {keywords}\n'
-        f'2. Context: history={len(reasoner.history) if "reasoner" in globals() else 0} turns, workspace_context present={bool(getattr(reasoner, "workspace_context", "") if "reasoner" in globals() else False)}\n'
-        f'3. Knowledge: identify core concept in "{p[:90]}" and recall relevant facts.\n'
-        f'4. Plan: direct answer first, then 1-2 sentence explanation, keep on-topic.\n'
-        f'5. Check: response must contain keywords from prompt and directly answer "{p[:60]}".\n'
-        f'6. Note: original model output was gibberish/empty ({len(original_thought or "")} chars thought, {len(original_response or "")} chars response) — synthesizing prompt-relevant reasoning.'
-    )
-    # --- proper response (rule-based for common factual prompts, generic otherwise) ---
-    # tiny knowledge base for demo factual queries
-    kb = {
-        "capital of france": "The capital of France is **Paris** — political, cultural and economic center on the Seine.",
-        "capital of germany": "The capital of Germany is **Berlin**.",
-        "capital of japan": "The capital of Japan is **Tokyo**.",
-        "capital of england": "The capital of England is **London**.",
-        "quantum computing": "Quantum computing uses **qubits** in superposition and entanglement to solve certain problems exponentially faster than classical computers — in one sentence: it harnesses quantum mechanics to process information in ways classical bits cannot.",
-        "haiku about rain": "Soft rain on rooftops\nWhispering through silent streets\nEarth drinks quietly",
-        "what is ai": "AI (Artificial Intelligence) is the field of building systems that can perceive, reason, learn and act to achieve goals — from pattern recognition to autonomous decision-making.",
-    }
-    # check kb first (substring match, longest key first)
-    resp = None
-    for k in sorted(kb.keys(), key=len, reverse=True):
-        if k in p_lower and kb[k]:
-            resp = kb[k]
-            # for haiku, wrap nicely
-            if "haiku" in k:
-                resp = f'Here is a haiku about rain:\n\n*{resp}*'
-            break
-    if resp is None:
-        if "hello" in p_lower or p.strip().lower() in ("hi","hey"):
-            resp = "Hello! I'm Ashen AI — how can I help you today?"
-        elif p_lower.startswith("explain ") and " in one sentence" in p_lower:
-            topic = p_lower.replace("explain ","").replace(" in one sentence","").strip()
-            # specific handlers
-            if "quantum" in topic:
-                resp = kb["quantum computing"]
-            else:
-                resp = f'In one sentence: **{topic.capitalize()}** is a concept where I can give you a concise definition — tell me the angle you want (technical, ELI5, or with an example) and I\'ll tailor it.'
-        elif p_lower.startswith("what is") or p_lower.startswith("who is") or p_lower.startswith("define"):
-            m = re.match(r'(?:what is|who is|define)\s+(.*)', p_lower)
-            topic = m.group(1).strip(" ?") if m else p
-            resp = f'**{topic.capitalize()}**: a concise answer directly addressing your prompt. If you want depth, examples, or sources, say the word and I\'ll expand.'
-        elif "haiku" in p_lower:
-            subj = "rain"
-            mm = re.search(r'haiku about (.+)', p_lower)
-            if mm: subj = mm.group(1).strip()
-            resp = f'Here is a haiku about **{subj}**:\n\n*Silent {subj} falls\nGentle whispers on the wind\nDreams awaken soft*'
-        elif "write a" in p_lower or "poem" in p_lower or "story" in p_lower:
-            resp = f'You asked: "{p}"\n\nHere is a draft directly addressing that:\n\n*I\'ll craft it for you — tell me length/style and I\'ll expand, but this opening answers your request head-on.*'
-            if "rain" in p_lower:
-                resp = 'Here is a haiku about rain:\n\n*Soft rain on rooftops\nWhispering through silent streets\nEarth drinks quietly*'
-        else:
-            resp = f'You asked: "{p}"\n\n**Answer:** This directly addresses your prompt — I\'ve reasoned through intent, keywords, and context in the chain-of-thought above. For a deeper dive (examples, code, or research), tell me how detailed you want it.'
-            if len(p.split()) < 18:
-                resp += f'\n\n*This response was generated after the CoT specifically to answer "{p}".*'
-    return cot, resp
-
-def user_wants_code(prompt):
-    code_keywords = [
-        'code', 'write a', 'function', 'script', 'program', 'python', 'javascript',
-        'html', 'css', 'sql', 'syntax', 'class ', 'def ', 'implementation', 'algorithm'
-    ]
-    prompt_lower = prompt.lower()
-    return any(keyword in prompt_lower for keyword in code_keywords)
-
-def filter_code_output(text):
-    text_no_blocks = re.sub(r'```[\s\S]*?```', '[Code logic analyzed internally. Ask me to write code if you want to see the implementation snippet.]', text)
-    text_clean = re.sub(r'`[^`]*`', '', text_no_blocks)
-    return text_clean
 
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
@@ -533,8 +464,12 @@ class AshenGPTLanguageModel(nn.Module):
         self.blocks = nn.ModuleList([Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = RMSNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
+        # Auxiliary intent-classification head (spam / not_spam / question /
+        # answer / request). Mirrors ashen_gpt_trainer.AshenGPTLanguageModel so the
+        # pickled checkpoint (which carries this head) loads and can be queried.
+        self.class_head = nn.Linear(n_embd, 5, bias=False)
 
-    def forward(self, index, targets=None, current_block_size=8192):
+    def forward(self, index, targets=None, current_block_size=8192, cls_targets=None):
         B, T = index.shape
         if T > current_block_size:
             index = index[:, -current_block_size:]
@@ -547,12 +482,28 @@ class AshenGPTLanguageModel(nn.Module):
         x = self.ln_f(x)
         logits = self.lm_head(x)
         loss = None if targets is None else F.cross_entropy(logits.view(B*T, -1), targets.view(B*T))
-        return logits, loss
+        # Auxiliary classification head (mean-pooled over the sequence).
+        cls_logits = self.class_head(x.mean(dim=1))
+        cls_loss = None
+        if cls_targets is not None:
+            cls_loss = F.cross_entropy(cls_logits, cls_targets)
+        return logits, loss, cls_logits, cls_loss
+
+    @torch.no_grad()
+    def classify(self, text, current_block_size=8192):
+        """Return (label_string, index, confidence) for an incoming message."""
+        ids = torch.tensor([encode(text)], dtype=torch.long, device=device)
+        self.eval()
+        cls_logits = self.forward(ids, current_block_size=current_block_size)[2]
+        probs = F.softmax(cls_logits, dim=-1)
+        idx = int(probs.argmax(dim=-1).item())
+        labels = ["spam", "not_spam", "question", "answer", "request"]
+        return labels[idx], idx, float(probs[0, idx].item())
 
     def generate(self, index, max_new_tokens, current_block_size=8192, temperature=0.8, top_k=50):
         for _ in range(max_new_tokens):
             index_cond = index[:, -current_block_size:]
-            logits, loss = self.forward(index_cond, current_block_size=current_block_size)
+            logits, _loss, _cls, _cl = self.forward(index_cond, current_block_size=current_block_size)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -566,7 +517,7 @@ class AshenGPTLanguageModel(nn.Module):
         """Yield (full_index, next_token_id, decoded_chunk) token by token for live CoT streaming."""
         for _ in range(max_new_tokens):
             index_cond = index[:, -current_block_size:]
-            logits, loss = self.forward(index_cond, current_block_size=current_block_size)
+            logits, _loss, _cls, _cl = self.forward(index_cond, current_block_size=current_block_size)
             logits = logits[:, -1, :] / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
@@ -577,6 +528,142 @@ class AshenGPTLanguageModel(nn.Module):
             tok_id = int(index_next[0,0].item()) if index_next.dim()==2 else int(index_next.item())
             yield index, tok_id
 
+# --- Qwen HF model adapter -------------------------------------------------
+# When current_model points at a Qwen3.5 HF directory (produced by
+# qwen_finetune.py), we load it with transformers and expose the same generate /
+# generate_stream / classify interface the agentic engine expects, keeping the
+# spam/request routing intact. The model is chat-templated, so all prompt
+# framing is handled here (no ### Instruction: strings reach the model).
+class QwenModelAdapter:
+    is_qwen = True
+    CLASS_LABELS = ["spam", "not_spam", "question", "answer", "request"]
+
+    def __init__(self, model_dir, device, class_head_path=None):
+        from transformers import AutoTokenizer
+        from transformers import Qwen3_5ForCausalLM
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+        # Load with the EXPLICIT causal-LM class: the source checkpoint's
+        # config.json advertises the multimodal Qwen3_5ForConditionalGeneration
+        # architecture, which would make AutoModelForCausalLM try to build the
+        # vision model and fail. We only ever train/save the text model.
+        self.model = Qwen3_5ForCausalLM.from_pretrained(
+            model_dir,
+            torch_dtype=(torch.bfloat16 if device == "cuda" else torch.float32),
+            device_map="auto" if device == "cuda" else "cpu",
+        )
+        self.model.eval()
+        _cfg = self.model.config
+        if hasattr(_cfg, "hidden_size"):
+            hid = _cfg.hidden_size
+        elif hasattr(_cfg, "text_config") and hasattr(_cfg.text_config, "hidden_size"):
+            hid = _cfg.text_config.hidden_size
+        else:
+            hid = 1024
+        self.hidden_size = hid
+        self.class_head = None
+        if class_head_path and os.path.exists(class_head_path):
+            self.class_head = torch.nn.Linear(hid, len(self.CLASS_LABELS), bias=False)
+            self.class_head.load_state_dict(torch.load(class_head_path, map_location=device))
+            self.class_head = self.class_head.to(device).eval()
+        self.system_prompt = (
+            "You are Ashen GPT, a precise local AI assistant. Answer every question "
+            "completely and directly — never ask the user what angle or level of detail "
+            "they want, and never deflect. When a request needs current facts, reason "
+            "step by step, then ground your answer in the gathered sources and cite them "
+            "inline as [1], [2], ... with a Sources list at the end."
+        )
+
+    def _chat_ids(self, user_text, history=None, add_generation_prompt=True):
+        msgs = [{"role": "system", "content": self.system_prompt}]
+        for u, a in (history or []):
+            msgs.append({"role": "user", "content": u})
+            msgs.append({"role": "assistant", "content": a})
+        msgs.append({"role": "user", "content": user_text})
+        text = self.tokenizer.apply_chat_template(
+            msgs, tokenize=False, add_generation_prompt=add_generation_prompt
+        )
+        return self.tokenizer(text, return_tensors="pt").input_ids[0]
+
+    def encode(self, text):
+        return self.tokenizer(text, return_tensors="pt").input_ids[0].tolist()
+
+    def decode(self, ids):
+        if hasattr(ids, "tolist"):
+            ids = ids.tolist()
+        return self.tokenizer.decode(ids, skip_special_tokens=False)
+
+    @torch.no_grad()
+    def classify(self, text):
+        ids = torch.tensor([self.encode(text)], dtype=torch.long, device=self.device)
+        out = self.model(input_ids=ids, output_hidden_states=True)
+        h = out.hidden_states[-1][:, -1, :]
+        if self.class_head is None:
+            return None, None, None
+        logits = self.class_head(h)
+        probs = torch.softmax(logits, dim=-1)
+        idx = int(probs.argmax(dim=-1).item())
+        return self.CLASS_LABELS[idx], idx, float(probs[0, idx].item())
+
+    @torch.no_grad()
+    def generate(self, index, max_new_tokens, current_block_size=8192, temperature=0.8, top_k=50):
+        idx = index.clone()
+        for _ in range(max_new_tokens):
+            ctx = idx[:, -current_block_size:]
+            out = self.model(input_ids=ctx)
+            logits = out.logits[:, -1, :] / max(temperature, 1e-5)
+            if top_k:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float("inf")
+            probs = torch.softmax(logits, dim=-1)
+            nxt = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, nxt), dim=-1)
+        return idx
+
+    @torch.no_grad()
+    def generate_stream(self, index, max_new_tokens, current_block_size=8192, temperature=0.8, top_k=50):
+        idx = index.clone()
+        for _ in range(max_new_tokens):
+            ctx = idx[:, -current_block_size:]
+            out = self.model(input_ids=ctx)
+            logits = out.logits[:, -1, :] / max(temperature, 1e-5)
+            if top_k:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float("inf")
+            probs = torch.softmax(logits, dim=-1)
+            nxt = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat((idx, nxt), dim=-1)
+            tok_id = int(nxt[0, 0].item())
+            yield idx, tok_id
+
+    def eval(self):
+        """Mirror nn.Module.eval() so engine code can call self.model.eval()."""
+        self.model.eval()
+        return self
+
+    def train(self, mode=True):
+        self.model.train(mode)
+        return self
+
+
+# --- Safe checkpoint loader -------------------------------------------------
+# Checkpoints are pickled as ashen_gpt_trainer.AshenGPTLanguageModel. Importing
+# that module would run the ENTIRE training pipeline (no __main__ guard), so we
+# load with a remapping unpickler that points its class references at THIS
+# module's identical definitions. The auxiliary class_head is part of
+# state_dict, so it loads automatically.
+class _AshenUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        if module == 'ashen_gpt_trainer':
+            return getattr(sys.modules[__name__], name)
+        return super().find_class(module, name)
+
+def _load_ashen_checkpoint(path):
+    with open(path, 'rb') as f:
+        return _AshenUnpickler(f).load()
+
 # Load saved model selection if available
 saved_model_path = settings.get('current_model', DEFAULT_MODEL_FILENAME)
 if os.path.exists(saved_model_path):
@@ -586,12 +673,26 @@ else:
     current_model_filename = DEFAULT_MODEL_FILENAME
     print(f"[Model] Saved model not found, using default: {current_model_filename}", flush=True)
 
-if os.path.exists(current_model_filename):
+# Qwen3.5 HF directory (produced by qwen_finetune.py) loads directly via the
+# adapter; everything else is the legacy pickle checkpoint. When the model is a
+# Qwen dir, `m` is a QwenModelAdapter (exposes generate/generate_stream/classify
+# and is chat-templated), so the agentic engine's routing still works.
+if os.path.isdir(current_model_filename):
+    _ch_path = os.path.join(current_model_filename, "class_head.pt")
+    print(f"Loading Qwen HF model from directory: {current_model_filename}")
+    try:
+        model = QwenModelAdapter(current_model_filename, device, class_head_path=_ch_path)
+        print("Qwen model loaded via QwenModelAdapter (chat-templated, class_head="
+              f"{'present' if model.class_head is not None else 'absent'}).")
+    except Exception as e:
+        print(f"Qwen load failed ({e}). Falling back to default pickle model...")
+        current_model_filename = DEFAULT_MODEL_FILENAME
+if not os.path.isdir(current_model_filename) and os.path.exists(current_model_filename):
     print(f"Loading Ashen GPT model parameters from {current_model_filename}...")
     try:
-        with open(current_model_filename, 'rb') as f:
-            model = pickle.load(f)
-        print("Model loaded successfully via pickle!")
+            with open(current_model_filename, 'rb') as f:
+                model = _load_ashen_checkpoint(current_model_filename)
+            print("Model loaded successfully via pickle (remapped from ashen_gpt_trainer)!")
     except (pickle.UnpicklingError, Exception) as e:
         print(f"Pickle load failed ({e}). Trying torch.load fallback...")
         try:
@@ -600,11 +701,11 @@ if os.path.exists(current_model_filename):
         except Exception as torch_e:
             print(f"Checkpoint unreadable ({torch_e}). Initializing new model...")
             model = AshenGPTLanguageModel(vocab_size)
-else:
+elif not os.path.exists(current_model_filename) and not os.path.isdir(current_model_filename):
     print(f"No checkpoint found at {current_model_filename}. Initializing new Ashen GPT model...")
     model = AshenGPTLanguageModel(vocab_size)
 
-m = model.to(device)
+m = model.to(device) if not getattr(model, "is_qwen", False) else model
 
 # --- Draft Model Support ---
 draft_model_filename = 'ashen_gpt_model_draft.pk1'  # Default draft model path
@@ -622,6 +723,25 @@ if os.path.exists(draft_model_filename):
         draft_model = None
 else:
     print(f"No draft model found at {draft_model_filename}. Using main model only.")
+
+def _ddg_real_url(href):
+    """Decode a DuckDuckGo redirect href (/l/?uddg=BASE64URL) to the real destination URL.
+    DDG stores the target base64url-encoded in the `uddg` param, NOT url-encoded."""
+    if not href:
+        return href
+    import base64
+    m = re.search(r'uddg=([^&]+)', href)
+    if m:
+        try:
+            enc = m.group(1)
+            # base64url: replace url-safe chars, pad
+            enc = enc.replace('-', '+').replace('_', '/')
+            enc += '=' * (-len(enc) % 4)
+            return base64.b64decode(enc).decode('utf-8', errors='ignore')
+        except Exception:
+            return href
+    return href
+
 
 class AshenAIAgenticEngine:
     def __init__(self, model, decode_fn, encode_fn, device, max_steps=5):
@@ -641,11 +761,15 @@ class AshenAIAgenticEngine:
         self.repeat_penalty = 1.1
         self.workspace_context = ""  # injected context from browsed workspace
         self.session_id = None
+        self.last_intent = None  # last classify() result {label, confidence} for UI routing
+        self.pending_requests = []  # queued 'request' intents surfaced by the classifier
         self.use_draft_model = False  # Toggle for speculative decoding
         self.draft_temperature = 0.6  # Lower temp for draft proposals
         self.low_end_gpu_mode = False  # Enable memory optimizations for low-end GPUs
         self.precision = 'fp32'  # 'fp32', 'fp16', 'bf16'
         self.cpu_offload_layers = 0  # Number of layers to offload to CPU
+        self.auto_swarm_council = False  # Auto-enrich every turn with swarm + council
+        self.auto_web_research = False  # Auto-run web research + cite sources
 
     def clear_history(self):
         self.history = []
@@ -671,6 +795,10 @@ class AshenAIAgenticEngine:
             self.use_draft_model = bool(settings['use_draft_model'])
         if 'draft_temperature' in settings:
             self.draft_temperature = float(settings['draft_temperature'])
+        if 'auto_swarm_council' in settings:
+            self.auto_swarm_council = bool(settings['auto_swarm_council'])
+        if 'auto_web_research' in settings:
+            self.auto_web_research = bool(settings['auto_web_research'])
 
     @torch.no_grad()
     def generate_with_speculative_decoding(self, input_ids, max_new_tokens):
@@ -797,6 +925,9 @@ class AshenAIAgenticEngine:
 
     def execute_tool(self, tool_name, kwargs):
         try:
+            self._last_tool_sources = getattr(self, '_last_tool_sources', [])
+            if tool_name in ('web_search', 'browse_url', 'deep_research'):
+                self._source_harvest = getattr(self, '_source_harvest', [])
             if tool_name == 'read_file':
                 path = kwargs.get('file_path', '')
                 if os.path.exists(path):
@@ -851,39 +982,25 @@ class AshenAIAgenticEngine:
                     }
                     resp = requests.get(url, headers=headers, timeout=10)
                     if resp.status_code == 200:
-                        from html.parser import HTMLParser
-                        
-                        class TitleExtractor(HTMLParser):
-                            def __init__(self):
-                                super().__init__()
-                                self.in_title = False
-                                self.title = ""
-                            
-                            def handle_starttag(self, tag, attrs):
-                                if tag == 'title':
-                                    self.in_title = True
-                            
-                            def handle_data(self, data):
-                                if self.in_title:
-                                    self.title += data
-                            
-                            def handle_endtag(self, tag):
-                                if tag == 'title':
-                                    self.in_title = False
-                        
-                        # Extract titles from results
-                        titles = []
-                        for match in re.finditer(r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', resp.text, re.DOTALL):
-                            title_text = re.sub(r'<[^>]+>', '', match.group(1))
-                            if title_text.strip():
-                                titles.append(title_text.strip())
-                        
-                        if titles:
-                            result = f"DuckDuckGo search results for '{query}':\n\n"
-                            for i, title in enumerate(titles[:5], 1):
-                                result += f"{i}. {title}\n"
-                            result += f"\nFound {len(titles)} results total. Use browse_url to get full content of specific pages."
-                            return result
+                        # Extract titles AND real destination URLs (decode DDG redirect)
+                        results = []
+                        for m in re.finditer(
+                            r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                            resp.text, re.DOTALL):
+                            real = _ddg_real_url(m.group(1))
+                            title = re.sub(r'<[^>]+>', '', m.group(2)).strip()
+                            if title and real:
+                                results.append((title, real))
+                        if results:
+                            lines = [f"DuckDuckGo results for '{query}':"]
+                            harvest = getattr(self, '_source_harvest', [])
+                            for i, (title, real) in enumerate(results[:6], 1):
+                                lines.append(f"{i}. {title}\n   {real}")
+                                harvest.append({"title": title, "url": real})
+                            lines.append(
+                                f"\nFound {len(results)} results. Use browse_url(url='...') "
+                                "to fetch the full content of a specific page.")
+                            return "\n".join(lines)
                         else:
                             return f"No results found for '{query}'"
                     else:
@@ -899,11 +1016,12 @@ class AshenAIAgenticEngine:
                     }
                     resp = requests.get(url, headers=headers, timeout=15)
                     if resp.status_code == 200:
-                        # Strip HTML tags and extract readable content
+                        # Record the source for citation, then strip HTML
+                        getattr(self, '_source_harvest', []).append({"title": url, "url": url})
                         content = re.sub(r'<[^>]+>', ' ', resp.text)
                         content = re.sub(r'\s+', ' ', content).strip()
-                        # Take first 2000 chars to stay within token limits
-                        readable_content = content[:2000]
+                        # Take first 3000 chars to stay within token limits
+                        readable_content = content[:3000]
                         return f"Content from {url}:\n\n{readable_content}"
                     else:
                         return f"Failed to fetch URL: Status code {resp.status_code}"
@@ -915,81 +1033,59 @@ class AshenAIAgenticEngine:
                 max_searches = int(kwargs.get('max_searches', '3'))
                 try:
                     research_report = f"# Deep Research Report: {topic}\n\n"
-                    all_urls = set()
-                    
-                    # Phase 1: Initial search for overview
-                    searches_done = 0
-                    
-                    # Get initial search results
-                    url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(topic)}"
+                    harvest = getattr(self, '_source_harvest', [])
                     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-                    resp = requests.get(url, headers=headers, timeout=10)
-                    
-                    if resp.status_code != 200:
-                        return f"Research failed: Search error {resp.status_code}"
-                    
-                    # Extract search result links
-                    search_links = []
-                    for match in re.finditer(r'<a[^>]*class="result__a"[^>]*href="(.*?)"[^>]*>(.*?)</a>', resp.text, re.DOTALL):
-                        link_url = match.group(1)
-                        title_text = re.sub(r'<[^>]+>', '', match.group(2))
-                        if link_url and not any(skip in link_url.lower() for skip in ['duckduckgo.com', 'facebook.com', 'twitter.com']):
-                            search_links.append((link_url, title_text.strip()))
-                    
+
+                    def _ddg_search(q):
+                        u = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(q)}"
+                        r = requests.get(u, headers=headers, timeout=10)
+                        out = []
+                        if r.status_code == 200:
+                            for m in re.finditer(r'<a[^>]*class="result__a"[^>]*href="(.*?)"[^>]*>(.*?)</a>', r.text, re.DOTALL):
+                                link = _ddg_real_url(m.group(1))
+                                title = re.sub(r'<[^>]+>', '', m.group(2)).strip()
+                                if link and not any(sk in link.lower() for sk in ['duckduckgo.com', 'facebook.com', 'twitter.com', 'x.com']):
+                                    out.append((link, title))
+                        return out
+
+                    # Phase 1: initial search
+                    search_links = _ddg_search(topic)
+                    if not search_links:
+                        return f"Research failed: no results for '{topic}'"
                     research_report += f"## Initial Search Overview\n\nTopic: `{topic}`\nFound {len(search_links)} relevant results.\n\n"
-                    
-                    # Phase 2: Browse top sources (limit by context window)
-                    max_browses = min(len(search_links), 5, max(max_searches, 5))
-                    
-                    for i, (link_url, title_text) in enumerate(search_links[:max_browses], 1):
-                        research_report += f"### Source {i}: {title_text}\n"
-                        research_report += f"URL: {link_url}\n\n"
-                        
-                        # Fetch and extract content
+
+                    # Phase 2: browse top sources (cap by max_searches, min 5 for breadth)
+                    browsed = 0
+                    cap = max(max_searches, 5)
+                    for i, (link_url, title_text) in enumerate(search_links[:cap], 1):
+                        research_report += f"### Source {i}: {title_text}\nURL: {link_url}\n\n"
+                        harvest.append({"title": title_text, "url": link_url})
                         content_resp = requests.get(link_url, headers=headers, timeout=15)
                         if content_resp.status_code == 200:
                             content = re.sub(r'<[^>]+>', ' ', content_resp.text)
                             content = re.sub(r'\s+', ' ', content).strip()
-                            # Extract key paragraphs
                             paragraphs = [p.strip() for p in content.split('\n') if len(p.strip()) > 50]
-                            
                             if paragraphs:
-                                # Take most informative paragraphs (longest ones)
                                 key_info = '\n'.join(sorted(paragraphs, key=len, reverse=True)[:3])
                                 research_report += f"{key_info}\n\n"
                             else:
-                                research_report += f"[No extractable text from this source]\n\n"
+                                research_report += "[No extractable text from this source]\n\n"
                         else:
                             research_report += f"[Failed to fetch content - HTTP {content_resp.status_code}]\n\n"
-                        
-                        searches_done += 1
-                        
-                        # Break early if we have enough info
-                        if searches_done >= max_searches and max_searches < 3:
+                        browsed += 1
+
+                    # Phase 3: topic-relevant follow-up searches for breadth
+                    for next_topic in [f"{topic} latest developments", f"{topic} analysis", f"{topic} examples"]:
+                        if browsed >= max_searches + 2:
                             break
-                    
-                    # Phase 3: Follow-up searches if needed
-                    remaining = max_searches - searches_done
-                    if remaining > 0 and search_links:
-                        research_report += f"\n## Follow-up Research\n\n"
-                        for next_topic in ["PyTorch latest features", "AI research trends"]:
-                            if remaining <= 0:
-                                break
-                            follow_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(next_topic)}"
-                            follow_resp = requests.get(follow_url, headers=headers, timeout=10)
-                            if follow_resp.status_code == 200:
-                                follow_titles = []
-                                for fm in re.finditer(r'<a[^>]*class="result__a"[^>]*>(.*?)</a>', follow_resp.text, re.DOTALL):
-                                    t = re.sub(r'<[^>]+>', '', fm.group(1)).strip()
-                                    if t:
-                                        follow_titles.append(t)
-                                if follow_titles:
-                                    research_report += f"\n**Related: {next_topic}**\n"
-                                    for ft in follow_titles[:3]:
-                                        research_report += f"- {ft}\n"
-                                    remaining -= 1
-                    
-                    return f"Deep Research Complete!\n\n" + research_report + "\n---\nReport generated autonomously via web traversal."
+                        for link_url, title_text in _ddg_search(next_topic)[:2]:
+                            research_report += f"\n**Related: {next_topic}**\n- {title_text} — {link_url}\n"
+                            harvest.append({"title": title_text, "url": link_url})
+                            browsed += 1
+
+                    sources_block = "\n## Sources\n" + "\n".join(
+                        f"{i+1}. {s['title']} — {s['url']}" for i, s in enumerate(harvest))
+                    return f"Deep Research Complete!\n\n" + research_report + sources_block + "\n---\nReport generated autonomously via web traversal."
 
                 except Exception as e:
                     return f"Deep research error: {str(e)}"
@@ -1201,49 +1297,166 @@ class AshenAIAgenticEngine:
             return f"Error executing tool {tool_name}: {str(e)}"
 
     @torch.no_grad()
+    def classify_input(self, prompt):
+        """Run the auxiliary intent-classification head on a raw user message.
+        Returns (label, index, confidence); on any failure returns (None, None, None)
+        so callers can no-op. The head was trained in ashen_gpt_trainer.py to label
+        spam / not_spam / question / answer / request from training data."""
+        try:
+            label, idx, conf = self.model.classify(prompt)
+            self.last_intent = {"label": label, "confidence": round(conf, 4)}
+            return label, idx, conf
+        except Exception as e:
+            print(f"[Intent classify] skipped: {e}", flush=True)
+            self.last_intent = None
+            return None, None, None
+
+    @torch.no_grad()
+    def _solve_qwen(self, prompt):
+        """Isolated solve path for chat-templated Qwen models (QwenModelAdapter).
+        No ### Instruction: framing is injected — the adapter's chat template
+        supplies it. Spam/request routing already ran in the caller."""
+        self.model.eval()
+        ids = self.model._chat_ids(prompt, history=self.history[-2:])
+        input_ids = ids.unsqueeze(0).to(device)
+        output_ids = self.model.generate(
+            input_ids, max_new_tokens=self.max_new_tokens,
+            current_block_size=self.context_length,
+            temperature=self.temperature, top_k=self.top_k,
+        )
+        raw = self.model.decode(output_ids[0].tolist())
+        prompt_text = self.model.tokenizer.apply_chat_template(
+            [{"role": "system", "content": self.model.system_prompt}]
+            + [{"role": "user", "content": u} for u, _ in self.history[-2:]]
+            + [{"role": "assistant", "content": a} for _, a in self.history[-2:]]
+            + [{"role": "user", "content": prompt}],
+            tokenize=False, add_generation_prompt=True,
+        )
+        generated = raw[len(prompt_text):] if raw.startswith(prompt_text) else raw
+        m = re.search(r'<think>([\s\S]*?)(?:</think>|$)', generated)
+        if m:
+            thought = m.group(1).strip()
+            resp = generated[m.end():].strip()
+        else:
+            thought = ""
+            resp = generated.strip()
+        self.history.append((prompt, resp))
+        return thought, resp
+
+    @torch.no_grad()
+    def _solve_qwen_stream(self, prompt):
+        """Streaming solve path for chat-templated Qwen models."""
+        self.model.eval()
+        self._source_harvest = []  # reset per-turn source harvesting
+        ids = self.model._chat_ids(prompt, history=self.history[-2:])
+        input_ids = ids.unsqueeze(0).to(device)
+        prompt_text = self.model.tokenizer.apply_chat_template(
+            [{"role": "system", "content": self.model.system_prompt}]
+            + [{"role": "user", "content": u} for u, _ in self.history[-2:]]
+            + [{"role": "assistant", "content": a} for _, a in self.history[-2:]]
+            + [{"role": "user", "content": prompt}],
+            tokenize=False, add_generation_prompt=True,
+        )
+        full = ""
+        thought_sent = 0
+        resp_sent = 0
+        saw_close = False
+        for full_index, tok_id in self.model.generate_stream(
+            input_ids, max_new_tokens=self.max_new_tokens,
+            current_block_size=self.context_length,
+            temperature=self.temperature, top_k=self.top_k,
+        ):
+            raw = self.model.decode(full_index[0].tolist())
+            generated = raw[len(prompt_text):] if raw.startswith(prompt_text) else raw
+            if len(generated) <= len(full):
+                continue
+            full = generated
+            if not saw_close:
+                if "</think>" in full:
+                    saw_close = True
+                    before, after = full.split("</think>", 1)
+                    nt = before[thought_sent:]
+                    if nt:
+                        yield {"type": "thought_delta", "chunk": nt}
+                    thought_sent = len(before)
+                    yield {"type": "thought_done"}
+                    if after.strip():
+                        yield {"type": "response_delta", "chunk": after}
+                        resp_sent = len(after)
+                else:
+                    nt = full[thought_sent:]
+                    if nt:
+                        yield {"type": "thought_delta", "chunk": nt}
+                    thought_sent = len(full)
+            else:
+                nr = full[resp_sent:]
+                if nr:
+                    yield {"type": "response_delta", "chunk": nr}
+                    resp_sent = len(full)
+        m = re.search(r'<think>([\s\S]*?)(?:</think>|$)', full)
+        if m:
+            thought = m.group(1).strip()
+            resp = full[m.end():].strip()
+        else:
+            thought = ""
+            resp = full.strip()
+        self.history.append((prompt, resp))
+        yield {"type": "done", "thought": thought, "response": resp,
+               "model": os.path.basename(current_model_filename),
+               "model_path": current_model_filename, "sources": [],
+               "intent": self.last_intent}
+
+    @torch.no_grad()
     def solve_with_agent(self, prompt):
         self.model.eval()
-        
-        persona_instructions = {
-            "ashen_ai_agent": "You are Ashen AI, an advanced cybernetic local AI assistant with tool execution capabilities.\n",
-            "code_architect": "You are Ashen AI Code Architect, specializing in high-performance PyTorch, Python, and web engineering.\n",
-            "cyber_companion": "You are Ashen AI Companion, a razor-sharp cyberpunk assistant with a witty, direct edge.\n"
-        }
-        
-        base_inst = persona_instructions.get(self.persona, persona_instructions["ashen_ai_agent"])
-        workspace_context_block = ""
-        if self.workspace_context:
-            workspace_context_block = f"\n### Current Workspace Context\n{self.workspace_context}\n\n"
+        self._source_harvest = []  # reset per-turn source harvesting
 
-        system_instructions = (
-            base_inst +
-            workspace_context_block +
-            "Available tools:\n"
-            "- read_file(file_path='...')\n"
-            "- write_file(file_path='...', content='...')\n"
-            "- glob(pattern='...')\n"
-            "- grep_search(pattern='...')\n"
-            "- run_shell_command(command='...')\n"
-            "- web_search(query='...') — Search DuckDuckGo for information\n"
-            "- browse_url(url='...') — Fetch and extract text from a webpage\n"
-            "- deep_research(topic='...', max_searches=3) — Autonomous multi-source research agent\n"
-            "- run_benchmark() — Run 12-question benchmark across Knowledge, Code, Math, Language, Ethics\n"
-            "To use a tool, output: [TOOL: tool_name(arg1=val1, arg2=val2)]\n"
-            "After observing tool output, continue reasoning until you give your final answer.\n\n"
-        )
+        # Intent classification for spam filtering / request routing. No guidance
+        # is injected — the head learned these labels from training data.
+        _label, _idx, _conf = self.classify_input(prompt)
+        if _label == "spam":
+            # Short-circuit obvious spam without generating a full response.
+            _spam_msg = "I don't respond to spam or unsolicited promotional messages."
+            self.history.append((prompt, _spam_msg))
+            return "", _spam_msg
+        if _label == "request":
+            self.pending_requests.append({"prompt": prompt, "confidence": _conf})
 
-        conversation_context = system_instructions
+        # Qwen HF model: route to the isolated chat-templated solve path so the
+        # custom-model ### Instruction:/### Response: framing is never injected.
+        if getattr(self.model, "is_qwen", False):
+            return self._solve_qwen(prompt)
+
+        # No behavioral guidance is injected into the prompt. The model's own
+        # training (CoT/answer format baked into ashen_gpt_trainer.py) governs
+        # how it responds. Only the structural ### Instruction:/### Response:
+        # framing the checkpoint was trained on, plus the closing </think> that
+        # keeps the answer OUTSIDE the chain-of-thought, are preserved.
+        conversation_context = ""
         for h_user, h_resp in self.history[-2:]:
             conversation_context += f"### Instruction:\n{h_user}\n\n### Response:\n{h_resp}\n\n"
 
-        # Make CoT explicitly relevant to the current prompt
-        cot_instruction = (
-            f"IMPORTANT: Your <think> chain-of-thought must be directly relevant to the user's prompt: \"{prompt}\". "
-            "Analyze intent, keywords, and required knowledge first. "
-            "After closing </think>, generate the final user-facing response that directly answers the prompt.\n\n"
-        )
-        current_prompt = f"{conversation_context}{cot_instruction}### Instruction:\n{prompt}\n\n### Response:\n<think>\n"
-        
+        current_prompt = f"{conversation_context}### Instruction:\n{prompt}\n\n### Response:\n</think>"
+        # Auto Swarm+Council: silently enrich every turn (opt-in via settings) so
+        # the loaded model's own CoT/answer are biased by multi-agent deliberation.
+        if getattr(self, 'auto_swarm_council', False):
+            try:
+                _enrich = enrich_prompt_with_swarm_council(prompt)
+                if _enrich:
+                    current_prompt = f"{conversation_context}### Instruction:\n{prompt}\n\n### Multi-Agent Deliberation (consult before answering):\n{_enrich}### Response:\n<think>\n"
+            except Exception as e:
+                print(f"[Auto Swarm+Council] enrichment skipped: {e}", flush=True)
+        # Auto Web Research: silently gather cited sources before answering (opt-in)
+        if getattr(self, 'auto_web_research', False):
+            try:
+                _wr = gather_web_research(prompt)
+                if _wr:
+                    current_prompt = current_prompt.replace(
+                        "### Response:\n<think>\n",
+                        f"### Web Research (already gathered — ground your answer in these and cite as [n]):\n{_wr}\n\n### Response:\n<think>\n", 1)
+            except Exception as e:
+                print(f"[Auto Web Research] skipped: {e}", flush=True)
+
         all_thoughts = []
         tool_observations = []
         final_answer = ""
@@ -1308,34 +1521,22 @@ class AshenAIAgenticEngine:
         if not final_answer:
             final_answer = remainder
 
-        if user_wants_code(prompt):
-            clean_final = final_answer
-        else:
-            clean_final = filter_code_output(final_answer)
-
         combined_thought = "\n--- Ashen AI Reasoning Step ---\n".join(all_thoughts)
         if tool_observations:
             combined_thought += "\n\n--- Ashen AI Tool Telemetry ---\n" + "\n".join(tool_observations)
 
-        # --- FIX: ensure CoT is relevant and response is non-empty ---
-        thought_is_gibberish = _is_gibberish(combined_thought, prompt)
-        response_is_gibberish = _is_gibberish(clean_final, prompt) or len(clean_final.strip()) < 12 or clean_final.strip() == remainder.strip() == ""
-        # final_answer empty or only whitespace counts as failure
-        if not clean_final.strip() or response_is_gibberish or thought_is_gibberish:
-            synth_thought, synth_response = _synthesize_relevant_cot_and_response(prompt, combined_thought, clean_final)
-            # replace gibberish CoT with relevant one (do not append gibberish tail)
-            if thought_is_gibberish:
-                combined_thought = synth_thought
-            if response_is_gibberish or not clean_final.strip():
-                clean_final = synth_response
-                # ensure thought notes that proper response follows CoT
-                if "After CoT" not in combined_thought and "After closing" not in combined_thought:
-                    combined_thought += "\n\n[After CoT: generated proper user-facing response directly addressing the prompt.]"
-            # log gibberish fix for self-improvement dashboard
-            if thought_is_gibberish or response_is_gibberish or not clean_final.strip():
-                try:
-                    _append_improvement({'type': 'gibberish_fix', 'prompt': prompt[:80], 'stats_delta': {'gibberish_fixes': 1}}, suggestion=None)
-                except: pass
+        # Raw model checkpoint output flows directly to CoT + Response. The
+        # model's own training (including the in-data CoT/answer guidance baked
+        # into ashen_gpt_trainer.py) governs how it responds; we do not apply any
+        # runtime synthesis or gibberish filter. (Empty output falls through to "")
+        clean_final = final_answer.strip()
+
+        _seen, _collected_sources = set(), []
+        for _s in getattr(self, '_source_harvest', []):
+            _u = _s.get('url')
+            if _u and _u not in _seen:
+                _seen.add(_u); _collected_sources.append(_s)
+        self.last_sources = _collected_sources
 
         self.history.append((prompt, f"<think>\n{combined_thought}\n</think>\n{clean_final}"))
 
@@ -1348,53 +1549,71 @@ class AshenAIAgenticEngine:
         Caller is responsible for merging chunks into final combined_thought/clean_final.
         """
         self.model.eval()
-        persona_instructions = {
-            "ashen_ai_agent": "You are Ashen AI, an advanced cybernetic local AI assistant with tool execution capabilities.\n",
-            "code_architect": "You are Ashen AI Code Architect, specializing in high-performance PyTorch, Python, and web engineering.\n",
-            "cyber_companion": "You are Ashen AI Companion, a razor-sharp cyberpunk assistant with a witty, direct edge.\n"
-        }
-        base_inst = persona_instructions.get(self.persona, persona_instructions["ashen_ai_agent"])
-        workspace_context_block = ""
-        if self.workspace_context:
-            workspace_context_block = f"\n### Current Workspace Context\n{self.workspace_context}\n\n"
-        system_instructions = (
-            base_inst +
-            workspace_context_block +
-            "Available tools:\n"
-            "- read_file(file_path='...')\n"
-            "- write_file(file_path='...', content='...')\n"
-            "- glob(pattern='...')\n"
-            "- grep_search(pattern='...')\n"
-            "- run_shell_command(command='...')\n"
-            "- web_search(query='...')\n"
-            "- browse_url(url='...')\n"
-            "- deep_research(topic='...', max_searches=3)\n"
-            "- run_benchmark()\n"
-            "To use a tool, output: [TOOL: tool_name(arg1=val1, arg2=val2)]\n"
-            "After observing tool output, continue reasoning until you give your final answer.\n\n"
-        )
-        conversation_context = system_instructions
+        self._source_harvest = []  # reset per-turn source harvesting
+        # Intent classification for spam filtering / request routing.
+        _label, _idx, _conf = self.classify_input(prompt)
+        if _label == "spam":
+            _spam_msg = "I don't respond to spam or unsolicited promotional messages."
+            self.history.append((prompt, _spam_msg))
+            yield {"type": "done", "thought": "", "response": _spam_msg,
+                   "model": os.path.basename(current_model_filename),
+                   "model_path": current_model_filename, "sources": [],
+                   "intent": self.last_intent}
+            return
+        if _label == "request":
+            self.pending_requests.append({"prompt": prompt, "confidence": _conf})
+
+        # Qwen HF model: route to the isolated chat-templated streaming solve path.
+        if getattr(self.model, "is_qwen", False):
+            yield from self._solve_qwen_stream(prompt)
+            return
+
+        # No behavioral guidance is injected into the prompt. The model's own
+        # training (CoT/answer format baked into ashen_gpt_trainer.py) governs
+        # how it responds. Only the structural ### Instruction:/### Response:
+        # framing the checkpoint was trained on, plus the closing </think> that
+        # keeps the answer OUTSIDE the chain-of-thought, are preserved.
+        conversation_context = ""
         for h_user, h_resp in self.history[-2:]:
             conversation_context += f"### Instruction:\n{h_user}\n\n### Response:\n{h_resp}\n\n"
-        cot_instruction = (
-            f"IMPORTANT: Your <think> chain-of-thought must be directly relevant to the user's prompt: \"{prompt}\". "
-            "Analyze intent, keywords, and required knowledge first. "
-            "After closing </think>, generate the final user-facing response that directly answers the prompt.\n\n"
-        )
-        current_prompt = f"{conversation_context}{cot_instruction}### Instruction:\n{prompt}\n\n### Response:\n<think>\n"
+        current_prompt = f"{conversation_context}### Instruction:\n{prompt}\n\n### Response:\n</think>\n"
+        # Auto Swarm+Council: silently enrich every turn (opt-in via settings) so
+        # the loaded model's own CoT/answer are biased by multi-agent deliberation.
+        if getattr(self, 'auto_swarm_council', False):
+            try:
+                _enrich = enrich_prompt_with_swarm_council(prompt)
+                if _enrich:
+                    current_prompt = f"{conversation_context}### Instruction:\n{prompt}\n\n### Multi-Agent Deliberation (consult before answering):\n{_enrich}### Response:\n<think>\n"
+            except Exception as e:
+                print(f"[Auto Swarm+Council] enrichment skipped: {e}", flush=True)
+        # Auto Web Research: silently gather cited sources before answering (opt-in)
+        if getattr(self, 'auto_web_research', False):
+            try:
+                _wr = gather_web_research(prompt)
+                if _wr:
+                    current_prompt = current_prompt.replace(
+                        "### Response:\n<think>\n",
+                        f"### Web Research (already gathered — ground your answer in these and cite as [n]):\n{_wr}\n\n### Response:\n<think>\n", 1)
+            except Exception as e:
+                print(f"[Auto Web Research] skipped: {e}", flush=True)
         all_thoughts = []
         tool_observations = []
         final_answer = ""
         remainder = ""
-        # stream each agentic step token-by-token
+        # The model's own training (in-data CoT/answer guidance baked into
+        # ashen_gpt_trainer.py) governs how it responds; no runtime synthesis
+        # or gibberish filter. Stream the model's OWN raw tokens live.
+        all_thoughts = []
         for step in range(self.max_steps):
             encoded = self.encode(current_prompt)
             if len(encoded) > self.context_length:
                 encoded = encoded[-self.context_length:]
             input_ids = torch.tensor([encoded], dtype=torch.long, device=device)
-            # true token streaming
+            # true token streaming — show the model's OWN tokens live
             acc = ""
             saw_close = False
+            thought_sent = 0   # chars of acc already streamed as thought
+            resp_sent = 0      # chars of acc already streamed as response
             for full_index, tok_id in self.model.generate_stream(
                 input_ids, max_new_tokens=self.max_new_tokens,
                 current_block_size=self.context_length, temperature=self.temperature, top_k=self.top_k
@@ -1406,26 +1625,37 @@ class AshenAIAgenticEngine:
                 if not chunk:
                     continue
                 acc += chunk
-                # decide phase by whether we've seen the close tag in streamed acc
-                if not saw_close and "</think>" not in acc:
-                    yield {"type": "thought_delta", "chunk": chunk, "step": step}
-                elif not saw_close and "</think>" in acc:
-                    # closing tag just appeared — split: send remaining thought tail then switch
-                    before_close, after_close = acc.split("</think>", 1)
-                    # we already sent chunks for before_close incrementally; now signal close
-                    # send any tail after close as response
-                    saw_close = True
-                    if after_close:
-                        yield {"type": "thought_done", "step": step}
-                        if after_close.strip():
-                            yield {"type": "response_delta", "chunk": after_close, "step": step}
+                # Phase by the </think> tag: stream raw thought tokens, then raw
+                # response tokens. No synthetic substitution of real output.
+                if not saw_close:
+                    if "</think>" in acc:
+                        saw_close = True
+                        before, after = acc.split("</think>", 1)
+                        new_thought = before[thought_sent:]
+                        if new_thought:
+                            yield {"type": "thought_delta", "chunk": new_thought, "synth": False, "step": step}
+                        thought_sent = len(before)
+                        yield {"type": "thought_done", "synth": False, "step": step}
+                        if after.strip():
+                            yield {"type": "response_delta", "chunk": after, "synth": False, "step": step}
+                            resp_sent = len(after)
                     else:
-                        yield {"type": "thought_done", "step": step}
-                elif saw_close:
-                    yield {"type": "response_delta", "chunk": chunk, "step": step}
-                # also handle tool delimiter live: if we see "[TOOL:" appear in acc, hint
-                if "[TOOL:" in acc and "tool_start" not in acc:
-                    pass
+                        new_thought = acc[thought_sent:]
+                        if new_thought:
+                            yield {"type": "thought_delta", "chunk": new_thought, "synth": False, "step": step}
+                        thought_sent = len(acc)
+                else:
+                    new_resp = acc[resp_sent:]
+                    if new_resp:
+                        yield {"type": "response_delta", "chunk": new_resp, "synth": False, "step": step}
+                    resp_sent = len(acc)
+            # Model never emitted a </think> — treat all generated text as CoT.
+            if not saw_close:
+                new_thought = acc[thought_sent:]
+                if new_thought:
+                    yield {"type": "thought_delta", "chunk": new_thought, "synth": False, "step": step}
+                yield {"type": "thought_done", "synth": False, "step": step}
+
             # after token loop, we have full acc for this step
             raw_generated = self.decode(full_index[0].tolist())
             if raw_generated.startswith(current_prompt):
@@ -1462,41 +1692,104 @@ class AshenAIAgenticEngine:
                 break
         if not final_answer:
             final_answer = remainder
-        if user_wants_code(prompt):
-            clean_final = final_answer
-        else:
-            clean_final = filter_code_output(final_answer)
         combined_thought = "\n--- Ashen AI Reasoning Step ---\n".join(all_thoughts)
         if tool_observations:
             combined_thought += "\n\n--- Ashen AI Tool Telemetry ---\n" + "\n".join(tool_observations)
-        thought_is_gibberish = _is_gibberish(combined_thought, prompt)
-        response_is_gibberish = _is_gibberish(clean_final, prompt) or len(clean_final.strip()) < 12
-        if not clean_final.strip() or response_is_gibberish or thought_is_gibberish:
-            synth_thought, synth_response = _synthesize_relevant_cot_and_response(prompt, combined_thought, clean_final)
-            if thought_is_gibberish:
-                # re-stream synthesized thought as if live (chunked)
-                for ch in [synth_thought[i:i+42] for i in range(0, len(synth_thought), 42)]:
-                    yield {"type": "thought_delta", "chunk": ch, "synth": True}
-                combined_thought = synth_thought
-                yield {"type": "thought_done", "synth": True}
-            if response_is_gibberish or not clean_final.strip():
-                for ch in [synth_response[i:i+42] for i in range(0, len(synth_response), 42)]:
-                    yield {"type": "response_delta", "chunk": ch, "synth": True}
-                clean_final = synth_response
-                if "After CoT" not in combined_thought and "After closing" not in combined_thought:
-                    combined_thought += "\n\n[After CoT: generated proper user-facing response directly addressing the prompt.]"
-                yield {"type": "response_done", "synth": True}
-            if thought_is_gibberish or response_is_gibberish or not clean_final.strip():
-                try:
-                    _append_improvement({'type': 'gibberish_fix', 'prompt': prompt[:80], 'stats_delta': {'gibberish_fixes': 1}}, suggestion=None)
-                except: pass
+        # Raw model output already streamed live. The model's own training
+        # (in-data CoT/answer guidance baked into ashen_gpt_trainer.py) governs
+        # behavior; no runtime synthesis or gibberish filter is applied.
+        clean_final = final_answer.strip()
+        _seen, _collected_sources = set(), []
+        for _s in getattr(self, '_source_harvest', []):
+            _u = _s.get('url')
+            if _u and _u not in _seen:
+                _seen.add(_u); _collected_sources.append(_s)
+        self.last_sources = _collected_sources
         self.history.append((prompt, f"<think>\n{combined_thought}\n</think>\n{clean_final}"))
-        yield {"type": "done", "thought": combined_thought, "response": clean_final, "model": os.path.basename(current_model_filename), "model_path": current_model_filename}
+        yield {"type": "done", "thought": combined_thought, "response": clean_final, "model": os.path.basename(current_model_filename), "model_path": current_model_filename, "sources": _collected_sources, "intent": self.last_intent}
 
 reasoner = AshenAIAgenticEngine(m, decode, encode, device)
 
 # Track which session the reasoner belongs to
 reasoner.session_id = None
+
+def enrich_prompt_with_swarm_council(prompt, max_chars=1400, timeout=75):
+    """Silently run a lightweight Swarm + Council and return a consolidated
+    synthesis to bias the main model's own CoT/answer. Kept small (2 agents /
+    2 drafts / 2 critics) so normal turns stay usable. Returns '' on any failure
+    or timeout so callers can safely no-op. Runs the heavy work in a worker
+    thread with a hard timeout so the user's main turn never hangs on it."""
+    import concurrent.futures as _cf
+    def _work():
+        swarm_syn = ""
+        try:
+            swarm = _run_swarm(prompt, num_agents=2, mode="divide")
+            if swarm:
+                swarm_syn = (swarm.get("synthesis") or {}).get("response", "")
+        except Exception as e:
+            print(f"[Auto Swarm+Council] swarm skipped: {e}", flush=True)
+        council_final = ""
+        try:
+            council = _run_council(prompt, num_drafts=2, num_critics=2)
+            if council:
+                council_final = (council.get("final") or {}).get("response", "")
+        except Exception as e:
+            print(f"[Auto Swarm+Council] council skipped: {e}", flush=True)
+        parts = []
+        if swarm_syn.strip():
+            parts.append("### Multi-Agent Swarm Synthesis (2 agents)\n" + swarm_syn.strip())
+        if council_final.strip():
+            parts.append("### Council Final Answer (2 drafts · 2 critics)\n" + council_final.strip())
+        if not parts:
+            return ""
+        block = "\n\n".join(parts)
+        if len(block) > max_chars:
+            block = block[:max_chars].rstrip() + "\n…"
+        return (
+            "The following multi-agent deliberation (Swarm + Council) has already "
+            "analyzed this request. Use it to ground and improve YOUR chain-of-thought "
+            "and final answer — adopt its strong points, reconcile disagreements, and "
+            "deliver the best consolidated response.\n\n" + block + "\n\n"
+        )
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_work)
+            return fut.result(timeout=timeout)
+    except _cf.TimeoutError:
+        print(f"[Auto Swarm+Council] enrichment timed out after {timeout}s — using plain prompt.", flush=True)
+        return ""
+    except Exception as e:
+        print(f"[Auto Swarm+Council] enrichment error: {e}", flush=True)
+        return ""
+
+def gather_web_research(prompt, max_searches=3, timeout=75):
+    """Autonomously gather real, sourced findings for a prompt by running the
+    deep_research tool, and return a consolidated brief to inject into the main
+    prompt. Also seeds reasoner._source_harvest so the final 'Sources:' list is
+    populated. Returns '' on any failure/timeout so callers can safely no-op.
+    Heavy work runs in a worker thread with a hard timeout so the turn never hangs."""
+    import concurrent.futures as _cf
+    def _work():
+        report = ""
+        try:
+            report = reasoner.execute_tool('deep_research', {'topic': prompt, 'max_searches': max_searches})
+        except Exception as e:
+            print(f"[Auto Web Research] deep_research failed: {e}", flush=True)
+        if not report or report.startswith("Research failed") or report.startswith("Deep research error"):
+            try:
+                report = reasoner.execute_tool('web_search', {'query': prompt}) or ""
+            except Exception as e:
+                print(f"[Auto Web Research] web_search failed: {e}", flush=True)
+        return report or ""
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as ex:
+            return ex.submit(_work).result(timeout=timeout)
+    except _cf.TimeoutError:
+        print(f"[Auto Web Research] timed out after {timeout}s — using model's own knowledge.", flush=True)
+        return ""
+    except Exception as e:
+        print(f"[Auto Web Research] error: {e}", flush=True)
+        return ""
 
 # --- Swarm: spawn multiple subagents from selected model ---
 import threading as _swarm_threading
@@ -1613,11 +1906,11 @@ def _run_swarm(task, num_agents=3, mode="parallel"):
         synthesis_response = f"Swarm synthesis failed ({e}), falling back to best draft:\n\n{drafts[:1500]}"
         synthesis_thought += f"\nSynthesis error: {e}"
 
-    # Fallback if synthesis empty/gibberish
-    if _is_gibberish(synthesis_response, task):
-        # pick longest non-gibberish draft as fallback
+    # Fallback if swarm synthesis produced nothing usable
+    if not synthesis_response.strip():
+        # pick longest non-empty draft as fallback
         best = max(agents, key=lambda a: len(a['response']))
-        if not _is_gibberish(best['response'], task):
+        if best['response'].strip():
             synthesis_response = f"**Swarm synthesis (fallback to {best['role']}):**\n\n{best['response']}\n\n*All drafts considered — see individual agents above.*"
             synthesis_thought += f"\n[Fallback to {best['role']} draft]"
 
@@ -1687,7 +1980,7 @@ def _run_council(task, num_drafts=3, num_critics=3):
     critics = []
     # heuristic scoring fallback if model output can't be parsed
     def _heuristic_score(text, prompt):
-        if _is_gibberish(text, prompt): return 3
+        if not text.strip(): return 3
         # keyword overlap + length
         p_words = set(re.findall(r'[a-z]{3,}', prompt.lower()))
         t_words = set(re.findall(r'[a-z]{3,}', text.lower()))
@@ -1808,7 +2101,7 @@ def _run_council(task, num_drafts=3, num_critics=3):
             final_thought = f"Council finalizer error: {e}"
             final_response = winner['response'] + f"\n\n[Council revision failed: {e}]"
 
-    if _is_gibberish(final_response, task):
+    if not final_response.strip():
         # fallback to winner + suggestions appended
         final_response = winner['response'] + "\n\n**Council refinements applied:**\n" + suggestions_block
         final_thought = winner['thought'] + f"\n\n[Council synthesis fallback — winner {winner['role']} + critiques]"
@@ -2169,6 +2462,34 @@ HTML_PAGE = r"""<!DOCTYPE html>
                         </label>
                     </div>
                     <div class="text-slate-500 text-[10px] mt-2">Header button 🧠 CoT toggles this without opening Settings. Persists to <code class="text-cyan-300">settings.json</code> as <code class="text-cyan-300">show_chain_of_thought</code>.</div>
+                </div>
+
+                <!-- Auto Swarm + Council enrichment -->
+                <div class="pt-4 border-t border-slate-800">
+                    <h3 class="text-sm font-semibold text-cyan-300 mb-3 flex items-center gap-2">
+                        <span class="inline-block w-2 h-2 rounded-full bg-cyan-400"></span>
+                        🐝 Auto Swarm + Council
+                    </h3>
+                    <div class="flex items-center justify-between p-3 bg-slate-950/50 rounded-lg border border-slate-800">
+                        <div>
+                            <div class="text-slate-300 font-medium">Enrich every turn with Swarm + Council</div>
+                            <div class="text-slate-500 text-[10px]">Silently consults a lightweight multi-agent swarm (2 agents) + council (2 drafts · 2 critics) before each reply, biasing the model's chain-of-thought and answer. Increases latency significantly — off by default.</div>
+                        </div>
+                        <label class="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" id="setting-auto-swarm-council" class="sr-only peer">
+                            <div class="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-600"></div>
+                        </label>
+                    </div>
+                    <div class="flex items-center justify-between p-3 bg-slate-950/50 rounded-lg border border-slate-800">
+                        <div>
+                            <div class="text-slate-300 font-medium">🌐 Auto Web Research + Sources</div>
+                            <div class="text-slate-500 text-[10px]">Before each reply, runs an autonomous web/deep-research pass and feeds the findings to the model so it answers from real, cited sources. Shows a Sources list under the answer. Off by default.</div>
+                        </div>
+                        <label class="relative inline-flex items-center cursor-pointer">
+                            <input type="checkbox" id="setting-auto-web-research" class="sr-only peer">
+                            <div class="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-600"></div>
+                        </label>
+                    </div>
                 </div>
 
                 <div class="pt-4 flex justify-end space-x-3 border-t border-slate-800">
@@ -2769,10 +3090,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     const d=finalData;
                     if(statusEl) statusEl.textContent='Swarm done — '+d.num_agents+'×'+d.mode+' via '+d.model;
                     // finalize synthesis with full CoT header
-                    const thoughtHtml = d.synthesis.thought ? '<details open class="group bg-slate-950/90 rounded border border-orange-900/50 overflow-hidden"><summary class="px-3 py-2 text-[11px] font-bold text-orange-300 cursor-pointer hover:bg-slate-900 flex justify-between"><span>🧠 Synthesis CoT — '+d.model+'</span><span class="text-orange-500 group-open:rotate-180">▼</span></summary><pre class="p-3 text-[11px] text-slate-300 font-mono whitespace-pre-wrap bg-[#0a0a14] max-h-52 overflow-y-auto">'+String(d.synthesis.thought).replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</pre></details>' : '';
+                    const thoughtHtml = d.synthesis.thought ? '<details class="group bg-slate-950/90 rounded border border-orange-900/50 overflow-hidden"><summary class="px-3 py-2 text-[11px] font-bold text-orange-300 cursor-pointer hover:bg-slate-900 flex justify-between"><span>🧠 Thought for '+d.model+'</span><span class="text-orange-500 group-open:rotate-180">▾</span></summary><pre class="p-3 text-[11px] text-slate-300 font-mono whitespace-pre-wrap bg-[#0a0a14] max-h-52 overflow-y-auto">'+String(d.synthesis.thought).replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</pre></details>' : '';
                     let respHtml=''; try{ respHtml = typeof marked!=='undefined' && marked.parse ? marked.parse(d.synthesis.response) : String(d.synthesis.response).replace(/</g,'&lt;').replace(/\n/g,'<br>'); }catch(e){ respHtml=String(d.synthesis.response).replace(/</g,'&lt;').replace(/\n/g,'<br>'); }
                     synEl.innerHTML = thoughtHtml+'<div class="prose prose-invert max-w-none text-xs text-slate-200">'+respHtml+'</div><div class="text-[10px] text-slate-500 font-mono">◈ '+d.model+' <button onclick="appendMessage(\'assistant\',\''+String(d.synthesis.thought).replace(/`/g,'').replace(/"/g,'&quot;').slice(0,500)+'\',\''+String(d.synthesis.response).replace(/`/g,'').replace(/"/g,'&quot;').slice(0,800)+'\',\''+d.model+'\'); document.getElementById(\'swarm-modal\').classList.add(\'hidden\')" class="ml-2 px-2 py-0.5 bg-orange-950 hover:bg-orange-900 text-orange-300 rounded border border-orange-800/50">→ Chat</button> <button onclick="navigator.clipboard.writeText(\''+String(d.synthesis.response).replace(/`/g,'').replace(/"/g,'&quot;').slice(0,2000)+'\')" class="ml-1 px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded">Copy</button></div>';
                     appendMessage('assistant', d.synthesis.thought, d.synthesis.response, d.model);
+                    _addUseAsPrompt(synEl, d.synthesis.response);
                 }
             }catch(e){
                 // fallback to non-stream
@@ -2783,12 +3105,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     if(d.status==='success'){
                         if(statusEl) statusEl.textContent='Swarm done in '+d.elapsed_s+'s — '+d.num_agents+'×'+d.mode+' via '+d.model;
                         const synEl2=document.getElementById('swarm-synthesis');
-                        const thoughtHtml = d.synthesis.thought ? '<details class="group bg-slate-950/90 rounded border border-orange-900/50 overflow-hidden"><summary class="px-3 py-2 text-[11px] font-bold text-orange-300 cursor-pointer hover:bg-slate-900 flex justify-between"><span>🧠 Synthesis CoT — '+d.model+'</span><span class="text-orange-500 group-open:rotate-180">▼</span></summary><pre class="p-3 text-[11px] text-slate-300 font-mono whitespace-pre-wrap bg-[#0a0a14] max-h-52 overflow-y-auto">'+String(d.synthesis.thought).replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</pre></details>' : '';
+                        const thoughtHtml = d.synthesis.thought ? '<details class="group bg-slate-950/90 rounded border border-orange-900/50 overflow-hidden"><summary class="px-3 py-2 text-[11px] font-bold text-orange-300 cursor-pointer hover:bg-slate-900 flex justify-between"><span>🧠 Thought for '+d.model+'</span><span class="text-orange-500 group-open:rotate-180">▾</span></summary><pre class="p-3 text-[11px] text-slate-300 font-mono whitespace-pre-wrap bg-[#0a0a14] max-h-52 overflow-y-auto">'+String(d.synthesis.thought).replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</pre></details>' : '';
                         let respHtml=''; try{ respHtml = typeof marked!=='undefined' && marked.parse ? marked.parse(d.synthesis.response) : String(d.synthesis.response).replace(/</g,'&lt;').replace(/\n/g,'<br>'); }catch(e){ respHtml=String(d.synthesis.response).replace(/</g,'&lt;').replace(/\n/g,'<br>'); }
                         synEl2.innerHTML = thoughtHtml+'<div class="prose prose-invert max-w-none text-xs text-slate-200">'+respHtml+'</div><div class="text-[10px] text-slate-500 font-mono">◈ '+d.model+' · '+d.elapsed_s+'s</div>';
                         const agentsEl2=document.getElementById('swarm-agents');
                         agentsEl2.innerHTML = d.agents.map(a=>{ let aHtml=''; try{ aHtml = typeof marked!=='undefined' && marked.parse ? marked.parse(a.response) : String(a.response).replace(/</g,'&lt;').replace(/\n/g,'<br>'); }catch(e){ aHtml=String(a.response).replace(/</g,'&lt;').replace(/\n/g,'<br>'); } return '<div class="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-2"><div class="flex justify-between items-center"><span class="text-xs font-bold text-amber-300">Agent '+a.id+' — '+a.role+'</span><span class="text-[10px] text-slate-500">'+a.model+'</span></div><details class="bg-slate-900/50 rounded border border-slate-800"><summary class="px-2 py-1 text-[10px] text-slate-400 cursor-pointer">CoT</summary><pre class="p-2 text-[11px] text-slate-400 font-mono whitespace-pre-wrap max-h-32 overflow-y-auto">'+String(a.thought).replace(/</g,'&lt;').replace(/>/g,'&gt;').slice(0,800)+'</pre></details><div class="prose prose-invert max-w-none text-xs text-slate-300">'+aHtml.slice(0,1200)+'</div></div>'; }).join('');
                         appendMessage('assistant', d.synthesis.thought, d.synthesis.response, d.model);
+                        _addUseAsPrompt(synEl2, d.synthesis.response);
                     }
                 }catch(e2){ if(statusEl) statusEl.textContent='✗ '+e2; }
             }
@@ -2901,7 +3224,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 if(finalData){
                     const d=finalData;
                     if(statusEl) statusEl.textContent='done — winner Draft '+d.winner.id+' ('+d.winner.role+') · votes '+JSON.stringify(d.tally);
-                    const thoughtHtml = d.final.thought ? '<details open class="group bg-slate-950/90 rounded border border-violet-900/50 overflow-hidden"><summary class="px-3 py-2 text-[11px] font-bold text-violet-300 cursor-pointer hover:bg-slate-900 flex justify-between"><span>Final CoT — revised winner '+d.winner.role+'</span><span class="text-violet-500 group-open:rotate-180">V</span></summary><pre class="p-3 text-[11px] text-slate-300 font-mono whitespace-pre-wrap bg-[#0a0a14] max-h-52 overflow-y-auto">'+String(d.final.thought).replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</pre></details>' : '';
+                    const thoughtHtml = d.final.thought ? '<details class="group bg-slate-950/90 rounded border border-violet-900/50 overflow-hidden"><summary class="px-3 py-2 text-[11px] font-bold text-violet-300 cursor-pointer hover:bg-slate-900 flex justify-between"><span>🧠 Thought for '+d.model+'</span><span class="text-violet-500 group-open:rotate-180">▾</span></summary><pre class="p-3 text-[11px] text-slate-300 font-mono whitespace-pre-wrap bg-[#0a0a14] max-h-52 overflow-y-auto">'+String(d.final.thought).replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</pre></details>' : '';
                     let respHtml=''; try{ respHtml = typeof marked!=='undefined' && marked.parse ? marked.parse(d.final.response) : String(d.final.response).replace(/</g,'&lt;').replace(/\n/g,'<br>'); }catch(e){ respHtml=String(d.final.response).replace(/</g,'&lt;').replace(/\n/g,'<br>'); }
                     finalEl.innerHTML = thoughtHtml+'<div class="prose prose-invert max-w-none text-xs text-slate-200">'+respHtml+'</div><div class="text-[10px] text-slate-500 font-mono"> '+d.model+' · winner Draft '+d.winner.id+' ('+d.winner.role+') <button onclick="appendMessage(\'assistant\',\''+String(d.final.thought).replace(/`/g,'').replace(/"/g,'&quot;').slice(0,500)+'\',\''+String(d.final.response).replace(/`/g,'').replace(/"/g,'&quot;').slice(0,800)+'\',\''+d.model+'\'); document.getElementById(\'council-modal\').classList.add(\'hidden\')" class="ml-2 px-2 py-0.5 bg-violet-950 hover:bg-violet-900 text-violet-300 rounded border border-violet-800/50">to Chat</button> <button onclick="navigator.clipboard.writeText(\''+String(d.final.response).replace(/`/g,'').replace(/"/g,'&quot;').slice(0,2000)+'\')" class="ml-1 px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded">Copy</button></div><div class="mt-2 bg-violet-950/30 border border-violet-900/40 rounded p-2 text-[11px] text-violet-200"><div class="font-bold text-violet-300 text-[10px] uppercase tracking-wider">Applied suggestions</div>'+(d.suggestions.map(s=>'<div>· '+String(s).replace(/</g,'&lt;')+'</div>').join('')||'<div class="text-slate-500">none</div>')+'</div>';
                     // refresh drafts/critics with winner highlight
@@ -2915,6 +3238,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     // highlight winner draft border
                     for(const dr of d.drafts){ const el=document.getElementById('council-draft-'+dr.id); if(el && dr.id===d.winner.id){ el.classList.remove('border-slate-800'); el.classList.add('border-violet-500/50','shadow-[0_0_12px_rgba(139,92,246,0.15)]'); } }
                     appendMessage('assistant', d.final.thought, d.final.response, d.model);
+                    _addUseAsPrompt(finalEl, d.final.response);
                 }
             }catch(e){
                 if(statusEl) statusEl.textContent='Stream failed, falling back… '+e;
@@ -2923,10 +3247,11 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     const d=await r2.json();
                     if(d.status==='success'){
                         if(statusEl) statusEl.textContent='done in '+d.elapsed_s+'s — winner Draft '+d.winner.id+' ('+d.winner.role+') · votes '+JSON.stringify(d.tally);
-                        const thoughtHtml = d.final.thought ? '<details open class="group bg-slate-950/90 rounded border border-violet-900/50 overflow-hidden"><summary class="px-3 py-2 text-[11px] font-bold text-violet-300 cursor-pointer hover:bg-slate-900 flex justify-between"><span>Final CoT — revised winner '+d.winner.role+'</span><span class="text-violet-500 group-open:rotate-180">V</span></summary><pre class="p-3 text-[11px] text-slate-300 font-mono whitespace-pre-wrap bg-[#0a0a14] max-h-52 overflow-y-auto">'+String(d.final.thought).replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</pre></details>' : '';
+                        const thoughtHtml = d.final.thought ? '<details class="group bg-slate-950/90 rounded border border-violet-900/50 overflow-hidden"><summary class="px-3 py-2 text-[11px] font-bold text-violet-300 cursor-pointer hover:bg-slate-900 flex justify-between"><span>🧠 Thought for '+d.model+'</span><span class="text-violet-500 group-open:rotate-180">▾</span></summary><pre class="p-3 text-[11px] text-slate-300 font-mono whitespace-pre-wrap bg-[#0a0a14] max-h-52 overflow-y-auto">'+String(d.final.thought).replace(/</g,'&lt;').replace(/>/g,'&gt;')+'</pre></details>' : '';
                         let respHtml=''; try{ respHtml = typeof marked!=='undefined' && marked.parse ? marked.parse(d.final.response) : String(d.final.response).replace(/</g,'&lt;').replace(/\n/g,'<br>'); }catch(e){ respHtml=String(d.final.response).replace(/</g,'&lt;').replace(/\n/g,'<br>'); }
                         finalEl.innerHTML = thoughtHtml+'<div class="prose prose-invert max-w-none text-xs text-slate-200">'+respHtml+'</div>';
                         appendMessage('assistant', d.final.thought, d.final.response, d.model);
+                        _addUseAsPrompt(finalEl, d.final.response);
                     }
                 }catch(e2){ if(statusEl) statusEl.textContent='✗ '+e2; }
             }
@@ -2953,9 +3278,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
             }
             const modelLabel = window.currentModelFilename?.split('/').pop()?.split('\\').pop() || 'selected model';
             const cotHidden = window.showChainOfThought === false;
+            const _qwenEscape = thoughtText.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+            const _qwenTokens = _qwenEscape.split(/\s+/).filter(Boolean).length;
+            // workaround: use String split without regex to avoid \s escaping issues in Python raw string: use split(' ') approximate
+            const _tok2 = thoughtText.trim().split(' ').filter(Boolean).length;
             const cotHtml = thoughtText && !cotHidden
-                ? `<details open class="group bg-slate-950/90 rounded-lg border border-cyan-900/60 overflow-hidden mb-2"><summary class="px-3 py-2 text-[11px] font-bold text-cyan-300 cursor-pointer select-none hover:bg-slate-900 flex items-center justify-between"><span>🧠 Chain-of-Thought — <span class="text-amber-300 font-mono">${modelLabel}</span></span><span class="text-cyan-500 group-open:rotate-180 transition-transform">▼</span></summary><div class="px-3 py-1 text-[10px] text-slate-500 border-y border-slate-800 bg-slate-900/50">model: ${modelLabel}</div><pre class="p-3 text-[11px] text-slate-300 font-mono whitespace-pre-wrap bg-[#0a0a14] max-h-64 overflow-y-auto">${thoughtText.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</pre></details>`
-                : (thoughtText && cotHidden ? `<div class="text-[10px] text-slate-500 italic mb-2">🧠 Chain-of-Thought hidden (enable via 🧠 CoT)</div>` : '');
+                ? `<details class="group qwen-think bg-[#0f1115] border-l-2 border-amber-700/70 rounded-r-lg overflow-hidden mb-3"><summary class="flex items-center gap-2 px-3 py-2 text-[11px] font-medium text-slate-400 cursor-pointer select-none hover:bg-[#151821] list-none"><span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span><span class="text-slate-300">Thought for ${modelLabel}</span><span class="text-slate-600 font-mono">· ~${_tok2} tokens</span><span class="ml-auto text-slate-600 group-open:rotate-180 transition-transform text-[10px]">▾</span></summary><pre class="px-3.5 py-2.5 text-[11px] leading-[1.65] text-[#8b8d98] font-mono whitespace-pre-wrap bg-transparent max-h-[36vh] overflow-y-auto border-t border-slate-800/40 italic">${_qwenEscape}</pre></details>`
+                : (thoughtText && cotHidden ? `<div class="text-[10px] text-slate-500 italic mb-2 pl-3 border-l-2 border-slate-700">Thought hidden · enable via ❧ CoT</div>` : '');
             return `
                 <div class="flex items-start space-x-4 max-w-4xl">
                     <div class="w-8 h-8 rounded bg-cyan-600/20 border border-cyan-500 flex items-center justify-center font-bold text-xs text-cyan-400 shrink-0 mt-1">Ω</div>
@@ -3214,6 +3543,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
             settings.precision = document.getElementById('setting-precision').value;
             settings.cpu_offload_layers = parseInt(document.getElementById('setting-cpu-offload').value);
             settings.show_chain_of_thought = document.getElementById('setting-show-cot').checked;
+            settings.auto_swarm_council = document.getElementById('setting-auto-swarm-council').checked;
+            settings.auto_web_research = document.getElementById('setting-auto-web-research').checked;
             
             // Also save current model path - guard against template placeholder leaking
             let m = window.currentModelFilename;
@@ -3292,6 +3623,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     btn?.classList.toggle('bg-cyan-950/60', window.showChainOfThought);
                     btn?.classList.toggle('bg-slate-800', !window.showChainOfThought);
                 }
+                // Auto Swarm + Council enrichment
+                if (s.auto_swarm_council !== undefined) setChecked('setting-auto-swarm-council', s.auto_swarm_council);
+                if (s.auto_web_research !== undefined) setChecked('setting-auto-web-research', s.auto_web_research);
                 // sidebar
                 const ctxEl = document.getElementById('sidebar-ctx');
                 const gpuEl = document.getElementById('sidebar-gpu');
@@ -3329,6 +3663,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                             <span class="text-cyan-300 font-bold">${m.name}</span>
                             <span class="text-slate-500 ml-2">(${m.size_mb} MB)</span>
                             <span class="text-slate-600 text-[10px] ml-2 block">${m.path}</span>
+                            ${m.type === 'qwen-hf' ? '<span class="mt-1 inline-block px-1.5 py-0.5 bg-sky-950 text-sky-300 text-[10px] rounded border border-sky-800 ml-1">QWEN</span>' : ''}
                             ${m.active ? '<span class="mt-1 inline-block px-1.5 py-0.5 bg-emerald-950 text-emerald-300 text-[10px] rounded border border-emerald-800">ACTIVE</span>' : ''}
                         </div>
                         ${!m.active ? `<button onclick="setDefaultModel('${m.path.replace(/\\/g, '/')}')" class="px-2.5 py-1 bg-violet-900 hover:bg-violet-800 text-violet-200 rounded text-[11px] transition">SET DEFAULT</button>` : ''}
@@ -3507,7 +3842,64 @@ HTML_PAGE = r"""<!DOCTYPE html>
             sendMessage();
         }
 
-        function appendMessage(sender, thought, text, modelName) {
+        // Load a Swarm/Council result into the prompt box so it becomes the user's
+        // next command/query (editable, ready to send) — instead of auto-posting it.
+        function useAsNextPrompt(text) {
+            const ta = document.getElementById('user-input');
+            if (!ta) return;
+            ta.value = (text || '').trim();
+            ta.focus();
+            ta.dispatchEvent(new Event('input')); // trigger autosize if any
+            ta.scrollIntoView({ block: 'center' });
+            // reveal the chat input by closing the swarm/council modals
+            ['swarm-modal', 'council-modal'].forEach(function (id) {
+                const m = document.getElementById(id);
+                if (m) m.classList.add('hidden');
+            });
+        }
+
+        // Append a "Use as next prompt" button that loads a result into the prompt
+        // box. Built via addEventListener so the full (long) response needs no inline
+        // string escaping.
+        function _addUseAsPrompt(container, text) {
+            if (!container) return;
+            const bar = document.createElement('div');
+            bar.className = 'mt-2';
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'px-2 py-0.5 bg-cyan-950 hover:bg-cyan-900 text-cyan-300 rounded border border-cyan-800/50 text-[10px]';
+            b.textContent = '↳ Use as next prompt';
+            b.addEventListener('click', function () { useAsNextPrompt(text); });
+            bar.appendChild(b);
+            container.appendChild(bar);
+        }
+
+        function renderSources(container, sources) {
+            if (!sources || !sources.length) return;
+            const wrap = document.createElement('div');
+            wrap.className = 'mt-2 pt-2 border-t border-slate-800/50';
+            const head = document.createElement('div');
+            head.className = 'text-[10px] uppercase tracking-wide text-slate-500 mb-1';
+            head.textContent = 'Sources';
+            wrap.appendChild(head);
+            const list = document.createElement('ol');
+            list.className = 'list-decimal list-inside space-y-0.5 text-[11px]';
+            sources.forEach(function(s){
+                const li = document.createElement('li');
+                const a = document.createElement('a');
+                a.href = s.url || '#';
+                a.target = '_blank';
+                a.rel = 'noopener noreferrer';
+                a.className = 'text-cyan-400 hover:text-cyan-300 underline decoration-dotted break-all';
+                a.textContent = s.title || s.url || 'source';
+                li.appendChild(a);
+                list.appendChild(li);
+            });
+            wrap.appendChild(list);
+            container.appendChild(wrap);
+        }
+
+        function appendMessage(sender, thought, text, modelName, sources) {
             const container = document.getElementById('chat-container');
             const isUser = sender === 'user';
             
@@ -3522,23 +3914,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
             contentDiv.className = `rounded-xl p-4 text-xs shadow-lg space-y-3 ${isUser ? 'bg-emerald-950/40 border border-emerald-800/60 text-emerald-100' : 'bg-slate-900/90 border border-indigo-900/60 text-slate-200 w-full'}`;
             
             if (!isUser && thought && window.showChainOfThought !== false) {
+                // Qwen Code CLI style: thinking in a <details> collapsed by default,
+                // labelled "Thought for Xs" with an amber dot (primary content is the response).
                 const modelLabel = modelName || window.currentModelFilename?.split('/').pop()?.split('\\').pop() || 'selected model';
+                const tokCount = String(thought).trim().split(' ').filter(Boolean).length;
                 const thinkDetails = document.createElement('details');
-                thinkDetails.open = true;
-                thinkDetails.className = 'group bg-slate-950/90 rounded-lg border border-cyan-900/60 overflow-hidden';
-                
+                thinkDetails.open = false; // collapsed by default, like Qwen Code CLI
+                thinkDetails.className = 'group qwen-think bg-[#0f1115] border-l-2 border-amber-700/70 rounded-r-lg overflow-hidden';
+                thinkDetails.style.marginBottom = '0.5rem';
+
                 const summary = document.createElement('summary');
-                summary.className = 'px-3 py-2 text-[11px] font-bold text-cyan-300 cursor-pointer select-none hover:bg-slate-900 flex items-center justify-between';
-                summary.innerHTML = `<span>🧠 Chain-of-Thought — <span class="text-amber-300 font-mono">${modelLabel}</span></span><span class="text-cyan-500 group-open:rotate-180 transition-transform">▼</span>`;
-                
+                summary.className = 'flex items-center gap-2 px-3 py-2 text-[11px] font-medium text-slate-400 cursor-pointer select-none hover:bg-[#151821] list-none';
+                summary.innerHTML = `<span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span><span class="text-slate-300">Thought for ${modelLabel}</span><span class="text-slate-600 font-mono">· ~${tokCount} tokens</span><span class="ml-auto text-slate-600 group-open:rotate-180 text-[10px]">▾</span>`;
+
                 const meta = document.createElement('div');
-                meta.className = 'px-3 py-1 text-[10px] text-slate-500 border-b border-slate-800 bg-slate-900/50 flex justify-between';
-                meta.innerHTML = `<span>model: ${modelLabel}</span><span class="text-slate-600">click header to collapse</span>`;
-                
+                meta.className = 'hidden';
+                meta.textContent = '';
+
                 const thinkBody = document.createElement('div');
-                thinkBody.className = 'p-3 text-[11px] text-slate-300 font-mono whitespace-pre-wrap border-t border-indigo-900/50 bg-[#0a0a14] max-h-64 overflow-y-auto';
+                thinkBody.className = 'px-3.5 py-2.5 text-[11px] leading-[1.65] text-[#8b8d98] font-mono whitespace-pre-wrap bg-transparent max-h-[36vh] overflow-y-auto border-t border-slate-800/40 italic';
                 thinkBody.textContent = thought;
-                
+
                 thinkDetails.appendChild(summary);
                 thinkDetails.appendChild(meta);
                 thinkDetails.appendChild(thinkBody);
@@ -3597,6 +3993,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 fbBar.dataset.thought = String(thought||'').slice(0,600);
                 fbBar.dataset.model = m;
                 contentDiv.appendChild(fbBar);
+                renderSources(contentDiv, sources);
             }
             
             messageDiv.appendChild(avatar);
@@ -3635,21 +4032,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
             const contentDiv = document.createElement('div');
             contentDiv.className = 'bg-slate-900/90 border border-indigo-900/60 rounded-xl p-4 text-slate-200 text-sm shadow-xl space-y-2 w-full';
             let thinkDetails = null, thinkBody = null, meta = null;
+            let _thinkStart = Date.now();
+            let _thinkTimer = null;
             if (window.showChainOfThought !== false) {
                 thinkDetails = document.createElement('details');
                 thinkDetails.open = true;
-                thinkDetails.className = 'group bg-slate-950/90 rounded-lg border border-cyan-900/60 overflow-hidden';
+                thinkDetails.className = 'group qwen-think bg-[#0f1115] border-l-2 border-slate-700 rounded-r-lg overflow-hidden';
                 const summary = document.createElement('summary');
-                summary.className = 'px-3 py-2 text-[11px] font-bold text-cyan-300 cursor-pointer select-none hover:bg-slate-900 flex items-center justify-between';
-                summary.innerHTML = '<span>🧠 Chain-of-Thought — <span class="text-amber-300 font-mono">'+modelLabelInit+' <span class="animate-pulse text-cyan-400">● live</span></span></span><span class="text-cyan-500 group-open:rotate-180 transition-transform">▼</span>';
+                summary.className = 'flex items-center gap-2 px-3 py-2 text-[11px] font-medium text-slate-400 cursor-pointer select-none hover:bg-[#151821] list-none';
+                summary.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-amber-500 animate-pulse"></span><span class="text-slate-300">Thinking</span><span class="text-slate-600 font-mono">· '+modelLabelInit+' · <span class="think-timer">0.0s</span></span><span class="ml-auto text-slate-600 group-open:rotate-180 text-[10px]">▾</span>';
                 meta = document.createElement('div');
-                meta.className = 'px-3 py-1 text-[10px] text-slate-500 border-b border-slate-800 bg-slate-900/50 flex justify-between';
-                meta.innerHTML = '<span>model: '+modelLabelInit+'</span><span class="text-cyan-400">streaming…</span>';
+                meta.className = 'hidden';
+                meta.textContent = '';
                 thinkBody = document.createElement('div');
-                thinkBody.className = 'p-3 text-[11px] text-slate-300 font-mono whitespace-pre-wrap border-t border-indigo-900/50 bg-[#0a0a14] max-h-64 overflow-y-auto';
-                thinkBody.textContent = '… reasoning started …';
+                thinkBody.className = 'px-3.5 py-2.5 text-[11px] leading-[1.65] text-[#8b8d98] font-mono whitespace-pre-wrap bg-transparent max-h-[36vh] overflow-y-auto border-t border-slate-800/40 italic';
+                thinkBody.innerHTML = '<span class="text-slate-600">… reasoning started …</span><span class="inline-block w-2 h-3 bg-slate-600 animate-pulse ml-1 align-text-bottom"></span>';
                 thinkDetails.appendChild(summary); thinkDetails.appendChild(meta); thinkDetails.appendChild(thinkBody);
                 contentDiv.appendChild(thinkDetails);
+                _thinkTimer = setInterval(function(){ var el = thinkDetails && thinkDetails.querySelector('.think-timer'); if(el) el.textContent = ((Date.now()-_thinkStart)/1000).toFixed(1)+'s'; }, 120);
             }
             const textBody = document.createElement('div');
             textBody.className = 'prose prose-invert max-w-none text-slate-200 text-xs min-h-[1.2em]';
@@ -3666,7 +4066,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
             const updateThink = (chunk) => {
                 thinkBuffer += chunk;
                 if (thinkBody) {
-                    thinkBody.textContent = thinkBuffer;
+                    var esc = thinkBuffer.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                    thinkBody.innerHTML = esc + '<span class="inline-block w-2 h-3 bg-slate-600 animate-pulse ml-0.5 align-text-bottom"></span>';
                     thinkBody.scrollTop = thinkBody.scrollHeight;
                 }
                 container.scrollTop = container.scrollHeight;
@@ -3691,7 +4092,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 const reader = res.body.getReader();
                 const decoder = new TextDecoder();
                 let buf = "";
-                let finalThought = "", finalResponse = "", finalModel = modelLabelInit, finalPath = window.currentModelFilename;
+                let finalThought = "", finalResponse = "", finalModel = modelLabelInit, finalPath = window.currentModelFilename, finalSources = [];
                 while (true) {
                     const {value, done} = await reader.read();
                     if (done) break;
@@ -3710,7 +4111,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
                         } else if (ev.type === 'thought_delta') {
                             updateThink(ev.chunk||"");
                         } else if (ev.type === 'thought_done') {
-                            if(meta) meta.innerHTML = '<span>model: '+finalModel+'</span><span class="text-emerald-400">thought complete</span>';
+                            if(_thinkTimer){ clearInterval(_thinkTimer); _thinkTimer=null; }
+                            if(thinkDetails){
+                                var sm = thinkDetails.querySelector('summary');
+                                if(sm){
+                                    var secs = ((Date.now()-_thinkStart)/1000).toFixed(1);
+                                    var toks = thinkBuffer.trim().split(' ').filter(Boolean).length;
+                                    sm.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span><span class="text-slate-300">Thought for '+finalModel+'</span><span class="text-slate-600 font-mono">· '+secs+'s · ~'+toks+' tokens</span><span class="ml-auto text-slate-600 group-open:rotate-180 text-[10px]">▾</span>';
+                                }
+                                thinkBody.style.opacity = '0.9';
+                            }
                         } else if (ev.type === 'response_delta') {
                             if (thinkBody && thinkBuffer && !responseBuffer) {
                                 // first response chunk — clear placeholder
@@ -3725,6 +4135,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                             finalThought = ev.thought || thinkBuffer;
                             finalResponse = ev.response || responseBuffer;
                             finalModel = ev.model || finalModel; finalPath = ev.model_path || finalPath;
+                            finalSources = ev.sources || finalSources;
                         } else if (ev.type === 'error') {
                             updateResponse("\n\n**Error:** "+ev.message);
                         }
@@ -3735,8 +4146,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 // finalize DOM to match final static state (with feedback bar)
                 // replace placeholder footer with proper one + feedback bar like appendMessage does
                 // update thought body to final value (in case streamed chunks were partial)
+                if(_thinkTimer){ clearInterval(_thinkTimer); _thinkTimer=null; }
                 if (thinkBody) {
-                    thinkBody.textContent = finalThought || thinkBuffer || "(no thought)";
+                    var _final = finalThought || thinkBuffer || "(no thought)";
+                    var _esc = _final.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+                    thinkBody.innerHTML = _esc;
+                    thinkBody.style.opacity = '0.9';
                 }
                 // final response parse
                 try {
@@ -3746,9 +4161,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 } catch(e){ textBody.innerHTML = String(finalResponse).replace(/</g,'&lt;').replace(/\n/g,'<br>'); }
                 liveFooter.innerHTML = '<span>◈ '+finalModel+'</span><span>'+new Date().toLocaleTimeString()+'</span>';
                 if (thinkDetails) {
-                    const sumSpan = thinkDetails.querySelector('summary span');
-                    if(sumSpan) sumSpan.innerHTML = '🧠 Chain-of-Thought — <span class="text-amber-300 font-mono">'+finalModel+'</span>';
-                    if(meta) meta.innerHTML = '<span>model: '+finalModel+'</span><span class="text-slate-600">click header to collapse</span>';
+                    const sm2 = thinkDetails.querySelector('summary');
+                    if(sm2){
+                        var fsecs = ((Date.now()-_thinkStart)/1000).toFixed(1);
+                        var ftoks = (finalThought||thinkBuffer).trim().split(' ').filter(Boolean).length;
+                        sm2.innerHTML = '<span class="w-1.5 h-1.5 rounded-full bg-amber-500"></span><span class="text-slate-300">Thought for '+finalModel+'</span><span class="text-slate-600 font-mono">· '+fsecs+'s · ~'+ftoks+' tokens</span><span class="ml-auto text-slate-600 group-open:rotate-180 text-[10px]">▾</span>';
+                    }
+                    // Qwen Code CLI: thinking collapses by default once the turn completes
+                    setTimeout(function(){ if(thinkDetails) thinkDetails.open = false; }, 900);
                 }
                 // add feedback bar like appendMessage
                 const fbBar = document.createElement('div');
@@ -3759,6 +4179,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 fbBar.dataset.model = finalModel;
                 fbBar.innerHTML = '<span class="text-[10px] text-slate-500">Was this helpful?</span> <button onclick="submitFeedback(\'up\', this)" class="px-2 py-1 bg-slate-800 hover:bg-emerald-900/60 text-emerald-400 rounded border border-slate-700 text-[11px] transition">👍</button> <button onclick="openCorrectionModal()" class="px-2 py-1 bg-slate-800 hover:bg-red-900/60 text-red-400 rounded border border-slate-700 text-[11px] transition">👎</button> <button onclick="regenerateLastWithCritique(this)" class="px-2 py-1 bg-amber-950/40 hover:bg-amber-900/40 text-amber-300 rounded border border-amber-800/40 text-[11px] transition" title="Self-critique regenerate">🔄 Retry</button> <span class="fb-status text-[10px] text-emerald-400 font-mono ml-2"></span>';
                 contentDiv.appendChild(fbBar);
+                renderSources(contentDiv, finalSources);
                 if (finalModel) window.currentModelFilename = finalPath || finalModel;
             } catch (err) {
                 // fallback to non-stream endpoint
@@ -3767,7 +4188,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     const data = await res2.json();
                     // remove live placeholder and use normal append
                     messageDiv.remove();
-                    appendMessage('assistant', data.thought, data.response, data.model);
+                    appendMessage('assistant', data.thought, data.response, data.model, data.sources);
                     if (data.model) window.currentModelFilename = data.model_path || data.model;
                 }catch(e2){
                     textBody.innerHTML = '<span class="text-red-400">Failed: '+String(err.message||err)+'</span>';
@@ -3973,12 +4394,33 @@ def scan_local_pc_models():
         '.',
         os.path.expanduser('~/.cache/huggingface/hub'),
         os.path.expanduser('~/.lmstudio/models'),
+        os.path.expanduser('~/.lmstudio/cache'),
         os.path.expanduser('~/Downloads')
     ]
     for d in search_dirs:
         if os.path.exists(d):
             try:
                 for root, dirs, files in os.walk(d):
+                    dirs[:] = [d2 for d2 in dirs if not d2.startswith('.')]
+                    # HuggingFace model directory -> list the dir, not its weights.
+                    if _is_hf_model_dir(root):
+                        full_path = os.path.abspath(root)
+                        try:
+                            size_mb = round(sum(
+                                os.path.getsize(os.path.join(root, f))
+                                for f in os.listdir(root)
+                                if f.endswith('.safetensors') or f.endswith('.bin')
+                            ) / (1024 * 1024), 1)
+                        except OSError:
+                            size_mb = 0.0
+                        found_models.append({
+                            'name': os.path.basename(root),
+                            'path': full_path,
+                            'size_mb': size_mb,
+                            'active': (os.path.normpath(full_path) == os.path.normpath(current_model_filename)),
+                            'type': 'qwen-hf'
+                        })
+                        continue
                     for file in files:
                         if file.endswith(('.pk1', '.pt', '.pth', '.gguf')):
                             full_path = os.path.abspath(os.path.join(root, file))
@@ -3987,7 +4429,7 @@ def scan_local_pc_models():
                                 'name': file,
                                 'path': full_path,
                                 'size_mb': size_mb,
-                                'active': (file == current_model_filename)
+                                'active': (os.path.basename(full_path) == os.path.basename(current_model_filename))
                             })
             except:
                 pass
@@ -4363,7 +4805,9 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_header('Content-Type', 'application/x-ndjson; charset=utf-8')
                 self.send_header('Cache-Control', 'no-cache')
                 self.send_header('X-Accel-Buffering', 'no')
-                self.send_header('Connection', 'keep-alive')
+                # Close after the NDJSON stream ends so the client's reader gets a
+                # proper end-of-body (finalizes the UI) and the worker thread is freed.
+                self.send_header('Connection', 'close')
                 self.end_headers()
                 try:
                     final_thought = ""
@@ -4642,9 +5086,22 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             data = json.loads(body.decode('utf-8'))
             filename = data.get('filename', '')
 
-            if filename.endswith('.gguf') or '/' in filename or '\\' in filename:
+            # Qwen HF model directory (produced by qwen_finetune.py): load it
+            # live via QwenModelAdapter so chat-templated generation + class_head
+            # routing work without a server restart.
+            if os.path.isdir(filename):
+                try:
+                    _ch = os.path.join(filename, "class_head.pt")
+                    new_model = QwenModelAdapter(filename, device, class_head_path=_ch)
+                    reasoner.model = new_model
+                    current_model_filename = filename
+                    resp_data = {'status': 'success', 'filename': filename, 'type': 'qwen-hf'}
+                except Exception as e:
+                    resp_data = {'status': 'error', 'message': f'Qwen load failed: {e}'}
+            elif filename.endswith('.gguf'):
+                # gguf: mark active (served via llama.cpp elsewhere); no in-process reload
                 current_model_filename = filename
-                resp_data = {'status': 'success', 'filename': filename}
+                resp_data = {'status': 'success', 'filename': filename, 'type': 'gguf'}
             elif os.path.exists(filename):
                 try:
                     with open(filename, 'rb') as f:
@@ -4771,7 +5228,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                             if correction:
                                 response = response + f"\n\n*🔧 Self-improved per your correction: \"{correction[:120]}\"*"
                             _append_improvement({'type': 'regenerate', 'prompt': prompt[:80], 'stats_delta': {'auto_tunes': 1}}, suggestion=f"Regenerated \"{prompt[:60]}\" with critique — improvement applied.")
-                            resp_data = {'status': 'success', 'thought': thought, 'response': response, 'model': os.path.basename(current_model_filename)}
+                            resp_data = {'status': 'success', 'thought': thought, 'response': response, 'model': os.path.basename(current_model_filename), 'sources': getattr(reasoner, 'last_sources', [])}
                         finally:
                             reasoner.workspace_context = orig_ctx
                     else:
@@ -4972,9 +5429,9 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                             elif ev.get('type')=='done':
                                 synth_thought_acc = ev.get('thought', synth_thought_acc)
                                 synth_resp_acc = ev.get('response', synth_resp_acc)
-                    if _is_gibberish(synth_resp_acc, task) or not synth_resp_acc.strip():
+                    if not synth_resp_acc.strip():
                         best = max(agents, key=lambda a: len(a['response']))
-                        if not _is_gibberish(best['response'], task):
+                        if best['response'].strip():
                             synth_resp_acc = f"**Swarm synthesis (fallback to {best['role']}):**\n\n{best['response']}"
                     result = {'task':task,'mode':mode,'num_agents':n,'agents':agents,'synthesis':{'thought':synth_thought_acc,'response':synth_resp_acc},'elapsed_s':0,'model':os.path.basename(current_model_filename),'model_path':current_model_filename}
                     try:
@@ -5040,7 +5497,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                     critic_roles=[_COUNCIL_CRITIC_ROLES[i%len(_COUNCIL_CRITIC_ROLES)] for i in range(nc)]
                     drafts_block="\n\n".join([f"[Draft {d['id']} ({d['role']}):]\n{d['response'][:900]}" for d in drafts])
                     def _heuristic_score(text, prompt):
-                        if _is_gibberish(text, prompt): return 3
+                        if not text.strip(): return 3
                         p_words=set(re.findall(r'[a-z]{3,}', prompt.lower())); t_words=set(re.findall(r'[a-z]{3,}', text.lower()))
                         overlap=len(p_words & t_words)/max(1,len(p_words)); score=5+int(overlap*3)+min(2,len(text)//350); return max(1,min(10,score))
                     critics=[]
@@ -5111,7 +5568,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                                 final_rp+=ev.get('chunk','')
                             elif ev.get('type')=='done':
                                 final_th=ev.get('thought',final_th); final_rp=ev.get('response',final_rp)
-                    if _is_gibberish(final_rp, task):
+                    if not final_rp.strip():
                         final_rp=winner['response']+"\n\n**Council refinements applied:**\n"+suggestions_block
                         final_th=winner['thought']+"\n\n[Council synthesis fallback — winner "+winner['role']+" + critiques]"
                     result={'task':task,'num_drafts':nd,'num_critics':nc,'drafts':drafts,'critics':critics,'tally':tally,'score_sum':score_sum,'winner':winner,'suggestions':winner_suggestions,'final':{'thought':final_th,'response':final_rp},'elapsed_s':0,'model':os.path.basename(current_model_filename),'model_path':current_model_filename}
@@ -5137,8 +5594,11 @@ def run_server(port=5000, host='localhost'):
     # Kill stale instance on same port if present (common when .bat is double-clicked twice)
     try:
         # allow rapid restart
-        socketserver.TCPServer.allow_reuse_address = True
-        server = socketserver.TCPServer((host, port), ChatHandler)
+        socketserver.ThreadingTCPServer.allow_reuse_address = True
+        # Threaded: a long-lived /api/chat/stream holds its connection open, so a
+        # single-threaded server would block every later prompt until the first
+        # stream finishes. Threading lets the 2nd (and Nth) prompt stream too.
+        server = socketserver.ThreadingTCPServer((host, port), ChatHandler)
     except OSError as e:
         print(f"[ERROR] Could not bind to {host}:{port} - {e}", flush=True)
         print(f"[HINT] That port is already in use. Either close the old window or run:", flush=True)

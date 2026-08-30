@@ -26,7 +26,7 @@ Ashen GPT is tuned for **consumer GPUs (8GB+ VRAM)** with strict memory protecti
 - **Gradient Checkpointing**: Activates during Stage 3 training (context > 2048) to trade compute for VRAM in the attention sub-layer.
 - **CUDA Cache Management**: Periodic `torch.cuda.empty_cache()` + `gc.collect()` after every step and evaluation block.
 - **Progressive Context Staging**: Safely scales through three context lengths (512 → 2K → 8K) to prevent $O(T^2)$ attention memory spikes.
-- **Auto Upscaling**: On re-run, existing checkpoints (`ashen_gpt_model.pk1`) are detected and depth-doubled (8 → 16 layers) before continued training.
+- **Auto Upscaling**: On re-run, existing custom checkpoints (`ashen_gpt_model.pk1`) are detected and **width-upscaled** by √2 (`n_embd` widened, depth unchanged) so parameter count ~doubles with Net2Net copy-init (minimal loss spike). The Qwen-family checkpoint (`ashen_gpt_model/`) is upscaled the same way by `qwen_finetune.py` (hidden_size widened √2, ~1.4× params).
 
 ---
 
@@ -41,7 +41,7 @@ Ashen GPT is tuned for **consumer GPUs (8GB+ VRAM)** with strict memory protecti
 | Extreme Extension | 4,001–5,000 | 8,192 | 2 | 8 | 16 |
 
 - Evaluation runs every 500 iterations (quick loss estimation + lightweight text test).
-- Auto-detects and doubles checkpoint depth if `ashen_gpt_model.pk1` already exists.
+- Auto-detects and **width-upscales** (√2, depth unchanged) existing checkpoints via Net2Net copy-init before continued training.
 - Training logs stream to both terminal and `training_logs.txt` (timestamped sessions).
 - Optimized for ~40-50% faster training: reduced from 5,000 to 3,000 iterations, higher batch utilization, streamlined evaluations.
 
@@ -143,7 +143,7 @@ run_web_chatbot.bat   →   http://localhost:5000
 
 - **Cyberpunk aesthetic** — dark theme, neon accents, toggleable CRT scanline overlay.
 - **Persona switcher** — *Ashen AI Agent*, *Code Architect*, *Cyber Companion*.
-- **Model Hub modal** — browse local `.pk1`/`.gguf` checkpoints, upload new weights, swap models live.
+- **Model Hub modal** — browse local `.pk1`/`.gguf` checkpoints **and Qwen HuggingFace dirs** (e.g. `ashen_gpt_model/`, auto-tagged `QWEN`), upload new weights, swap models live.
 - **Quick-action chips** — one-click buttons for common agent tools (*File Glob*, *Grep*, *Git Status*, *Run Tests*, *Web Search*, *Browse URL*, *Deep Research*).
 
 #### 🌐 Web Browsing & Research
@@ -224,11 +224,11 @@ Precedence: `CLI --settings <path>` > `SETTINGS_PATH` / `ASHEN_SETTINGS` env > `
 
 | Key | Default | Notes |
 |---|---|---|
-| `temperature` | `0.65` | Auto-tune drops to `0.60` when down-vote ratio > 35 % |
+| `temperature` | `0.70` | Auto-tune lowers by `0.05` (floor `0.40`) when down-vote ratio > 35 % |
 | `top_k` / `top_p` | `40` / `0.9` | Live-applied via `reasoner.update_settings(...)` |
 | `max_new_tokens` / `context_length` | `250` / `8192` | |
 | `gpu_layers` / `precision` / `cpu_offload_layers` | `16` / `fp16` / `0` | |
-| `current_model` | `C:/dev/Ashen AI Base/ashen_gpt_model.pk1` | Switchable to `Jackrong_Qwopus3.5-9B-coder-Exp-Q3_K_M.gguf` via Model Hub |
+| `current_model` | `ashen_gpt_model.pk1` (relative to the script dir) — *or* an absolute/relative HF dir like `ashen_gpt_model` (Qwen3.5). Switchable to `Jackrong_Qwopus3.5-9B-coder-Exp-Q3_K_M.gguf` via Model Hub |
 | `show_chain_of_thought` | `true` | Header toggle `🧠 CoT: ON/OFF` + Settings checkbox, persists to `settings.json` |
 
 APIs: `GET /api/settings/load`, `POST /api/settings/save → {"status":"saved"}`, `GET /` injects `{{current_model_filename}}` so the UI never leaks the placeholder. CLI: `python web_chatbot.py [--settings "..."] [--host localhost] [--port 5000]` and `run_web_chatbot.bat` forwards `%*`.
@@ -271,12 +271,12 @@ Synthesized answer auto-appends to chat via `appendMessage('assistant', synthesi
 
 Like Swarm but **drafts → critics vote & suggest → tallied winner → finalizer refines**:
 
-1. **Drafts** `N=1–4` proposer agents (role-cycling prompts, `_swarm_lock`) produce candidates.
+1. **Drafts** `N=2–5` proposer agents (role-cycling prompts, `_swarm_lock`) produce candidates.
 2. **Critics** `M=2–5` from `Accuracy / Clarity / Completeness / Safety / Efficiency Critic`, each prompted `Draft <id>: Score <1-10> - Suggestion: …` then `VOTE: <id>` (temp 0.65 / max 220). Parser falls back to heuristic scoring (`_is_gibberish → 3` else `5 + overlap*3 + len/350`) so the untrained pk1 still votes usefully.
 3. **Tally** `tally[id] = vote count`, `score_sum[id] = Σ scores` → winner = `max(tally, score_sum, length)`; winner suggestions collected as `"- [Critic] …"`.
 4. **Finalizer** prompt `Winning draft + Council critiques + other drafts → <think> + final response`, with gibberish fallback to `winner + suggestions_block`.
 
-- Header `🏛️ Council` → modal: task textarea, `Drafts 1–4` + `Critics 2–5` sliders, threshold `0–5`, `🏛️ CONVENE COUNCIL`, status, model path, roles preview, results with **Votes table** (`Winner: D1 — picks 2, score 12` + per-critic rows), **Drafts** 2-col winners starred/ringed, **Critics** 2-col with vote/suggestion, **Final Council Answer** collapsible CoT + markdown + `→ Chat / Copy`.
+- Header `🏛️ Council` → modal: task textarea, `Drafts 2–5` + `Critics 2–5` sliders, threshold `0–5`, `🏛️ CONVENE COUNCIL`, status, model path, roles preview, results with **Votes table** (`Winner: D1 — picks 2, score 12` + per-critic rows), **Drafts** 2-col winners starred/ringed, **Critics** 2-col with vote/suggestion, **Final Council Answer** collapsible CoT + markdown + `→ Chat / Copy`.
 - APIs: `GET /api/council → {roles, proposers, recent_runs, model, model_path}`, `POST /api/council {task, num_drafts, num_critics, threshold}` → `{drafts, critics:[{votes,suggestions,pick,thought,response}], tally, score_sum, winner, suggestions, final:{thought,response}, elapsed_s, model}`, and live `POST /api/council/stream → draft_start → draft_thought_delta → draft_done → critic_* → tally → final_thought_delta → done`. Logged as `type:'council'` in `self_improvement.json`.
 
 ---
@@ -334,6 +334,7 @@ Built-in evaluation framework that tests model performance across 5 capability c
 | Script | Description | Command |
 |---|---|---|
 | `ashen_gpt_trainer.py` | Train / upscaling pre-training + SFT | `python ashen_gpt_trainer.py` or `run_ashen_gpt.bat` |
+| `qwen_finetune.py` | LoRA bf16 fine-tune + width-upscale the Qwen3.5 checkpoint (`ashen_gpt_model/`) | `cuda\Scripts\python.exe qwen_finetune.py` or `run_qwen_finetuner.bat` |
 | `chatbot.py` | Terminal-based agentic chatbot | `python chatbot.py` or `run_chatbot.bat` |
 | `web_chatbot.py` | Browser-based cyberpunk UI (port 5000) | `python web_chatbot.py` or `run_web_chatbot.bat` |
 
@@ -359,7 +360,7 @@ pause
 
 ### Workflow
 
-1. **Train** → produces `ashen_gpt_model.pk1` (~127M params, 8K context).
+1. **Train** → the custom model produces `ashen_gpt_model.pk1` (~127M params, 8K context) via `ashen_gpt_trainer.py`; the Qwen3.5 default model (`ashen_gpt_model/`) is fine-tuned + width-upscaled via `qwen_finetune.py`.
 2. **Chat** → launch CLI or Web interface; the model loads the saved checkpoint automatically.
 3. **Agent mode** → ask the model to inspect files, run commands, or explore your workspace.
 4. **Evaluate** → `[TOOL: run_benchmark()]` or the web `Run Benchmark` button; use Swarm / Council for hard prompts and the Self-Improve dashboard to auto-tune from feedback.
@@ -369,10 +370,10 @@ pause
 ## 📁 Project Structure
 
 ```
-ashen_gpt_trainer.py    # Full training pipeline (Pre-training → SFT → DPO)
-chatbot.py              # CLI agentic chatbot (sessions, workspace context, /cd)
-web_chatbot.py          # Web UI agentic chatbot (cyberpunk, sessions, workspace context, Swarm/Council, streaming CoT, self-improve)
-ashen_gpt_model.pk1     # SFT-aligned model (~127M params, 8K context)
+qwen_finetune.py       # LoRA (bf16) fine-tune of the Qwen3.5 checkpoint -> ashen_gpt_model/; width-only upscale on resume
+run_qwen_finetuner.bat # Windows launcher for qwen_finetune.py (cuda venv)
+ashen_gpt_model/       # Default model (Qwen3.5-0.8B, HF format): config.json + model.safetensors + class_head.pt
+ashen_gpt_model.pk1     # SFT-aligned custom model (~127M params, 8K context)
 ashen_gpt_model_dpo.pk1 # RL-aligned model (DPO preference optimization)
 Jackrong_Qwopus3.5-9B-Coder-GGUF/Qwopus3.5-9B-coder-Exp-Q3_K_M.gguf  # 4.4GB GGUF alternative (Model Hub switchable)
 settings.json           # Generation + display config (temperature, top_k/p, max_new_tokens, context_length, gpu_layers, precision, current_model, show_chain_of_thought)
@@ -387,24 +388,74 @@ code_train_split.txt    # Scraped code training data
 run_*.bat               # Windows launch scripts
 ```
 
-**Key web endpoints:**
+**Key web endpoints** (all served by the stdlib `http.server` `ChatHandler`; unknown paths return `404`):
 
+*Core chat*
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/` | Cyberpunk UI — injects `current_model_filename`, shows `🧠 CoT` / `🧬 Self-Improve` / `🐝 Swarm` / `🏛️ Council` header |
-| `GET,POST` | `/api/settings/load` | Load persisted settings |
-| `POST` | `/api/settings/save` | `settings.update(data); reasoner.update_settings(data);` → `{"status":"saved"}` |
-| `POST` | `/api/chat` | `{message}` → `{thought, response, model, show_chain_of_thought}` (batched) |
-| `POST` | `/api/chat/stream` | NDJSON live: `start → thought_delta* → thought_done → response_delta* → done` |
-| `GET` | `/api/self-improve` | `{stats, gibberish_rate, suggestions, log, feedback}` |
+| `POST` | `/api/chat` | `{message}` → `{thought, response, model, model_path, show_chain_of_thought}` (batched) |
+| `POST` | `/api/chat/stream` | NDJSON live: `start → thought_delta* → thought_done → response_delta* → response_done → done` (+ `tool_start`/`tool_result` mid-loop) |
+| `POST` | `/api/clear` | Save current session, then clear history + workspace context |
+| `POST` | `/api/persona` | `{persona}` → switch active persona |
+| `POST` | `/api/settings` | `{...}` → `reasoner.update_settings(...)` (live apply, no file write) |
+
+*Sessions*
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/sessions` | List sessions + `current` id |
+| `POST` | `/api/sessions/new` | Create → `201 {session_id}` |
+| `POST` | `/api/sessions/load` | `{session_id}` → restore history, persona, workspace context |
+| `POST` | `/api/sessions/delete` | `{session_id}` → delete (clears current if active) |
+| `POST` | `/api/sessions/rename` | `{session_id, name}` |
+
+*Settings persistence*
+| Method | Path | Purpose |
+|---|---|---|
+| `GET,POST` | `/api/settings/load` | → `{"status":"success","settings":...}` |
+| `POST` | `/api/settings/save` | Merge + write `settings.json` + live-apply → `{"status":"saved","settings":...}` |
+
+*Model Hub*
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/models` | Scan local PC for `.pk1`/`.gguf` (deduped by path) |
+| `GET` | `/api/hf-search` | `?q=` → HuggingFace model search (top 20 by downloads) |
+| `POST` | `/api/models/list` | `scan_available_models()` → `{models, current}` |
+| `POST` | `/api/models/set-default` | `{path}` → set + persist `current_model` |
+| `POST` | `/api/models/scan-pc` | Re-scan local PC |
+| `POST` | `/api/models/switch` | `{filename}` → swap live model (`.gguf` by path, `.pk1` via `pickle.load`) |
+| `POST` | `/api/models/upload` | `{filename, content_base64}` → save weights to script dir |
+| `POST` | `/api/models/download-hf-repo` | `{repo_id}` → `snapshot_download` from HuggingFace |
+
+*Workspace*
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/workspace/list` | `?dir=` → directory listing |
+| `POST` | `/api/workspace/read` | `{path}` → file content (utf-8, latin-1 fallback) |
+| `POST` | `/api/workspace/context` | `{dir}` → inject dir tree into model context |
+| `POST` | `/api/workspace/write` | `{path, content}` → write file |
+
+*Feedback & Self-Improvement*
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/feedback` | Last 50 feedback entries |
+| `GET` | `/api/self-improve` | `{stats, entries[-20], suggestions[-10], feedback_recent, gibberish_rate}` |
+| `POST` | `/api/feedback` | `{rating, prompt, response, thought, correction, model}` |
 | `POST` | `/api/self-improve` | `{action: regenerate\|auto-tune\|analyze, run_benchmark}` |
-| `POST` | `/api/feedback` | `{rating: up\|down, prompt, response, thought, correction, model}` |
+
+*Swarm*
+| Method | Path | Purpose |
+|---|---|---|
 | `GET` | `/api/swarm` | `{roles[6], recent_runs, model, model_path}` |
-| `POST` | `/api/swarm` | `{task, n_agents, mode}` → `{agents, synthesis, elapsed_s}` |
-| `POST` | `/api/swarm/stream` | Live agent + synthesis deltas |
-| `GET` | `/api/council` | `{roles (5 critics), proposers, recent_runs, model, model_path}` |
-| `POST` | `/api/council` | `{task, num_drafts, num_critics, threshold}` → `{drafts, critics, tally, winner, final}` |
-| `POST` | `/api/council/stream` | Live draft/critic/final deltas |
+| `POST` | `/api/swarm` | `{task\|prompt, num_agents:2-6, mode}` → `{agents, synthesis, elapsed_s}` |
+| `POST` | `/api/swarm/stream` | Live `swarm_start → agent_* → synthesis_* → done` |
+
+*Council*
+| Method | Path | Purpose |
+|---|---|---|
+| `GET` | `/api/council` | `{roles (5 critics), proposers[6], recent_runs, model, model_path}` |
+| `POST` | `/api/council` | `{task, num_drafts:2-5, num_critics:2-5}` → `{drafts, critics, tally, winner, final}` |
+| `POST` | `/api/council/stream` | Live `council_start → draft_* → critic_* → tally → final_* → done` |
 
 ---
 
