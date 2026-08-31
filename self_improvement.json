@@ -1088,6 +1088,20 @@
         "up": 1
       },
       "ts": "2026-08-30T06:57:29.225554"
+    },
+    {
+      "type": "swarm",
+      "prompt": "what can you do?",
+      "mode": "parallel",
+      "agents": 3,
+      "elapsed": 0,
+      "stats_delta": {},
+      "ts": "2026-08-30T16:46:45.659961"
+    },
+    {
+      "type": "benchmark",
+      "stats_delta": {},
+      "ts": "2026-08-30T16:47:28.621726"
     }
   ],
   "stats": {
@@ -1182,6 +1196,14 @@
     {
       "ts": "2026-08-30T02:10:48.372620",
       "text": "Swarm 3xparallel streamed"
+    },
+    {
+      "ts": "2026-08-30T16:46:45.659961",
+      "text": "Swarm 3xparallel streamed"
+    },
+    {
+      "ts": "2026-08-30T16:47:28.621726",
+      "text": "Benchmark executed via self-improve"
     }
   ]
 }

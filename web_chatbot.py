@@ -545,15 +545,40 @@ class QwenModelAdapter:
         self.tokenizer = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+        # --- inference-time VRAM budget (RTX 3060 Ti = 8.59 GB) --------------
+        # The upscaled ~1.06B Qwen3.5 is 2.13 GB in bf16. Loading it whole on an
+        # 8GB GPU plus the generation KV-cache (context_length up to 8192) OOMs.
+        # Default to 4-bit (bitsandbytes) which cuts weights to ~0.6 GB; full
+        # precision is opt-in via QWEN_INFER_4BIT=0 for GPUs with more VRAM.
+        q4 = os.environ.get("QWEN_INFER_4BIT", "1") != "0"
+        load_kwargs = dict(
+            torch_dtype=(torch.bfloat16 if device == "cuda" else torch.float32),
+            device_map="auto" if device == "cuda" else "cpu",
+            low_cpu_mem_usage=True,
+        )
+        if q4 and device == "cuda":
+            try:
+                from transformers import BitsAndBytesConfig
+                load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_4bit=True)
+                load_kwargs.pop("torch_dtype")
+                print("[QwenModelAdapter] loading in 4-bit (bitsandbytes) to fit 8GB VRAM", flush=True)
+            except Exception as e:
+                print(f"[QwenModelAdapter] 4-bit load unavailable ({e}); using bf16", flush=True)
         # Load with the EXPLICIT causal-LM class: the source checkpoint's
         # config.json advertises the multimodal Qwen3_5ForConditionalGeneration
         # architecture, which would make AutoModelForCausalLM try to build the
         # vision model and fail. We only ever train/save the text model.
-        self.model = Qwen3_5ForCausalLM.from_pretrained(
-            model_dir,
-            torch_dtype=(torch.bfloat16 if device == "cuda" else torch.float32),
-            device_map="auto" if device == "cuda" else "cpu",
+        # The trained model's hidden_size (1448) is not a multiple of 64, so
+        # bitsandbytes' 4-bit matmul falls back to a slower kernel and emits a
+        # harmless UserWarning. The inner dim is fixed by the saved weights and
+        # can't be changed without re-training, so we just silence this message.
+        import warnings as _warnings
+        _warnings.filterwarnings(
+            "ignore",
+            category=UserWarning,
+            message=r"inner dimension \(.*\) is not aligned for fast kernel",
         )
+        self.model = Qwen3_5ForCausalLM.from_pretrained(model_dir, **load_kwargs)
         self.model.eval()
         _cfg = self.model.config
         if hasattr(_cfg, "hidden_size"):
@@ -563,11 +588,23 @@ class QwenModelAdapter:
         else:
             hid = 1024
         self.hidden_size = hid
+        # --- inference VRAM caps (RTX 3060 Ti = 8.59 GB) --------------------
+        # Clamp the KV-cache context and max generation length so the model can't
+        # allocate a KV cache bigger than the GPU has room for, even though the
+        # chat settings allow context_length up to 8192. Tunable per-GPU.
+        self.kv_cap = int(os.environ.get("QWEN_KV_CAP", "2048"))
+        self.gen_cap = int(os.environ.get("QWEN_GEN_CAP", "512"))
         self.class_head = None
         if class_head_path and os.path.exists(class_head_path):
-            self.class_head = torch.nn.Linear(hid, len(self.CLASS_LABELS), bias=False)
-            self.class_head.load_state_dict(torch.load(class_head_path, map_location=device))
-            self.class_head = self.class_head.to(device).eval()
+            # Match the class_head dtype to the model's compute dtype so the
+            # matmul in classify() can't hit a bf16/fp32 mismatch. Coexists with
+            # the call-site cast at L629 (which is the real guarantee).
+            compute_dtype = (self.model.config.torch_dtype
+                             if getattr(self.model.config, "torch_dtype", None) is not None
+                             else torch.bfloat16 if device == "cuda" else torch.float32)
+            head = torch.nn.Linear(hid, len(self.CLASS_LABELS), bias=False).to(compute_dtype)
+            head.load_state_dict(torch.load(class_head_path, map_location="cpu"))
+            self.class_head = head.to(device).eval()
         self.system_prompt = (
             "You are Ashen GPT, a precise local AI assistant. Answer every question "
             "completely and directly — never ask the user what angle or level of detail "
@@ -602,16 +639,23 @@ class QwenModelAdapter:
         h = out.hidden_states[-1][:, -1, :]
         if self.class_head is None:
             return None, None, None
-        logits = self.class_head(h)
+        # model hidden states (h) are bf16 after the 4-bit load, but class_head
+        # loads in fp32; cast h to the head's own weight dtype to avoid the
+        # "expected mat1 and mat2 to have the same dtype" error.
+        logits = self.class_head(h.to(self.class_head.weight.dtype))
         probs = torch.softmax(logits, dim=-1)
         idx = int(probs.argmax(dim=-1).item())
         return self.CLASS_LABELS[idx], idx, float(probs[0, idx].item())
 
     @torch.no_grad()
     def generate(self, index, max_new_tokens, current_block_size=8192, temperature=0.8, top_k=50):
+        kv_cap = getattr(self, "kv_cap", 8192)
+        n_cap = getattr(self, "gen_cap", 512)
+        ctx_size = min(current_block_size, kv_cap)
+        n = min(max_new_tokens, n_cap)
         idx = index.clone()
-        for _ in range(max_new_tokens):
-            ctx = idx[:, -current_block_size:]
+        for _ in range(n):
+            ctx = idx[:, -ctx_size:]
             out = self.model(input_ids=ctx)
             logits = out.logits[:, -1, :] / max(temperature, 1e-5)
             if top_k:
@@ -619,14 +663,22 @@ class QwenModelAdapter:
                 logits[logits < v[:, [-1]]] = -float("inf")
             probs = torch.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1)
+            # Stop at the model's EOS (<|im_end|>) instead of flooding the
+            # output with repeated EOS/pad tokens until max_new_tokens is hit.
+            if int(nxt[0, 0].item()) == self.tokenizer.eos_token_id:
+                break
             idx = torch.cat((idx, nxt), dim=-1)
         return idx
 
     @torch.no_grad()
     def generate_stream(self, index, max_new_tokens, current_block_size=8192, temperature=0.8, top_k=50):
+        kv_cap = getattr(self, "kv_cap", 8192)
+        n_cap = getattr(self, "gen_cap", 512)
+        ctx_size = min(current_block_size, kv_cap)
+        n = min(max_new_tokens, n_cap)
         idx = index.clone()
-        for _ in range(max_new_tokens):
-            ctx = idx[:, -current_block_size:]
+        for _ in range(n):
+            ctx = idx[:, -ctx_size:]
             out = self.model(input_ids=ctx)
             logits = out.logits[:, -1, :] / max(temperature, 1e-5)
             if top_k:
@@ -634,8 +686,12 @@ class QwenModelAdapter:
                 logits[logits < v[:, [-1]]] = -float("inf")
             probs = torch.softmax(logits, dim=-1)
             nxt = torch.multinomial(probs, num_samples=1)
-            idx = torch.cat((idx, nxt), dim=-1)
             tok_id = int(nxt[0, 0].item())
+            # Stop at the model's EOS (<|im_end|>) so we don't flood the output
+            # with repeated EOS/pad tokens until max_new_tokens is exhausted.
+            if tok_id == self.tokenizer.eos_token_id:
+                break
+            idx = torch.cat((idx, nxt), dim=-1)
             yield idx, tok_id
 
     def eval(self):
@@ -1324,15 +1380,12 @@ class AshenAIAgenticEngine:
             current_block_size=self.context_length,
             temperature=self.temperature, top_k=self.top_k,
         )
-        raw = self.model.decode(output_ids[0].tolist())
-        prompt_text = self.model.tokenizer.apply_chat_template(
-            [{"role": "system", "content": self.model.system_prompt}]
-            + [{"role": "user", "content": u} for u, _ in self.history[-2:]]
-            + [{"role": "assistant", "content": a} for _, a in self.history[-2:]]
-            + [{"role": "user", "content": prompt}],
-            tokenize=False, add_generation_prompt=True,
-        )
-        generated = raw[len(prompt_text):] if raw.startswith(prompt_text) else raw
+        # Decode ONLY the generated suffix (tokens after the input prompt),
+        # never the whole re-decoded sequence. String-prefix stripping of the
+        # re-tokenized prompt is fragile (whitespace round-trip drift) and on
+        # multi-turn turns it fails, so the entire input context gets echoed
+        # back as the "answer" and poisons history.
+        generated = self.model.decode(output_ids[0][input_ids.shape[1]:].tolist())
         m = re.search(r'<think>([\s\S]*?)(?:</think>|$)', generated)
         if m:
             thought = m.group(1).strip()
@@ -1360,17 +1413,23 @@ class AshenAIAgenticEngine:
         full = ""
         thought_sent = 0
         resp_sent = 0
+        input_len = input_ids.shape[1]
         saw_close = False
         for full_index, tok_id in self.model.generate_stream(
             input_ids, max_new_tokens=self.max_new_tokens,
             current_block_size=self.context_length,
             temperature=self.temperature, top_k=self.top_k,
         ):
-            raw = self.model.decode(full_index[0].tolist())
-            generated = raw[len(prompt_text):] if raw.startswith(prompt_text) else raw
-            if len(generated) <= len(full):
+            # Decode ONLY the newly generated tokens (suffix after the input
+            # prompt), never the whole re-decoded sequence. String-prefix
+            # stripping of the re-tokenized prompt is fragile (whitespace
+            # round-trip drift) and on multi-turn turns it fails, so the entire
+            # input context gets echoed back as the "answer" and poisons history.
+            gen_ids = full_index[0][input_len:].tolist()
+            raw = self.model.decode(gen_ids)
+            if len(raw) <= len(full):
                 continue
-            full = generated
+            full = raw
             if not saw_close:
                 if "</think>" in full:
                     saw_close = True

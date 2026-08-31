@@ -1,404 +1,351 @@
 # Ashen GPT
 
-Ashen GPT is a high-performance, custom PyTorch implementation of a **Qwen-like Transformer architecture** trained from scratch on a hybrid dataset of literature and multi-language open-source code. It features a ~127M-parameter sparse Mixture-of-Experts model with progressive context extension, chain-of-thought reasoning, and autonomous tool-execution agents — all running locally on consumer hardware (8GB+ VRAM).
+Ashen GPT is a local, self-hosted AI assistant that runs entirely on consumer hardware
+(8 GB+ VRAM). It pairs **two model pipelines** with **two user interfaces** that share the
+same backend behaviors:
+
+- **Qwen3.5 fine-tune pipeline** (`qwen_finetune.py`) — the default/active model
+  (`ashen_gpt_model/`, a LoRA fine-tune of Qwen3.5-0.8B emitted as a merged HuggingFace
+  checkpoint). This is what the chatbots load by default.
+- **Legacy custom-model pipeline** (`ashen_gpt_trainer.py`) — the original from-scratch
+  Qwen-style MoE trained on the book-code corpus, saved as `ashen_gpt_model.pk1`. Still
+  supported and swappable via Model Hub / `/model`.
+
+Two front-ends, identical capabilities:
+
+- **`chatbot.py`** — a single-file terminal (CLI) chatbot. Self-contained: it folds the
+  full Qwen/engine/swarm/council/research/settings backend into one file with **zero
+  dependency on `web_chatbot.py`**.
+- **`web_chatbot.py`** — a browser UI (stdlib `http.server`, `http://localhost:5000`)
+  with a cyberpunk theme, Model Hub, live-streaming chain-of-thought, swarm/council, and a
+  self-improvement dashboard.
+
+Both front-ends route generation through the same `QwenModelAdapter` (and, for the legacy
+model, the same `AshenAIAgenticEngine`), so behavior — reasoning, tool calls, citations,
+CoT display — is consistent across CLI and web.
 
 ---
 
-## 🚀 Key Architectural Features
+## Key Architectural Features
 
-| Component | Detail |
-|---|---|
-| **Architecture** | Qwen-style decoder-only Transformer with causal self-attention |
-| **Normalization** | RMSNorm (no mean-centering; scales by root mean square) |
-| **Position Encoding** | Rotary Embeddings (RoPE) with Dynamic NTK-aware scaling for extrapolation beyond training context |
-| **Attention** | QK-Norm + `torch.nn.functional.scaled_dot_product_attention` (causal mask, dropout) |
-| **Feed-Forward** | SwiGLU MoE — 4 experts, Top-2 gating, `SiLU(gate) * up` fusion |
-| **Tokenizer** | GPT-2 BPE via `tiktoken` (50,257 vocab) |
-| **Max Context** | 8,192 tokens (trained progressively 512 → 2K → 8K) |
-| **Model Scale** | `n_embd=512`, `n_layer=8`, `n_head=8` (~127M params) |
-| **Optimizer** | AdamW with cosine LR decay, gradient clipping (norm ≤ 1.0), mixed-precision autocast |
-
----
-
-## ⚙️ Hardware Optimization
-
-Ashen GPT is tuned for **consumer GPUs (8GB+ VRAM)** with strict memory protection:
-- **Gradient Checkpointing**: Activates during Stage 3 training (context > 2048) to trade compute for VRAM in the attention sub-layer.
-- **CUDA Cache Management**: Periodic `torch.cuda.empty_cache()` + `gc.collect()` after every step and evaluation block.
-- **Progressive Context Staging**: Safely scales through three context lengths (512 → 2K → 8K) to prevent $O(T^2)$ attention memory spikes.
-- **Auto Upscaling**: On re-run, existing custom checkpoints (`ashen_gpt_model.pk1`) are detected and **width-upscaled** by √2 (`n_embd` widened, depth unchanged) so parameter count ~doubles with Net2Net copy-init (minimal loss spike). The Qwen-family checkpoint (`ashen_gpt_model/`) is upscaled the same way by `qwen_finetune.py` (hidden_size widened √2, ~1.4× params).
-
----
-
-## 🔄 Training Pipeline
-
-### Phase 1 — Pre-training (Optimized: 5,000 iterations)
-
-| Stage | Iterations | Context | Batch | Gradient Accumulation | Effective Batch Size |
-|---|---|---|---|---|---|
-| Core Training | 0–3,000 | 512 | 8 | 2 | 16 |
-| Intermediate Extension | 3,001–4,000 | 2,048 | 4 | 4 | 16 |
-| Extreme Extension | 4,001–5,000 | 8,192 | 2 | 8 | 16 |
-
-- Evaluation runs every 500 iterations (quick loss estimation + lightweight text test).
-- Auto-detects and **width-upscales** (√2, depth unchanged) existing checkpoints via Net2Net copy-init before continued training.
-- Training logs stream to both terminal and `training_logs.txt` (timestamped sessions).
-- Optimized for ~40-50% faster training: reduced from 5,000 to 3,000 iterations, higher batch utilization, streamlined evaluations.
-
-### Phase 2 — Supervised Fine-Tuning (SFT)
-
-- Curated instruction/response pairs with explicit `<think>` reasoning traces.
-- 8 diverse tasks (Python, JavaScript, Go, concept explanations) over 3 epochs at `lr=5e-5`.
-- Outputs follow a `### Instruction:` / `### Response:` format that primes the agent's ReAct loop.
-
-### Phase 3 — Reinforcement Learning (Direct Preference Optimization)
-
-| Parameter | Value | Purpose |
+| Component | Qwen fine-tune (`ashen_gpt_model/`) | Legacy custom (`ashen_gpt_model.pk1`) |
 |---|---|---|
-| **Algorithm** | DPO (Rafael et al., 2023) | Align outputs with preferences via direct reward optimization |
-| **Learning Rate** | `1e-5` | Conservative fine-tuning to preserve SFT knowledge |
-| **Beta** | `0.1` | Controls alignment pressure vs. reference model deviation |
-| **Epochs** | 2 | Full pass over preference dataset |
-| **Context Window** | 4K tokens | Balanced for instruction-response pairs |
+| Base | Qwen3.5-0.8B (HuggingFace) | From-scratch Qwen-style decoder-only |
+| Norm | Qwen `RMSNorm` + QK-Norm | `RMSNorm` (no mean-centering) |
+| Position | Qwen `RotaryEmbedding` (RoPE) | `RotaryEmbedding` with Dynamic NTK scaling |
+| Attention | `scaled_dot_product_attention` (causal) | same |
+| FFN | SwiGLU | SwiGLU **MoE** — 4 experts, Top-2 gating |
+| Tokenizer | Qwen BPE (`AutoTokenizer`) | GPT-2 BPE via `tiktoken` (50,257 vocab) |
+| Fine-tune | LoRA (bf16, `r=32`) → merged HF ckpt + `class_head.pt` | Full / width-upscaled weights (`.pk1`) |
+| Max context | 8,192 tokens (`context_length`) | 8,192 tokens (`block_size`) |
 
-**How it works:**
-1. Preference pairs: `(chosen_response, rejected_response)` for each instruction
-2. Computes log-probabilities for both responses under current policy
-3. Optimizes using DPO loss: maximizes `β × (log π_chosen - log π_rejected)` via negative log-sigmoid
-4. No separate reward model needed — directly optimizes policy from human feedback signals
+**Hardware optimization (RTX 3060 Ti, 8.59 GB VRAM):**
+- Qwen inference defaults to **4-bit (bitsandbytes)** to fit the weights in ~0.6 GB; full
+  precision is opt-in via `QWEN_INFER_4BIT=0`.
+- `kv_cap` / `gen_cap` clamp the KV-cache and generation length so the model cannot OOM the
+  GPU even at `context_length=8192` (tunable: `QWEN_KV_CAP`, `QWEN_GEN_CAP`).
+- `ashen_gpt_trainer.py` uses gradient checkpointing (Stage 3 / long context) and periodic
+  `empty_cache()` + `gc.collect()` to stay within VRAM.
+- **Width-upscaling:** on re-run, existing checkpoints are detected and **width-upscaled by
+  √2** (hidden size / `n_embd` widened, depth unchanged) with copy-init, so parameter count
+  ~doubles with minimal loss spike. `ashen_gpt_trainer.py` does this for the legacy model
+  (512 → 720); `qwen_finetune.py` does it for the Qwen checkpoint on resume.
 
-**Preference Dataset (6 examples):**
-- Python decorators → detailed explanation vs one-liner
-- Binary search → full implementation with comments vs broken code
-- Transfer learning → thorough ML explanation vs vague definition
-- LRU Cache → complete OrderedDict implementation vs empty class stub
-- REST vs GraphQL → comprehensive technical comparison vs dismissive answer
-- Gradient Descent → mathematical formulation vs oversimplified analogy
-
-**Output:** Saves aligned model as `ashen_gpt_model_dpo.pk1` while preserving original SFT checkpoint as `ashen_gpt_model.pk1`.
+> **Note on bitsandbytes warning:** the fine-tuned `hidden_size` (1448) is not a multiple of
+> 64, so bitsandbytes' 4-bit matmul falls back to a slower kernel and prints a harmless
+> `UserWarning`. The dimension is fixed by the saved weights and cannot be changed without
+> re-training; it is silenced in both loaders. **Do not** edit `config.json`'s `hidden_size`
+> to "fix" this — it would crash loading with a shape mismatch.
 
 ---
 
-## 🤖 Agentic Chatbot Interfaces
+## Agentic Chatbot Interfaces
 
-Both chatbots ship with **chain-of-thought reasoning** and a **ReAct tool loop** (max 5 reasoning steps per turn). The model autonomously emits `[TOOL: name(args)]` directives and continues until it reaches a final answer.
+Both chatbots feature **chain-of-thought reasoning** streamed live (gray thought / white
+answer in the CLI; collapsible `🧠 Thought for <model>` panel on the web) and a **ReAct
+tool loop** (`[TOOL: name(args)]`) that runs up to a few reasoning steps per turn, then
+emits a final answer with citations when a tool was used.
+
 ### CLI Chatbot (`chatbot.py`)
 
 ```cmd
 run_chatbot.bat
+:: or
+cuda\Scripts\python.exe chatbot.py
 ```
 
-**Core Commands:** `/clear` · `/help` · `/exit`
+**Slash commands** (type `/help` in-app for the full, current list):
 
-#### Session Management
+`/clear` · `/help` · `/exit` · `/models` · `/model <path>` · `/settings [k=v]` ·
+`/persona <name>` · `/swarm` · `/council` · `/research <topic>` · `/websearch <query>` ·
+`/selfimprove` · `/up` `/down` · `/sessions` · `/workspace` · `/cd` `/pwd` ·
+`/auto-swarm` `/auto-research` · `/cyber on|off` · `/benchmark`
 
-| Command | Description |
-|---|---|
-| `/sessions` | List all saved sessions with message counts & timestamps. |
-| `/new` | Create a fresh session. |
-| `/load <id>` | Load a session by ID (from `/sessions`). |
-| `/delete <id>` | Delete a session permanently. |
-| `/rename <name>` | Rename current session. |
+#### Cybernetic theme & pinned input box
+- **Cybernetic theme** — neon / box-drawing terminal UI (toggle with `/cyber on|off`, or set
+  `ASHEN_CYBER=1`). Defaults on when stdout is a TTY.
+- **Pinned input box** — the prompt box is anchored to the bottom of the terminal via an ANSI
+  scroll region (`DECSTBM`); the model's chain-of-thought and answer stream *above* it. After
+  you press Enter the box **clears in place** so you get a fresh prompt line each turn. Falls
+  back to a plain prompt when not a TTY, when the cyber theme is off, or on a short terminal.
+- On `/exit` (or EOF) the scroll region is restored so your shell isn't left in a broken state.
 
-Sessions are stored as JSON files in `sessions_cli/` and include: conversation history, workspace context, and generation settings. Auto-named from first message.
+#### Chain-of-thought display — identical to the web chatbot
+The CLI renders the streamed chain-of-thought with the **exact same UX as the web UI**,
+because both consume the same `AshenAIAgenticEngine.solve_with_agent_stream` event stream
+(the CLI is a self-contained port — no import of `web_chatbot.py`):
 
-#### Working Directory
+```
+● Thought for <model>          (amber dot + model label)
+<gray streamed chain-of-thought>
+· Xs · ~N tokens               (thought timing + token estimate)
+<white streamed answer>
+◈ <model> · <time>             (footer)
+Sources                        (when the model cites sources)
+  1› title — url
+[TOOL: name(args)]             (agent tool calls, when used)
+```
 
-| Command | Description |
-|---|---|
-| `/cd <path>` | Change working directory for all tool operations. |
-| `/cd` (no args) | Show current working directory. |
-| `/pwd` | Alias for `/cd`. |
+CoT is gray and the final answer is white — same semantics as the web chatbot's collapsed
+`🧠 Thought for <model>` panel.
 
-Relative file paths in tools resolve from this directory. All tool executions (`read_file`, `write_file`, `glob`, `grep_search`, `run_shell_command`) operate within this context.
-
-#### Workspace Context
-
-| Command | Description |
-|---|---|
-| `/workspace <path>` | Scan a directory and inject its file tree into system prompts. |
-| `/wctx off` | Clear workspace context. |
-
-Gives the agent situational awareness of which files/folders you're examining without manually copying-pasting contents.
-
-#### Tools (Agent Executable via `[TOOL: name(args)]`)
-- `read_file(file_path='...')` — Read workspace files (relative to working dir).
-- `write_file(file_path='...', content='...')` — Create/overwrite files.
-- `glob(pattern='...')` — File discovery.
-- `grep_search(pattern='...')` — Content search across `.py`, `.md`, `.txt`, `.bat`.
-- `run_shell_command(command='...')` — Run any shell command (30s timeout).
-- `web_search(query='...')` — Search DuckDuckGo for real-time information (returns top 5 result titles).
-- `browse_url(url='...')` — Fetch webpage content, strip HTML tags, extract readable text.
-- `deep_research(topic='...', max_searches=3)` — Autonomous multi-source research agent that searches, browses, and synthesizes findings into a structured markdown report.
+#### Sessions, workspace, and tools
+- **Sessions** — `/sessions` lists saved sessions; `/new`, `/load <id>`, `/delete <id>`,
+  `/rename <name>` manage them. Stored as JSON in `sessions_cli/` (history + workspace
+  context + generation settings), auto-named from the first message.
+- **Working directory** — `/cd <path>` / `/pwd` set the root for all file tools.
+- **Workspace context** — `/workspace <path>` scans a directory and injects its file tree
+  into the system prompt so the agent knows which files you're looking at.
+- **Agent tools (via `[TOOL: name(args)]`)** — `read_file`, `write_file`, `glob`,
+  `grep_search`, `run_shell_command`, `web_search`, `browse_url`,
+  `deep_research(topic, max_searches)`.
 
 ### Web Chatbot (`web_chatbot.py`) — Cyberpunk UI
 
 ```cmd
-run_web_chatbot.bat   →   http://localhost:5000
+run_web_chatbot.bat            →   http://localhost:5000
+:: or
+cuda\Scripts\python.exe web_chatbot.py --port 5000 --host localhost
 ```
 
-> **Bind address:** `http://localhost:5000` (`127.0.0.1:5000` is an alias). The server uses `allow_reuse_address` and logs every request as `[HTTP] 127.0.0.1 - - [DATE] "METHOD PATH HTTP/1.1" STATUS -`. If the port is busy it reports `[ERROR] Could not bind to localhost:5000`. Always use `http://` — `https://` will not connect.
+> **Bind:** `http://localhost:5000` (also `127.0.0.1:5000`). Always use `http://` —
+> `https://` will not connect. If the port is busy the server logs
+> `[ERROR] Could not bind to localhost:5000`.
 
 **Features:**
-
 - **Cyberpunk aesthetic** — dark theme, neon accents, toggleable CRT scanline overlay.
 - **Persona switcher** — *Ashen AI Agent*, *Code Architect*, *Cyber Companion*.
-- **Model Hub modal** — browse local `.pk1`/`.gguf` checkpoints **and Qwen HuggingFace dirs** (e.g. `ashen_gpt_model/`, auto-tagged `QWEN`), upload new weights, swap models live.
-- **Quick-action chips** — one-click buttons for common agent tools (*File Glob*, *Grep*, *Git Status*, *Run Tests*, *Web Search*, *Browse URL*, *Deep Research*).
+- **Model Hub modal** — browse local `.pk1`/`.gguf` checkpoints **and Qwen HuggingFace
+  dirs** (e.g. `ashen_gpt_model/`, auto-tagged `QWEN`), upload weights, swap models live.
+  GGUF alternatives (e.g. `Jackrong_Qwopus3.5-9B-coder-Exp-Q3_K_M.gguf`) are switchable here.
+- **Quick-action chips** — one-click buttons for common tools (*File Glob*, *Grep*,
+  *Git Status*, *Run Tests*, *Web Search*, *Browse URL*, *Deep Research*).
+- **Live CoT streaming** — `POST /api/chat/stream` returns NDJSON
+  (`thought_delta → thought_done → response_delta → response_done → done`, plus
+  `tool_start`/`tool_result` mid-loop); the UI updates the thought `pre` and response `div`
+  in place with a live cursor. Batched `POST /api/chat` is the fallback.
+- **Web browsing & research** — `web_search` (DuckDuckGo, top 5 titles+links), `browse_url`
+  (fetches + strips a page to readable text), and `deep_research` (autonomous
+  search → browse → synthesize into a cited markdown report).
+- **Adjustable settings** — temperature, top-k, top-p, max tokens, context length, GPU
+  layers, repeat penalty, precision, CPU offload. Low-end GPU presets (FP16/BF16, CPU
+  offload layers) for <8 GB cards. Optional **speculative decoding** with a draft model.
+- **Session export & purge**, **workspace browser**, and **workspace context injection**.
 
-#### 🌐 Web Browsing & Research
-
-The model can autonomously access live internet data:
-
-| Tool | Description |
-|---|---|
-| `web_search` | Searches DuckDuckGo HTML interface, returns top 5 result titles with links. |
-| `browse_url` | Fetches any webpage, strips HTML tags, extracts readable text (2K char limit). |
-| `deep_research` | Autonomous multi-step research agent: searches → browses → synthesizes into markdown report. |
-
-**Deep Research Workflow:**
-1. **Phase 1**: Initial DuckDuckGo search for topic overview
-2. **Phase 2**: Browses top sources, extracts key paragraphs ranked by informativeness
-3. **Phase 3**: Follow-up searches on related topics
-4. **Output**: Structured markdown report with source URLs and citations
-
-Configurable depth via `max_searches` parameter. New quick-action buttons in sidebar for instant web research.
-- **Adjustable settings** — temperature, top-k, max tokens, context length, GPU layer count, repeat penalty.
-- **Session export & purge** — export chats as Markdown (`.md`) or purge history instantly.
-- **Workspace browser** — navigate project directory directly from the UI.
-- **Workspace context injection** — browsing any folder automatically injects its file tree into the model's system prompt so the agent is aware of which files you're examining.
-
-#### ⚙️ Advanced Model & Inference Settings
-
-##### Low-End GPU Optimization
-
-For running larger models on GPUs with limited VRAM (<8GB):
-
-| Setting | Description | VRAM Savings |
-|---|---|---|
-| **Low-End GPU Mode** | Enables aggressive memory optimizations | ~30% |
-| **FP16 Precision** | Half-precision floating point (~50% less VRAM) | ~40% |
-| **BF16 Precision** | BFloat16 precision (balanced quality/performance) | ~40% |
-| **CPU Offload Layers** | Moves transformer layers to system RAM | Scales with layer count |
-
-**Recommended Configurations:**
-
-| GPU VRAM | Precision | CPU Offload | Expected Speed |
-|---|---|---|---|
-| **2-4GB** | FP16 | 8-12 layers | Slow but functional |
-| **6GB** | FP16 | 4-8 layers | Moderate |
-| **8GB+** | BF16/FP32 | 0-2 layers | Good |
-
-Configurable via ⚙️ Settings modal → 🔧 Low-End GPU Optimization section.
-
-##### Draft Model & Speculative Decoding
-
-Enable faster generation using a secondary "draft" model:
-
-- **Speculative Decoding**: Draft model proposes tokens, main model verifies them in parallel
-- **Configuration**: Enable toggle + adjust draft temperature in Settings modal
-- **Requirement**: Place draft model at `ashen_gpt_model_draft.pk1` or upload via Model Hub
-
-##### Standard Settings
-
-- **Temperature**, **Top-K**, **Top-P** (Nucleus Sampling), **Max Output Tokens**, **Context Length**, **GPU Offload Layers**, **Repeat Penalty**.
-
-| Action | Description |
-|---|---|
-| 📝 New Chat | Creates a fresh session; first message auto-names it. |
-| 💬 Sessions Panel | Slide-out sidebar listing all past sessions with msg count & timestamps. |
-| Load / ✎ / × | Click to restore full conversation history, rename, or delete a session. |
-| Auto-save | Every chat message is persisted to `sessions/*.json`; settings, persona, and workspace context travel with each session. |
-
-Sessions are stored as JSON files in `sessions/` and include: conversation history, persona choice, generation settings, and active workspace context.
-
-#### ⚙️ Settings Persistence & Live Tuning *(new 2026-08-29)*
-
+#### Settings persistence (`settings.json`)
 `web_chatbot.py` resolves `settings.json` via `__file__` so it works regardless of `cwd`:
 
-```
+```python
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'settings.json')
 ```
 
-Precedence: `CLI --settings <path>` > `SETTINGS_PATH` / `ASHEN_SETTINGS` env > `settings.json` next to the script. On first run a default file is auto-created and merged so partial saves never wipe `current_model`.
+Precedence: `CLI --settings <path>` > `SETTINGS_PATH` / `ASHEN_SETTINGS` env > `settings.json`
+next to the script. On first run a default file is auto-created and merged, so partial saves
+never wipe `current_model`.
 
 | Key | Default | Notes |
 |---|---|---|
-| `temperature` | `0.70` | Auto-tune lowers by `0.05` (floor `0.40`) when down-vote ratio > 35 % |
-| `top_k` / `top_p` | `40` / `0.9` | Live-applied via `reasoner.update_settings(...)` |
+| `temperature` | `0.70` | |
+| `top_k` / `top_p` | `40` / `0.9` | |
 | `max_new_tokens` / `context_length` | `250` / `8192` | |
 | `gpu_layers` / `precision` / `cpu_offload_layers` | `16` / `fp16` / `0` | |
-| `current_model` | `ashen_gpt_model.pk1` (relative to the script dir) — *or* an absolute/relative HF dir like `ashen_gpt_model` (Qwen3.5). Switchable to `Jackrong_Qwopus3.5-9B-coder-Exp-Q3_K_M.gguf` via Model Hub |
-| `show_chain_of_thought` | `true` | Header toggle `🧠 CoT: ON/OFF` + Settings checkbox, persists to `settings.json` |
+| `current_model` | `ashen_gpt_model.pk1` — or an HF dir like `ashen_gpt_model` (Qwen3.5) | |
+| `show_chain_of_thought` | `true` | |
 
-APIs: `GET /api/settings/load`, `POST /api/settings/save → {"status":"saved"}`, `GET /` injects `{{current_model_filename}}` so the UI never leaks the placeholder. CLI: `python web_chatbot.py [--settings "..."] [--host localhost] [--port 5000]` and `run_web_chatbot.bat` forwards `%*`.
+#### Self-improvement loop, Swarm, and Council
+- **Self-improvement** — file-based (no DB): `feedback.json` (last 500 ratings) +
+  `self_improvement.json` (`{stats, log, suggestions}`). Every reply has
+  `👍 / 👎 / 🔄 Retry` → `POST /api/feedback`; `🔄 Retry` / correction re-runs the engine
+  with `User correction:` injected. The `🧬 Self-Improve` dashboard shows stats and an
+  Auto-Tune (drops temperature when down-vote ratio is high).
+- **Swarm** — spawns 2–6 isolated engine copies (roles: Researcher/Coder/Critic/Planner/
+  Executor/Analyst) in `parallel` / `divide` / `debate` modes, then a Synthesizer merges the
+  drafts. Live variant streams each agent's CoT.
+- **Council** — drafts → critics vote & suggest → tallied winner → finalizer refines.
+  Useful for hard prompts that benefit from multi-perspective critique.
 
-#### 🧠 Chain-of-Thought — Live Streaming *(new 2026-08-29)*
-
-Every reply returns `{"thought": "...", "response": "...", "model": "...", "show_chain_of_thought": bool}`. The UI renders an **expanded, cyan-bordered `🧠 Chain-of-Thought — <model>` panel** (open by default, collapsible via `Show thought` header) + the final markdown response. Rendering uses `marked@12.0.1/marked.min.js` with a safe fallback and try/catch so `ReferenceError: marked is not defined at appendMessage` cannot recur.
-
-**Real-time streaming** — thoughts no longer pop in after the full call. New streaming pipeline:
-
-- `AshenGPTLanguageModel.generate_stream(index, ...)` yields one decoded token at a time from `model.forward`, so CoT tokens are produced during inference rather than batched.
-- `AshenAIAgenticEngine.solve_with_agent_stream(prompt)` yields NDJSON events `thought_delta → thought_done → response_delta → response_done → done` per token (and `tool_start`/`tool_result` mid-loop), with `_is_gibberish` + `_synthesize_relevant_cot_and_response` fallback streaming a prompt-relevant CoT if the small `ashen_gpt_model.pk1` produces gibberish.
-- Endpoints `POST /api/chat/stream`, `/api/swarm/stream`, `/api/council/stream` send `application/x-ndjson` with `Cache-Control: no-cache` and `wfile.flush()` per line; `POST /api/chat`/`/api/swarm`/`/api/council` remain as batched fallbacks.
-- Frontend `sendMessage()` / `runSwarm()` / `runCouncil()` create a **live placeholder** (`▌` pulsing cursor in both thought `pre` and response markdown) with `AbortController`, consume `response.body.getReader()` (`TextDecoder` NDJSON), and update the CoT `pre` and response `div` in place — `done` replaces the buffers with the final `marked.parse` output and swaps the footer from `● streaming…` to `Was this helpful? [👍][👎][🔄 Retry]`. Batch path is kept as fallback when `ReadableStream` is unavailable.
-
-Verified: `what is the capital of France? → thought contains france true, response Paris true`; `quantum`, `haiku rain` etc. stream to `**Paris**` / `qubits` live.
-
-#### 🧬 Self-Improvement Loop *(new 2026-08-29)*
-
-File-based, no DB: `feedback.json` (last 500) + `self_improvement.json` `{stats:{total_feedback,up,down,gibberish_fixes,auto_tunes,corrections,gibberish_rate}, log:[{type, ...}], suggestions:[]}`.
-
-- Every assistant bubble has `Was this helpful? [👍][👎][🔄 Retry]` → `POST /api/feedback {rating, prompt, response, thought, correction, model}` (truncates prompt 600/response 800/thought 800/correction 1000; 4/15 down-votes injects a hint suggestion).
-- `🔄 Retry` / correction modal → `POST /api/self-improve {action:"regenerate", prompt, correction}` injects `User correction:` into `workspace_context` and re-runs `solve_with_agent` with `*🔧 Self-improved*` marker.
-- Header `🧬 Self-Improve` → dashboard modal: stats grid, `Analyze` / `Auto-Tune` (down_ratio > 0.35 → temp −0.05) / `Benchmark` (~30 s, 12 prompts), suggestions list, log tail, feedback tail.
-- Benchmark tool also exposed as `[TOOL: run_benchmark()]` and via the quick-action **Run Benchmark** button.
-
-APIs: `GET /api/self-improve`, `GET /api/feedback`, `POST /api/self-improve {action: regenerate|auto-tune|analyze, run_benchmark}`.
-
-#### 🐝 Swarm — Parallel Subagents *(new 2026-08-29)*
-
-Spawns **2–6 isolated `AshenAIAgenticEngine(model,decode,encode,device,max_steps=3)` copies** sharing the CUDA weights, serialized via `_swarm_lock`, with cyclic role prompts `Researcher / Coder / Critic / Planner / Executor / Analyst`. Modes `parallel` (concurrent on same task), `divide` (split on `; . \n`), `debate` (sequential critique chain). A **Synthesizer** prompt merges drafts, with `_is_gibberish` fallback to the longest draft.
-
-- Header `🐝 Swarm` → modal: `Swarm Task` textarea, `Agents 2–6` slider with live preview, `Mode parallel|divide|debate`, `🐝 SPAWN SWARM`, status `≈ drafts*4s`, model path, roles preview, results grid.
-- `POST /api/swarm {task|prompt, n_agents:2-6, mode}` → `{task, mode, num_agents, agents:[{id,role,thought,response,model}], synthesis:{thought,response}, elapsed_s, model, model_path}` appended to the current session. `GET /api/swarm` → `{roles[6], recent_runs, model, model_path}`.
-- Live variant `POST /api/swarm/stream` streams `agent_start → agent_thought_delta/agent_response_delta → agent_done → synthesis_thought_delta → done` so each agent's CoT appears progressively.
-
-Synthesized answer auto-appends to chat via `appendMessage('assistant', synthesis.thought, synthesis.response, model)` with per-agent `→ Chat / Copy`.
-
-#### 🏛️ Council — Critics Voting *(new 2026-08-29)*
-
-Like Swarm but **drafts → critics vote & suggest → tallied winner → finalizer refines**:
-
-1. **Drafts** `N=2–5` proposer agents (role-cycling prompts, `_swarm_lock`) produce candidates.
-2. **Critics** `M=2–5` from `Accuracy / Clarity / Completeness / Safety / Efficiency Critic`, each prompted `Draft <id>: Score <1-10> - Suggestion: …` then `VOTE: <id>` (temp 0.65 / max 220). Parser falls back to heuristic scoring (`_is_gibberish → 3` else `5 + overlap*3 + len/350`) so the untrained pk1 still votes usefully.
-3. **Tally** `tally[id] = vote count`, `score_sum[id] = Σ scores` → winner = `max(tally, score_sum, length)`; winner suggestions collected as `"- [Critic] …"`.
-4. **Finalizer** prompt `Winning draft + Council critiques + other drafts → <think> + final response`, with gibberish fallback to `winner + suggestions_block`.
-
-- Header `🏛️ Council` → modal: task textarea, `Drafts 2–5` + `Critics 2–5` sliders, threshold `0–5`, `🏛️ CONVENE COUNCIL`, status, model path, roles preview, results with **Votes table** (`Winner: D1 — picks 2, score 12` + per-critic rows), **Drafts** 2-col winners starred/ringed, **Critics** 2-col with vote/suggestion, **Final Council Answer** collapsible CoT + markdown + `→ Chat / Copy`.
-- APIs: `GET /api/council → {roles, proposers, recent_runs, model, model_path}`, `POST /api/council {task, num_drafts, num_critics, threshold}` → `{drafts, critics:[{votes,suggestions,pick,thought,response}], tally, score_sum, winner, suggestions, final:{thought,response}, elapsed_s, model}`, and live `POST /api/council/stream → draft_start → draft_thought_delta → draft_done → critic_* → tally → final_thought_delta → done`. Logged as `type:'council'` in `self_improvement.json`.
+#### LLM benchmark suite
+Built-in evaluation across 5 categories (Knowledge, Code Generation, Math Reasoning,
+Language Understanding, Ethics & Safety) with 12 standardized questions and a letter grade.
+Trigger via `[TOOL: run_benchmark()]` or the web **Run Benchmark** button (~30–60 s).
 
 ---
 
-#### 🧪 LLM Benchmark Suite
+## Training & Fine-Tuning
 
-Built-in evaluation framework that tests model performance across 5 capability categories with 12 standardized questions:
+There are **two** training entry points, one per model pipeline. Both tee their output to
+**`training_logs.txt`** (real-time, ANSI-stripped) in addition to the terminal.
 
-| Category | # Tests | Description |
-|---|---|---|
-| **Knowledge** | 3 | Factual questions (Python release year, RAM definition, WWW creator) |
-| **Code Generation** | 2 | Algorithm implementation (fibonacci recursion, bubble sort) |
-| **Mathematical Reasoning** | 3 | Arithmetic & algebra (simple calc, quadratic eq., square root) |
-| **Language Understanding** | 2 | Comprehension & translation (pronoun reference, Spanish translation) |
-| **Ethics & Safety** | 1 | Judgment assessment (password sharing safety) |
+### `qwen_finetune.py` — LoRA fine-tune of the Qwen3.5 checkpoint (default)
 
-**Scoring System:**
-- Keyword matching against expected answers (proportional scoring)
-- +0.5 bonus for chain-of-thought reasoning (`<think>` tags)
-- Total possible: **23 points** across all tests
-- Letter grade assignment (A+ at 90%+, D at <50%)
+Fine-tunes `Qwen_Qwen3.5-0.8B` (or an existing `ashen_gpt_model/` resume) with **LoRA in
+bf16** and emits a **merged HuggingFace checkpoint** at `ashen_gpt_model/` (plus a small
+`class_head.pt` for intent routing). This is the model the chatbots load by default.
 
-**Report Features:**
-- Summary table with total/earned points and overall percentage
-- Category breakdown scores with percentages
-- Detailed per-question results with keyword match % and emoji grades
-- Final letter grade based on aggregate performance
+Why LoRA/bf16: a 0.75B bf16 base (~1.5 GB) + LoRA adapters (~9M params) + AdamW state +
+activations fits comfortably in 8.59 GB; a full bf16 fine-tune would not.
 
-**Usage:**
-- `[TOOL: run_benchmark()]` — Trigger full suite via agent tool
-- 📖 **"Run Benchmark"** button in web chatbot quick actions
-- Runs ~30-60 seconds; outputs structured markdown report
+- **Behavior is baked into training data, not the prompt.** The `SYSTEM_PROMPT` carries a
+  `REASONING GUIDE` (show your work → self-critique → weigh approaches → final answer), and
+  the SFT pool includes explicit chain-of-thought examples. Per the project rule, *all*
+  "how to respond" behavior lives in SFT/DPO data — the inference prompt is never used to
+  steer style.
+- **Reasoning in the training loop.** The eval step streams generation token-by-token: the
+  chain-of-thought prints **in gray**, flips to **white** when the model reaches its answer,
+  and flushes every token so you watch it in real time. The plain-text reply is also written
+  to `training_logs.txt`.
+- **Key knobs (env vars):**
+  - `QWEN_ITERS` — training iterations (default `200`)
+  - `QWEN_EVAL_EVERY` — eval/stream cadence (default `20`)
+  - `QWEN_CKPT_EVERY` — periodic merged checkpoint (default = eval cadence)
+  - `QWEN_GEN_TOKENS` — eval generation length (default `64`)
+  - `QWEN_CORPUS` — set `1` to train on the raw book/code corpora instead of the curated SFT
+    examples
+  - `QWEN_LORA_R` / `QWEN_LORA_ALPHA` / `QWEN_LORA_DROPOUT` — LoRA rank / alpha / dropout
+    (default rank `32`)
+  - `QWEN_KV_CAP` / `QWEN_GEN_CAP` — inference-time VRAM caps (default `2048` / `512`)
+  - `QWEN_EVAL_PROMPT` / `QWEN_PROMPT_POOL` — override the eval prompt (single / `|||`-joined)
+  - `QWEN_SFT_JSONL` / `QWEN_CLS_JSONL` — paths to SFT / classification data
+- **Width-upscale on resume** — hidden size is widened by √2 (copy-init, depth unchanged) so
+  a resumed run grows capacity without retraining from scratch.
+- **Checkpoints** — `save_checkpoint()` merges LoRA via `merge_and_unload()` into a plain
+  `Qwen3_5ForCausalLM`, writes `ashen_gpt_model/`, and keeps a timestamped history copy
+  `ashen_gpt_model.ckpt-{it}`.
+
+Run it:
+
+```cmd
+cuda\Scripts\python.exe qwen_finetune.py
+:: or
+run_qwen_finetuner.bat
+```
+
+### `ashen_gpt_trainer.py` — legacy custom-model pre-training
+
+Trains the from-scratch Qwen-style **MoE** (SwiGLU, 4 experts, Top-2 gating) on the
+book/code corpus and saves `ashen_gpt_model.pk1`. Architecture: `n_embd=512`,
+`n_layer=8`, `n_head=8`, `block_size=8192`, progressive context (512 → 2K → 8K),
+gradient checkpointing at long context, and **width-upscaling by √2** (512 → 720) on re-run.
+Data is streamed from `train_split.txt` / `code_train_split.txt` / `val_split.txt` via
+memory-mapped windows (O(1) RAM regardless of dataset size). Output is teed to
+`training_logs.txt` through a `Tee` stdout wrapper.
+
+Run it:
+
+```cmd
+python ashen_gpt_trainer.py
+:: or
+run_ashen_gpt.bat
+```
 
 ---
 
-## 📊 Data Pipeline
+## Data Pipeline
 
-- **Literature**: `train_split.txt` / `val_split.txt` (validation split).
-- **Code**: `code_train_split.txt` (scraped from public GitHub repos).
-- Memory-mapped streaming (`mmap.mmap`) for O(1) RAM regardless of dataset size.
-- Hybrid random selection between text and code splits during training.
+- **Literature** — `train_split.txt` / `val_split.txt` (raw-text book corpus).
+- **Code** — `code_train_split.txt` (scraped public GitHub source).
+- **SFT / classification** — `qwen_finetune.py` consumes `sft_data.jsonl` /
+  `cls_data.jsonl` for reasoning + intent-routing examples.
+- Memory-mapped streaming (`mmap.mmap`) for O(1) RAM regardless of dataset size; the Qwen
+  trainer selects between text and code splits during training.
 
 ---
 
-## 🚀 Getting Started
+## Getting Started
 
 ### Prerequisites
+- Python 3.10+ (the bundled `cuda\` venv has torch + transformers + peft + bitsandbytes).
+- A CUDA GPU with 8 GB+ VRAM recommended (4-bit inference works on smaller cards).
 
-- Python 3.10+
-- PyTorch (with CUDA if available)
-- `pip install tiktoken requests`
-
-### Quick Start
+### Quick start
 
 | Script | Description | Command |
 |---|---|---|
-| `ashen_gpt_trainer.py` | Train / upscaling pre-training + SFT | `python ashen_gpt_trainer.py` or `run_ashen_gpt.bat` |
-| `qwen_finetune.py` | LoRA bf16 fine-tune + width-upscale the Qwen3.5 checkpoint (`ashen_gpt_model/`) | `cuda\Scripts\python.exe qwen_finetune.py` or `run_qwen_finetuner.bat` |
-| `chatbot.py` | Terminal-based agentic chatbot | `python chatbot.py` or `run_chatbot.bat` |
-| `web_chatbot.py` | Browser-based cyberpunk UI (port 5000) | `python web_chatbot.py` or `run_web_chatbot.bat` |
+| `ashen_gpt_trainer.py` | Legacy custom-model pre-training + width-upscale | `python ashen_gpt_trainer.py` / `run_ashen_gpt.bat` |
+| `qwen_finetune.py` | LoRA bf16 fine-tune + width-upscale the Qwen3.5 checkpoint (`ashen_gpt_model/`) | `cuda\Scripts\python.exe qwen_finetune.py` / `run_qwen_finentuner.bat` |
+| `chatbot.py` | Terminal-based agentic chatbot | `python chatbot.py` / `run_chatbot.bat` |
+| `web_chatbot.py` | Browser-based cyberpunk UI (port 5000) | `python web_chatbot.py` / `run_web_chatbot.bat` |
 
-`web_chatbot.py` quick start:
+**Web chatbot examples:**
 
 ```cmd
-cuda\Scripts\activate.bat
+call cuda\Scripts\activate.bat
 python web_chatbot.py                  :: → http://localhost:5000  (settings.json auto-created if missing)
 python web_chatbot.py --port 5000 --host localhost
 python web_chatbot.py --settings "C:\path\to\custom_settings.json"
 set SETTINGS_PATH=C:\path\to\settings.json && python web_chatbot.py
 ```
 
-`run_web_chatbot.bat`:
-
-```bat
-@echo off
-echo Loading settings from: settings.json (override with --settings ... or SETTINGS_PATH env)
-call cuda\Scripts\activate.bat
-python web_chatbot.py %*
-pause
-```
-
-### Workflow
-
-1. **Train** → the custom model produces `ashen_gpt_model.pk1` (~127M params, 8K context) via `ashen_gpt_trainer.py`; the Qwen3.5 default model (`ashen_gpt_model/`) is fine-tuned + width-upscaled via `qwen_finetune.py`.
-2. **Chat** → launch CLI or Web interface; the model loads the saved checkpoint automatically.
-3. **Agent mode** → ask the model to inspect files, run commands, or explore your workspace.
-4. **Evaluate** → `[TOOL: run_benchmark()]` or the web `Run Benchmark` button; use Swarm / Council for hard prompts and the Self-Improve dashboard to auto-tune from feedback.
+### Typical workflow
+1. **Train/fine-tune** — `qwen_finetune.py` produces the default `ashen_gpt_model/`;
+   `ashen_gpt_trainer.py` produces the legacy `ashen_gpt_model.pk1`.
+2. **Chat** — launch the CLI or web interface; the model loads the saved checkpoint
+   automatically (`current_model` in `settings.json` selects which).
+3. **Agent mode** — ask the model to inspect files, run commands, or explore your workspace.
+4. **Evaluate & improve** — `[TOOL: run_benchmark()]` or the web **Run Benchmark** button;
+   use Swarm / Council for hard prompts and the Self-Improve dashboard to tune from feedback.
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
-qwen_finetune.py       # LoRA (bf16) fine-tune of the Qwen3.5 checkpoint -> ashen_gpt_model/; width-only upscale on resume
+qwen_finetune.py       # LoRA (bf16) fine-tune of Qwen3.5 -> ashen_gpt_model/; width-upscale on resume; tees training_logs.txt
+ashen_gpt_trainer.py   # Legacy custom MoE pre-training -> ashen_gpt_model.pk1; Tee stdout -> training_logs.txt
 run_qwen_finetuner.bat # Windows launcher for qwen_finetune.py (cuda venv)
-ashen_gpt_model/       # Default model (Qwen3.5-0.8B, HF format): config.json + model.safetensors + class_head.pt
-ashen_gpt_model.pk1     # SFT-aligned custom model (~127M params, 8K context)
-ashen_gpt_model_dpo.pk1 # RL-aligned model (DPO preference optimization)
-Jackrong_Qwopus3.5-9B-Coder-GGUF/Qwopus3.5-9B-coder-Exp-Q3_K_M.gguf  # 4.4GB GGUF alternative (Model Hub switchable)
-settings.json           # Generation + display config (temperature, top_k/p, max_new_tokens, context_length, gpu_layers, precision, current_model, show_chain_of_thought)
-feedback.json           # Last 500 user ratings (👍/👎 + corrections)
-self_improvement.json   # {stats, log, suggestions} — swarm/council/gibberish_fix/regenerate/auto_tune entries
-training_logs.txt       # Auto-generated training log
-sessions/               # Web chatbot sessions (JSON with history, settings, context)
-sessions_cli/           # CLI chatbot sessions (JSON with history, workspace context)
-train_split.txt         # Literature training data
-val_split.txt           # Validation data
-code_train_split.txt    # Scraped code training data
-run_*.bat               # Windows launch scripts
+run_ashen_gpt.bat      # Windows launcher for ashen_gpt_trainer.py
+chatbot.py             # Self-contained CLI chatbot (no import of web_chatbot.py)
+web_chatbot.py         # Browser cyberpunk UI (stdlib http.server, port 5000)
+run_chatbot.bat        # Windows launcher for chatbot.py
+run_web_chatbot.bat    # Windows launcher for web_chatbot.py
+ashen_gpt_model/       # Default model (Qwen3.5 fine-tune, HF format): config.json + safetensors + class_head.pt
+ashen_gpt_model.pk1    # Legacy custom MoE model (~127M params, 8K context)
+ashen_gpt_model_lora/  # Adapter-only LoRA checkpoint from qwen_finetune.py
+settings.json          # Generation + display config (resolved via __file__)
+feedback.json          # Last 500 user ratings (👍/👎 + corrections)
+self_improvement.json  # {stats, log, suggestions} — swarm/council/gibberish_fix/regenerate/auto_tune entries
+training_logs.txt      # Auto-generated training log (terminal + this file, ANSI-stripped)
+sessions/              # Web chatbot sessions (JSON: history, settings, workspace context)
+sessions_cli/          # CLI chatbot sessions (JSON: history, workspace context)
+train_split.txt        # Literature training data
+val_split.txt          # Validation data
+code_train_split.txt   # Scraped code training data
+sft_data.jsonl         # Qwen SFT reasoning examples
+cls_data.jsonl         # Intent-classification examples
+run_*.bat              # Windows launch scripts
 ```
 
-**Key web endpoints** (all served by the stdlib `http.server` `ChatHandler`; unknown paths return `404`):
+**Key web endpoints** (served by the stdlib `http.server` `ChatHandler`; unknown paths → 404):
 
 *Core chat*
 | Method | Path | Purpose |
 |---|---|---|
-| `GET` | `/` | Cyberpunk UI — injects `current_model_filename`, shows `🧠 CoT` / `🧬 Self-Improve` / `🐝 Swarm` / `🏛️ Council` header |
+| `GET` | `/` | Cyberpunk UI — injects `current_model_filename` |
 | `POST` | `/api/chat` | `{message}` → `{thought, response, model, model_path, show_chain_of_thought}` (batched) |
-| `POST` | `/api/chat/stream` | NDJSON live: `start → thought_delta* → thought_done → response_delta* → response_done → done` (+ `tool_start`/`tool_result` mid-loop) |
+| `POST` | `/api/chat/stream` | NDJSON live: `thought_delta* → thought_done → response_delta* → response_done → done` (+ `tool_start`/`tool_result`) |
 | `POST` | `/api/clear` | Save current session, then clear history + workspace context |
 | `POST` | `/api/persona` | `{persona}` → switch active persona |
-| `POST` | `/api/settings` | `{...}` → `reasoner.update_settings(...)` (live apply, no file write) |
+| `POST` | `/api/settings` | `{...}` → live-apply (no file write) |
 
 *Sessions*
 | Method | Path | Purpose |
@@ -459,6 +406,6 @@ run_*.bat               # Windows launch scripts
 
 ---
 
-## 📜 License
+## License
 
 Distributed under the MIT License. See `LICENSE` for details.

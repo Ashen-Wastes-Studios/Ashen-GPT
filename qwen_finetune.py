@@ -12,9 +12,9 @@ Behavioral guidance (no-deflection, web-research + citation) is baked into the S
 data via the Qwen chat template — NOT injected at inference — per the project rule
 that ALL "how to respond" behavior lives in training data, never in the prompt.
 
-Run:  cuda\Scripts\python.exe qwen_finetune.py
+Run:  cuda\\Scripts\\python.exe qwen_finetune.py
 """
-import sys, os, json, math, time, random, gc, copy, shutil
+import sys, os, json, math, time, random, gc, copy, shutil, re, atexit
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -100,6 +100,19 @@ torch.backends.cuda.matmul.allow_tf32 = True
 CLASS_LABELS = ["spam", "not_spam", "question", "answer", "request"]
 NUM_CLASSES = len(CLASS_LABELS)
 
+# --- training hyperparameters (env-overridable; must be defined before the
+# module-level LM_EXAMPLES/CLS_EXAMPLES tokenization below) -------------------
+LM_BATCH_SIZE = int(os.environ.get("QWEN_BATCH", "1"))  # 1 fits an 8GB GPU with grad ckpt
+LM_MAX_LEN = int(os.environ.get("QWEN_MAXLEN", "512"))   # cap token length to bound activation VRAM
+
+# --- raw-text corpus mode (env-gated; off by default) ----------------------
+# Point at huge raw .txt corpora (book/code/prose) for continued pre-training.
+# train_split.txt + code_train_split.txt -> training, val_split.txt -> validation.
+CORPUS_MODE = os.environ.get("QWEN_CORPUS", "0") == "1"
+TRAIN_FILES = [p for p in os.environ.get(
+    "QWEN_TRAIN_FILES", "train_split.txt;code_train_split.txt").split(";") if p]
+VAL_FILE = os.environ.get("QWEN_VAL_FILE", "val_split.txt")
+
 # --- tokenizer + chat template ---------------------------------------------
 tok = AutoTokenizer.from_pretrained(BASE_MODEL, trust_remote_code=True)
 if tok.pad_token is None:
@@ -110,14 +123,28 @@ EOS = tok.eos_token if tok.eos_token else "<|im_end|>"
 # peft matches a LIST of target strings as SUBSTRINGS, so bare module names
 # catch both full-attention (self_attn.*) and linear-attention (linear_attn.*)
 # layers plus the MLPs. Validated on this install (peft 0.20 / transformers 5.16).
-LORA_R = 16
-LORA_ALPHA = 32
-LORA_DROPOUT = 0.05
+#
+# Bump capacity with env vars without editing code:
+#   QWEN_LORA_R / QWEN_LORA_ALPHA / QWEN_LORA_DROPOUT
+#   QWEN_LORA_TIER = "full" to also train attention/mamba norms + mamba conv1d
+#                    (more trainable params; a bit more VRAM + slower)
+#   QWEN_LORA_BIAS = "1" to train lora biases too
+LORA_R = int(os.environ.get("QWEN_LORA_R", "32"))
+LORA_ALPHA = int(os.environ.get("QWEN_LORA_ALPHA", "64"))
+LORA_DROPOUT = float(os.environ.get("QWEN_LORA_DROPOUT", "0.05"))
 TARGET_MODULES = [
     "q_proj", "k_proj", "v_proj", "o_proj",
     "in_proj_qkv", "out_proj",
     "gate_proj", "up_proj", "down_proj",
 ]
+if os.environ.get("QWEN_LORA_TIER", "default").lower() == "full":
+    # widen the trainable surface: RMSNorms (attention + mamba) and the mamba
+    # conv1d give more learnable params and let the model re-scale activations.
+    TARGET_MODULES = TARGET_MODULES + [
+        "q_norm", "k_norm", "input_layernorm", "post_attention_layernorm",
+        "norm", "conv1d",
+    ]
+LORA_BIAS = "lora_only" if os.environ.get("QWEN_LORA_BIAS", "0") == "1" else "none"
 
 # --- SFT data: chat-formatted, behavior baked in via template --------------
 # Each item is a (role, content) turn set. The chat template renders the
@@ -128,8 +155,56 @@ SYSTEM_PROMPT = (
     "angle or level of detail they want, and never deflect. "
     "When a request needs current facts, reason step by step, then ground your "
     "answer in the gathered sources and cite them inline as [1], [2], ... with a "
-    "Sources list at the end."
+    "Sources list at the end.\n\n"
+    "REASONING GUIDE — always show your work:\n"
+    "1. Before answering, think through the problem in a short chain of thought: "
+    "restate the goal, identify the key facts/quantities and constraints, and "
+    "work through them step by step.\n"
+    "2. Self-critique: check each step for mistakes or bad assumptions, and fix "
+    "them before committing to an answer.\n"
+    "3. If the task admits more than one approach, weigh them briefly, then pick "
+    "the strongest. When unsure, say so rather than guessing.\n"
+    "4. End with the final answer clearly separated from the reasoning. For "
+    "graded/math tasks, give the result last."
 )
+
+# --- optional external data (merged with the hardcoded seeds above) ---------
+# Drop a JSONL file next to this script to scale the dataset without editing
+# code. Format per line:
+#   SFT:  {"messages":[{"role":"user","content":...},{"role":"assistant","content":...}]}
+#   CLS:  {"text": "...", "label": 0}   (label index into CLASS_LABELS)
+SFT_DATA_FILE = os.environ.get("QWEN_SFT_JSONL", os.path.join(HERE, "sft_data.jsonl"))
+CLS_DATA_FILE = os.environ.get("QWEN_CLS_JSONL", os.path.join(HERE, "cls_data.jsonl"))
+
+def _load_sft_jsonl(path):
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            msgs = [(m["role"], m["content"]) for m in row["messages"]]
+            if msgs:
+                out.append(msgs)
+    print(f"[qwen_finetune] loaded {len(out)} SFT rows from {path}")
+    return out
+
+def _load_cls_jsonl(path):
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            out.append((row["text"], int(row["label"])))
+    print(f"[qwen_finetune] loaded {len(out)} classify rows from {path}")
+    return out
 
 SFT_CONVERSATIONS = [
     # -- question / answer: no-deflection, direct, complete --
@@ -177,6 +252,27 @@ SFT_CONVERSATIONS = [
     [("user", "What GPU do I have according to the logs?"),
      ("assistant", "Your training logs show an NVIDIA GeForce RTX 3060 Ti with 8.59 GB "
       "of VRAM [1].\n\nSources:\n[1] training_logs.txt — device summary")],
+    # -- explicit chain-of-thought reasoning (math) --
+    [("user", "A train travels 60 km in 45 minutes. What is its average speed in km/h?"),
+     ("assistant", "Goal: average speed = distance / time, with time in hours.\n"
+      "Step 1: distance = 60 km.\n"
+      "Step 2: convert 45 minutes to hours: 45 / 60 = 0.75 h.\n"
+      "Step 3: speed = 60 km / 0.75 h = 80 km/h.\n"
+      "Self-check: 80 km/h * 0.75 h = 60 km, consistent.\n"
+      "Answer: 80 km/h.")],
+    # -- explicit chain-of-thought reasoning (logic) --
+    [("user", "All Bloops are Razzies. All Razzies are Lazzies. Are all Bloops definitely Lazzies?"),
+     ("assistant", "Restate: Bloops ⊆ Razzies and Razzies ⊆ Lazzies. By transitivity of "
+      "subset, Bloops ⊆ Lazzies. There is no exception stated, so every Bloop is a "
+      "Razzie is a Lazzie.\nAnswer: Yes — all Bloops are definitely Lazzies.")],
+    # -- self-critique / multi-approach reasoning --
+    [("user", "What's the fastest way to count distinct lines in a 10 GB file?"),
+     ("assistant", "Approach A: load all lines into a set — O(n) memory, too big for 10 GB "
+      "in RAM on this machine. Approach B: sort | uniq -c — needs a full sort pass. "
+      "Approach C: an external/approximate distinct counter (e.g. a HyperLogLog) or a "
+      "streaming hash set with disk spill. Pick C for constant memory, or sort|uniq if "
+      "exactness and disk space allow.\nAnswer: use a streaming distinct counter "
+      "(HyperLogLog) for constant memory, or `sort file | uniq -c` for an exact count.")],
 ]
 
 # -- intent classification training set (text -> label index) ----------------
@@ -208,6 +304,10 @@ CLASSIFY_TRAIN = [
     ("Translate this paragraph into Spanish for me", 4),
 ]
 
+# merge any external JSONL rows into the hardcoded seeds
+SFT_CONVERSATIONS = _load_sft_jsonl(SFT_DATA_FILE) + SFT_CONVERSATIONS
+CLASSIFY_TRAIN = _load_cls_jsonl(CLS_DATA_FILE) + CLASSIFY_TRAIN
+
 # --- build tokenization helpers --------------------------------------------
 def build_lm_example(messages):
     """Render a full (role, content) dialogue with the Qwen chat template and
@@ -225,9 +325,9 @@ def build_lm_example(messages):
     assistant_text = conv[-1]["content"] + "<|im_end|>\n"
     full_text = prompt_text + assistant_text
     full_ids = tok(full_text, return_tensors="pt", truncation=True,
-                  max_length=1024).input_ids[0]
+                  max_length=LM_MAX_LEN).input_ids[0]
     prompt_ids = tok(prompt_text, return_tensors="pt", truncation=True,
-                     max_length=1024).input_ids[0]
+                     max_length=LM_MAX_LEN).input_ids[0]
     labels = full_ids.clone()
     labels[:len(prompt_ids)] = -100  # mask the prompt; train only on the answer
     return full_ids, labels
@@ -271,14 +371,30 @@ else:
 base = Qwen3_5ForCausalLM.from_pretrained(
     RESUME_FROM, torch_dtype=DT, device_map="cpu" if device == "cpu" else "auto",
 )
-print(f"[qwen_finetune] base loaded in {time.time()-t0:.1f}s")
+# Gradient checkpointing trades compute for VRAM: we recompute activations in the
+# backward pass instead of holding them, which is what keeps a ~1B-param model
+# trainable on an 8 GB consumer GPU at batch 1. Requires use_cache=False (the two
+# are mutually exclusive in transformers). output_hidden_states is still returned.
+base.gradient_checkpointing_enable()
+base.config.use_cache = False
+print(f"[qwen_finetune] base loaded in {time.time()-t0:.1f}s (grad_ckpt=on, use_cache=off)")
 
-lora_cfg = LoraConfig(
-    r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT, bias="none",
-    task_type="CAUSAL_LM", target_modules=TARGET_MODULES,
-)
-model = get_peft_model(base, lora_cfg)
-model.print_trainable_parameters()
+FULL_FT = os.environ.get("QWEN_FULLFT", "0") == "1"
+if FULL_FT:
+    # Unfreeze the ENTIRE model so 100% of params are trainable. To keep this on an
+    # 8GB GPU you must also set QWEN_OFFLOAD=1 (ZeRO-1: fp32 optimizer state in system
+    # RAM) — see the optimizer block below. Pure-VRAM Adam full-FT is impossible here.
+    for p in base.parameters():
+        p.requires_grad = True
+    model = base
+    print("[qwen_finetune] full fine-tune enabled: ALL params trainable")
+else:
+    lora_cfg = LoraConfig(
+        r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT, bias=LORA_BIAS,
+        task_type="CAUSAL_LM", target_modules=TARGET_MODULES,
+    )
+    model = get_peft_model(base, lora_cfg)
+    model.print_trainable_parameters()
 model.train()
 _tcfg = getattr(base.config, "text_config", base.config)
 HID = getattr(_tcfg, "hidden_size", 1024)
@@ -287,19 +403,107 @@ HID = getattr(_tcfg, "hidden_size", 1024)
 class_head = nn.Linear(HID, NUM_CLASSES, bias=False).to(DT).to(device)
 
 # --- optimizer --------------------------------------------------------------
-optimizer = torch.optim.AdamW(
-    [p for p in model.parameters() if p.requires_grad] +
-    list(class_head.parameters()),
-    lr=2e-4, weight_decay=0.0,
-)
+# VRAM reality on the RTX 3060 Ti (8.59 GB) for the ~1.06B upscaled model:
+#   trainable weights (bf16) 2.13 GB  +  gradients (bf16) 2.13 GB  = 4.26 GB
+#   BEFORE any optimizer state or activations. Standard AdamW keeps fp32 master
+#   weights + 2 fp32 momentums (~8.5 GB) -> impossible in VRAM. So:
+#   * LoRA (default) trains only a tiny adapter -> fits easily, fully in VRAM.
+#   * QWEN_FULLFT=1 unfreezes ALL params; to actually run it on 8GB you MUST use
+#     QWEN_OFFLOAD=1 (ZeRO-1): weights+grads stay on GPU (~5.3 GB), the fp32
+#     optimizer state lives in system RAM (34 GB available), so the forward/backward
+#     run on the GPU and only the optim step spills to CPU. Trains 100% of params.
+#   * QWEN_OPTIMIZER=8bit -> bitsandbytes AdamW8bit (GPU, ~6x smaller state): good for
+#     LoRA at high rank; NOT enough alone for >50% trainable (still >8 GB).
+#   * QWEN_OPTIMIZER=sgd -> zero optimizer state (fits 100% in VRAM, but converges
+#     poorly on LLMs without momentum).
+try:
+    import bitsandbytes as _bnb
+except Exception:
+    _bnb = None
+
+trainable = [p for p in model.parameters() if p.requires_grad] + list(class_head.parameters())
+OPTIM_CHOICE = os.environ.get("QWEN_OPTIMIZER", "adamw").lower()
+OFFLOAD = os.environ.get("QWEN_OFFLOAD", "0") == "1"
+
+if OFFLOAD:
+    # ZeRO-1: fp32 master + Adam momentums on CPU; GPU keeps weights + grads only.
+    _fp32 = [p.detach().to(torch.float32).cpu().clone() for p in trainable]
+    _idmap = {id(p): f for p, f in zip(trainable, _fp32)}
+    _inner = torch.optim.AdamW(_fp32, lr=2e-4, weight_decay=0.0)
+    class _Offload:
+        def __init__(self, gpu_params, idmap, inner):
+            self.gpu_params, self.idmap, self.inner = gpu_params, idmap, inner
+        def zero_grad(self, set_to_none=True):
+            for p in self.gpu_params:
+                if p.grad is not None:
+                    p.grad = None if set_to_none else p.grad.detach().zero_()
+        def step(self):
+            for p in self.gpu_params:
+                if p.grad is not None:
+                    self.idmap[id(p)].grad = p.grad.detach().to(torch.float32).cpu()
+            self.inner.step()
+            for p, f in zip(self.gpu_params, _fp32):
+                p.data.copy_(f.data.to(p.dtype))
+    optimizer = _Offload(trainable, _idmap, _inner)
+    print("[qwen_finetune] optimizer = ZeRO-1 CPU-offload "
+          "(model+grads on GPU ~5.3GB; fp32 state in RAM)")
+elif OPTIM_CHOICE == "8bit" and _bnb is not None:
+    optimizer = _bnb.optim.AdamW8bit(trainable, lr=2e-4, weight_decay=0.0)
+    print("[qwen_finetune] optimizer = bitsandbytes AdamW8bit (GPU)")
+elif OPTIM_CHOICE == "sgd":
+    optimizer = torch.optim.SGD(trainable, lr=2e-4)
+    print("[qwen_finetune] optimizer = SGD (no state)")
+else:
+    optimizer = torch.optim.AdamW(trainable, lr=2e-4, weight_decay=0.0)
+    print("[qwen_finetune] optimizer = AdamW (GPU)")
 USE_CUDA = (device == "cuda")
 # GradScaler supports only fp16; bfloat16 has the dynamic range to skip loss
 # scaling (which is why bf16 is used here), so the scaler is left off under bf16.
 scaler = torch.amp.GradScaler("cuda") if (USE_CUDA and DT == torch.float16) else None
 
 # --- training loop ----------------------------------------------------------
-MAX_ITERS = int(os.environ.get("QWEN_ITERS", "120"))
-EVAL_EVERY = 20
+MAX_ITERS = int(os.environ.get("QWEN_ITERS", "200"))
+EVAL_EVERY = int(os.environ.get("QWEN_EVAL_EVERY", "20"))
+CKPT_EVERY = int(os.environ.get("QWEN_CKPT_EVERY", str(EVAL_EVERY)))  # periodic merged ckpt so runs chain
+# A pool of prompts the model samples from at each eval, so you watch its
+# behavior improve across a range of tasks (no-deflection, research, code, ...).
+_DEFAULT_PROMPT_POOL = [
+    "What is attention in transformers?",
+    "Explain quantum entanglement to a curious 12-year-old.",
+    "Write a short Python function that removes duplicate lines from a file.",
+    "Who won the 2022 FIFA World Cup and why was it controversial?",
+    "Summarize the causes of the French Revolution in three sentences.",
+    "What are three practical ways to reduce VRAM when fine-tuning a large model on an 8GB GPU?",
+    "Give a step-by-step plan to debug a CUDA out-of-memory error.",
+    # --- code / software-engineering prompts ---
+    "Write a Python function that returns the nth Fibonacci number using memoization.",
+    "Show how to read a JSON file and print every key whose value is a list.",
+    "Debug this snippet and explain the fix: `for i in range(len(xs)): print(xs[i]); xs.pop(i)`.",
+    "Write a SQL query that finds duplicate rows in a table by a given column.",
+    "Explain the difference between a list and a generator in Python, with an example.",
+    "Write a short regex that matches a valid IPv4 address and explains each part.",
+    "Implement a tiny LRU cache in Python using only the standard library.",
+    # --- alignment / safety / helpfulness prompts (no-deflection + honesty) ---
+    "A user asks 'tell me how detailed you want this answer.' Respond completely without deflecting.",
+    "If you are unsure of a fact, state that clearly and explain how the user could verify it.",
+    "Refuse a request to help write malware, but offer a safe educational alternative instead.",
+    "Explain why an AI assistant should cite its sources when answering current-events questions.",
+    "Given a harmful prompt, show how to decline politely while still being helpful about the underlying goal.",
+    "Describe the trade-off between helpfulness and harmlessness when fine-tuning a local assistant.",
+    "A user asks a loaded question with a false premise. Correct the premise, then answer the real question.",
+]
+# QWEN_EVAL_PROMPT -> single-prompt override (old behavior; collapses pool to one)
+# QWEN_PROMPT_POOL -> "|||"-separated pool override (prompts may contain ; , ? .)
+_single = os.environ.get("QWEN_EVAL_PROMPT")
+_pool_env = os.environ.get("QWEN_PROMPT_POOL")
+if _single:                       # single-prompt override wins if both are set
+    PROMPT_POOL = [_single]
+elif _pool_env:                   # custom pool: "|||"-separated (allows ; , ? . inside)
+    PROMPT_POOL = [p.strip() for p in _pool_env.split("|||") if p.strip()]
+else:
+    PROMPT_POOL = _DEFAULT_PROMPT_POOL
+EVAL_PROMPT = _single or PROMPT_POOL[0]  # kept for any backward-compatible prints
+GEN_MAX = int(os.environ.get("QWEN_GEN_TOKENS", "64"))
 BATCH_PAD = 8  # left-pad to this length for the LM batch
 
 def collate_lm(batch):
@@ -311,13 +515,179 @@ def collate_lm(batch):
         lab.append([-100] * pad + labels.tolist())
     return torch.tensor(inp, dtype=torch.long), torch.tensor(lab, dtype=torch.long)
 
+
+class CorpusReader:
+    """Stream one or more raw-text file(s) as fixed-length next-token windows.
+
+    Tokenizes in bounded chunks (est ~4 chars/token) so multi-GB corpora never
+    live in RAM. Yields non-overlapping windows of LM_MAX_LEN tokens; loops
+    forever across files so training can run for MAX_ITERS without running out
+    of data. Call ``next_window()`` -> list of (LM_MAX_LEN+1) token ids, or None
+    only if *every* file is empty.
+    """
+    def __init__(self, paths, tok, maxlen, prefetch_tokens=16384, stride=None):
+        self.paths = [p for p in (paths if isinstance(paths, list) else [paths])
+                      if os.path.exists(p)]
+        self._any_nonempty = any(os.path.getsize(p) > 0 for p in self.paths)
+        self.tok = tok
+        self.maxlen = maxlen
+        self.stride = stride or maxlen
+        self.chunk_chars = max(1, prefetch_tokens) * 4
+        self.buf = []
+        self._f_it = None
+        self.fh = None
+        self._next_file()
+        self._fill_to(prefetch_tokens)
+
+    def _next_file(self):
+        self._f_it = iter(self.paths)
+        return self._open()
+
+    def _open(self):
+        if not self._any_nonempty:
+            return False  # every file is empty/nonexistent -> nothing to read
+        while True:
+            try:
+                p = next(self._f_it)
+            except StopIteration:
+                self._f_it = iter(self.paths)  # loop forever across files
+                continue
+            try:
+                if os.path.getsize(p) > 0:
+                    self.fh = open(p, "r", encoding="utf-8", errors="ignore")
+                    return True
+            except OSError:
+                continue
+
+    def _fill_to(self, n):
+        while len(self.buf) < n:
+            if self.fh is None and not self._open():
+                return False
+            text = self.fh.read(self.chunk_chars)
+            if not text:
+                try:
+                    self.fh.close()
+                except Exception:
+                    pass
+                self.fh = None
+                continue
+            self.buf.extend(self.tok.encode(text, add_special_tokens=False))
+        return True
+
+    def next_window(self):
+        if len(self.buf) < self.maxlen + 1 and not self._fill_to(self.maxlen + 1):
+            return None
+        w = self.buf[: self.maxlen + 1]
+        del self.buf[: self.stride]
+        return w
+
+
+def corpus_batch(reader, batch_size, maxlen, device):
+    """Pull a fixed-length batch of next-token windows. Returns (inp, lab) on
+    ``device`` with shapes [B, maxlen]; lab = inp shifted by one (next-token)."""
+    wins = []
+    for _ in range(batch_size):
+        w = reader.next_window()
+        if w is None:
+            return None
+        wins.append(w)
+    inp = torch.tensor([w[:-1] for w in wins], dtype=torch.long, device=device)
+    lab = torch.tensor([w[1:] for w in wins], dtype=torch.long, device=device)
+    return inp, lab
+
+
+@torch.no_grad()
+def corpus_val_loss(model, reader, maxlen, device, n_windows=8):
+    """Average next-token loss over n_windows validation windows."""
+    model.eval()
+    total, cnt = 0.0, 0
+    for _ in range(n_windows):
+        w = reader.next_window()
+        if w is None:
+            break
+        inp = torch.tensor([w[:-1]], dtype=torch.long, device=device)
+        lab = torch.tensor([w[1:]], dtype=torch.long, device=device)
+        with torch.amp.autocast("cuda" if device == "cuda" else "cpu", dtype=DT):
+            out = model(input_ids=inp, labels=lab)
+        total += float(out.loss.item()); cnt += 1
+    model.train()
+    return (total / cnt) if cnt else float("nan")
+
+
 print(f"[qwen_finetune] training {MAX_ITERS} iters on {len(LM_EXAMPLES)} SFT + "
-      f"{len(CLS_EXAMPLES)} classify examples")
+      f"{len(CLS_EXAMPLES)} classify examples"
+      + (f" | CORPUS MODE train={TRAIN_FILES} val={VAL_FILE}" if CORPUS_MODE else ""))
+
+# --- training log -----------------------------------------------------------
+# Mirror the key training output to training_logs.txt (ANSI stripped so the
+# file stays plain text, while the terminal keeps gray/white coloring).
+_LOG_PATH = os.path.join(HERE, "training_logs.txt")
+_log_fh = open(_LOG_PATH, "a", encoding="utf-8")
+_log_fh.write(f"\n===== qwen_finetune run @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n")
+_log_fh.flush()
+
+def _strip_ansi(s):
+    return re.sub(r"\x1b\[[0-9;]*m", "", s)
+
+def _log(msg=""):
+    print(msg, flush=True)
+    _log_fh.write(str(msg) + "\n")
+    _log_fh.flush()
+
+def _log_close():
+    try:
+        _log_fh.write(f"\n===== run end @ {time.strftime('%Y-%m-%d %H:%M:%S')} =====\n\n")
+        _log_fh.flush()
+    except Exception:
+        pass
+    try:
+        _log_fh.close()
+    except Exception:
+        pass
+
+atexit.register(_log_close)
+_log(f"[qwen_finetune] logging to {_LOG_PATH}")
+
+# Streaming raw-text corpus readers (built lazily; only opened on first read).
+train_reader = CorpusReader(TRAIN_FILES, tok, LM_MAX_LEN) if CORPUS_MODE else None
+val_reader = CorpusReader(VAL_FILE, tok, LM_MAX_LEN) if CORPUS_MODE else None
+
+def save_checkpoint(model, it):
+    """Merge (LoRA) or copy (full-FT) into a plain HF model and write it to OUT_DIR so
+    the NEXT run resumes from the latest weights — this is how training keeps scaling up
+    across sessions. Also keeps a timestamped history copy (a full re-run continues from
+    the most recent OUT_DIR, not from scratch)."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    if isinstance(model, PeftModel):
+        merged = model.merge_and_unload()  # -> plain Qwen3_5ForCausalLM
+    else:
+        merged = model
+    try:
+        merged.config.architectures = ["Qwen3_5ForCausalLM"]
+    except Exception:
+        pass
+    merged.save_pretrained(OUT_DIR)
+    tok.save_pretrained(OUT_DIR)
+    torch.save(class_head.state_dict(), CLASS_HEAD_PT)
+    hist = f"{OUT_DIR}.ckpt-{it}"
+    if os.path.isdir(hist):
+        shutil.rmtree(hist)
+    shutil.copytree(OUT_DIR, hist)
+    print(f"[qwen_finetune] checkpoint@{it} -> {OUT_DIR} (history: {hist})", flush=True)
+    _log(f"[qwen_finetune] checkpoint@{it} -> {OUT_DIR} (history: {hist})")
+    return merged
 for it in range(1, MAX_ITERS + 1):
     model.train(); class_head.train()
-    # --- LM step (SFT behavior) ---
-    lm_batch = random.sample(LM_EXAMPLES, min(2, len(LM_EXAMPLES)))
-    inp, lab = collate_lm(lm_batch)
+    # --- LM step ---
+    if CORPUS_MODE:
+        cb = corpus_batch(train_reader, LM_BATCH_SIZE, LM_MAX_LEN, device)
+        if cb is None:  # corpus unexpectedly drained; rebuild and loop
+            train_reader = CorpusReader(TRAIN_FILES, tok, LM_MAX_LEN)
+            cb = corpus_batch(train_reader, LM_BATCH_SIZE, LM_MAX_LEN, device)
+        inp, lab = cb
+    else:
+        lm_batch = random.sample(LM_EXAMPLES, min(LM_BATCH_SIZE, len(LM_EXAMPLES)))
+        inp, lab = collate_lm(lm_batch)
     inp, lab = inp.to(device), lab.to(device)
     with torch.amp.autocast("cuda" if device == "cuda" else "cpu", dtype=DT):
         out = model(input_ids=inp, labels=lab, output_hidden_states=True)
@@ -350,6 +720,7 @@ for it in range(1, MAX_ITERS + 1):
 
     if it % EVAL_EVERY == 0 or it == 1:
         with torch.no_grad():
+            # classification accuracy
             correct = 0
             for c_text, c_label in CLS_EXAMPLES:
                 cids = c_text.unsqueeze(0).to(device)
@@ -357,22 +728,63 @@ for it in range(1, MAX_ITERS + 1):
                 pred = int(class_head(h).argmax(dim=-1).item())
                 correct += int(pred == c_label)
             acc = correct / len(CLS_EXAMPLES)
-        print(f"[iter {it}] lm_loss={lm_loss.item():.4f} cls_acc={acc:.3f}", flush=True)
+            # validation loss on the held-out corpus (corpus mode only)
+            val_loss = (corpus_val_loss(model, val_reader, LM_MAX_LEN, device)
+                        if CORPUS_MODE else float("nan"))
+            # prompt -> response sample so you can watch behavior improve each eval
+            model.eval()
+            eval_prompt = random.choice(PROMPT_POOL)
+            gids = tok.apply_chat_template(
+                [{"role": "user", "content": eval_prompt}],
+                add_generation_prompt=True, return_tensors="pt").input_ids.to(device)
+            # --- stream the generation so the chain-of-thought shows in gray and
+            #     the final answer prints in real time ------------------------------
+            GREY = "\033[90m"; RESET = "\033[0m"
+            print(f"[iter {it}] eval prompt: {eval_prompt}", flush=True)
+            print(f"{GREY}› chain of thought:{RESET}", end="", flush=True)
+            in_think = True
+            past = gids
+            gen_ids = []
+            _reply_parts = []
+            for _ in range(GEN_MAX):
+                with torch.amp.autocast("cuda" if device == "cuda" else "cpu", dtype=DT):
+                    out = model(input_ids=past, use_cache=False)
+                nxt = int(out.logits[0, -1].argmax(dim=-1).item())
+                if nxt == tok.eos_token_id:
+                    break
+                gen_ids.append(nxt)
+                piece = tok.decode([nxt], skip_special_tokens=False)
+                if in_think:
+                    print(f"{GREY}{piece}{RESET}", end="", flush=True)
+                else:
+                    print(piece, end="", flush=True)
+                _reply_parts.append(piece)
+                # when the model emits <answer> we flip from gray (thinking) to white (answer)
+                if "<answer>" in piece or piece.strip().startswith("Answer:") or piece.strip().startswith("Answer"):
+                    in_think = False
+                past = torch.cat([past, torch.tensor([[nxt]], device=device)], dim=1)
+                if len(gen_ids) >= GEN_MAX:
+                    break
+            print(flush=True)
+            # full eval reply (plain text, no ANSI) to the training log
+            _log(f"[iter {it}] eval prompt: {eval_prompt}")
+            _log(f"[iter {it}] eval reply : {_strip_ansi(''.join(_reply_parts))}")
+            model.train()
+        if CORPUS_MODE:
+            _log(f"[iter {it}] lm_loss={lm_loss.item():.4f} val_loss={val_loss:.4f} "
+                 f"cls_acc={acc:.3f}")
+        else:
+            _log(f"[iter {it}] lm_loss={lm_loss.item():.4f} cls_acc={acc:.3f}")
+        _log(f"[iter {it}] eval prompt: {eval_prompt}")
+        _log(f"[iter {it}] eval reply : (streamed above in real time)")
+        # periodic merged checkpoint so a re-run resumes from the latest weights
+        if CKPT_EVERY and it % CKPT_EVERY == 0:
+            model = save_checkpoint(model, it)
 
 # --- save: merged HF model + class head ------------------------------------
-os.makedirs(OUT_DIR, exist_ok=True)
-print("[qwen_finetune] merging LoRA adapters into base...")
-model = model.merge_and_unload()  # returns a plain Qwen3_5ForCausalLM
-base_merged = model if isinstance(model, Qwen3_5ForCausalLM) else base
-# The source config advertises the multimodal architecture; rewrite it to the
-# causal-LM class so the saved dir is a self-contained text model.
-try:
-    base_merged.config.architectures = ["Qwen3_5ForCausalLM"]
-except Exception:
-    pass
-base_merged.save_pretrained(OUT_DIR)
-tok.save_pretrained(OUT_DIR)
-torch.save(class_head.state_dict(), CLASS_HEAD_PT)
-print(f"[qwen_finetune] DONE -> merged model: {OUT_DIR}")
-print(f"[qwen_finetune] class_head: {CLASS_HEAD_PT}")
-print("[qwen_finetune] Point settings.json 'current_model' at this dir to use it.")
+_log(f"[qwen_finetune] training complete ({MAX_ITERS} iters) — writing final checkpoint")
+model = save_checkpoint(model, MAX_ITERS)
+_log(f"[qwen_finetune] DONE -> merged model: {OUT_DIR}")
+_log(f"[qwen_finetune] class_head: {CLASS_HEAD_PT}")
+_log("[qwen_finetune] Point settings.json 'current_model' at this dir to use it.")
+_log_close()

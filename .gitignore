@@ -86,6 +86,7 @@ secrets.json
 
 *.pk1
 *.bak
+*.zip
 *GGUF/
 sessions/
 sessions_cli/
