@@ -2232,18 +2232,24 @@ def _input_box():
         return input(f"{THEME['user']}◇ YOU ▷ {RESET}")
     inner = max(10, cols - 2)
     tl, tr, bl, br, h, v = THEME["box"]
-    # redraw the box in the reserved bottom region (does not scroll the conversation)
-    sys.stdout.write(f"\033[{rows - BOX_H + 1};1H\033[0J")
-    sys.stdout.write(f"{tl}{h * inner}{tr}\n")
-    sys.stdout.write(f"{v} {THEME['user']}◇ YOU ▷ {RESET}")
+    start_row = rows - BOX_H + 1
+    prompt_row = start_row + 1
+    bottom_row = start_row + 2
+    # Draw the complete frame in the reserved bottom region. The scroll region
+    # above it remains available for the model's response.
+    sys.stdout.write(f"\033[{start_row};1H\033[0J")
+    sys.stdout.write(f"{tl}{h * inner}{tr}")
+    sys.stdout.write(f"\033[{bottom_row};1H{bl}{h * inner}{br}")
+    sys.stdout.write(f"\033[{prompt_row};1H{v} {THEME['user']}◇ YOU ▷ {RESET}")
     sys.stdout.flush()
     val = input()
-    # Clear the prompt box in place so the typed text disappears immediately,
-    # then park the cursor at the bottom of the scroll region so the model's
-    # output prints above the (now-blank) box, which is redrawn on the next
-    # prompt.
-    for _row in range(BOX_H):
-        sys.stdout.write(f"\033[{rows - BOX_H + 1 + _row};1H\033[2K")
+    # Clear only the prompt line after Enter, then redraw the empty prompt and
+    # bottom border. The box remains visible while the model responds.
+    sys.stdout.write(f"\033[{prompt_row};1H\033[2K")
+    sys.stdout.write(f"{v} {THEME['user']}◇ YOU ▷ {RESET}")
+    sys.stdout.write(f"\033[{bottom_row};1H{bl}{h * inner}{br}")
+    # Park the cursor at the bottom of the scroll region so model output stays
+    # above the still-visible box.
     sys.stdout.write(f"\033[{rows - BOX_H};1H")
     sys.stdout.flush()
     return val
