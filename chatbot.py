@@ -2487,7 +2487,14 @@ if __name__ == "__main__":
   /benchmark        Run the built-in evaluation suite""")
                 continue
 
-            print("Invalid command. Type /help for usage.")
+            if cmd.startswith('/'):
+                print("Invalid command. Type /help for usage.")
+                continue
+
+            # Preserve the submitted prompt in the scroll region above the
+            # response. The pinned input box is cleared after Enter, so this
+            # keeps the conversation readable while the model responds.
+            print(f"{THEME['user']}◇ YOU ▷ {prompt}{RESET}", flush=True)
 
             # auto-name first message in session
             if not current_session_id:
