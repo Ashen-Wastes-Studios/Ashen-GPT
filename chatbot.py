@@ -880,27 +880,38 @@ class AshenAIAgenticEngine:
                 url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
                 headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
                 try:
-                    resp = requests.get(url, headers=headers, timeout=10)
-                    if resp.status_code == 200:
-                        results = []
-                        for mm in re.finditer(
-                                r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-                                resp.text, re.DOTALL):
-                            real = _ddg_real_url(mm.group(1))
-                            title = re.sub(r'<[^>]+>', '', mm.group(2)).strip()
-                            if title and real:
-                                results.append((title, real))
-                        if results:
-                            lines = [f"DuckDuckGo results for '{query}':"]
-                            harvest = getattr(self, '_source_harvest', [])
-                            for i, (title, real) in enumerate(results[:6], 1):
-                                lines.append(f"{i}. {title}\n   {real}")
-                                harvest.append({"title": title, "url": real})
-                            lines.append(f"\nFound {len(results)} results. Use browse_url(url='...') "
-                                         "to fetch the full content of a specific page.")
-                            return "\n".join(lines)
-                        return f"No results found for '{query}'"
-                    return f"Search failed with status code {resp.status_code}"
+                    last_status = None
+                    for _attempt in range(3):
+                        resp = requests.get(url, headers=headers, timeout=10)
+                        last_status = resp.status_code
+                        if resp.status_code == 200:
+                            results = []
+                            for mm in re.finditer(
+                                    r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                                    resp.text, re.DOTALL):
+                                real = _ddg_real_url(mm.group(1))
+                                title = re.sub(r'<[^>]+>', '', mm.group(2)).strip()
+                                if title and real:
+                                    results.append((title, real))
+                            if results:
+                                lines = [f"DuckDuckGo results for '{query}':"]
+                                harvest = getattr(self, '_source_harvest', [])
+                                for i, (title, real) in enumerate(results[:6], 1):
+                                    lines.append(f"{i}. {title}\n   {real}\n")
+                                    harvest.append({"title": title, "url": real})
+                                lines.append(f"\nFound {len(results)} results. Use browse_url(url='...') "
+                                             "to fetch the full content of a specific page.")
+                                return "\n".join(lines)
+                            # 200 with no parseable results: do not retry, report it.
+                            break
+                        if resp.status_code == 202:
+                            import time as _t
+                            _t.sleep(1.5)
+                            continue
+                        break
+                    if last_status == 202:
+                        return "Web search failed after retries: DuckDuckGo returned HTTP 202"
+                    return f"Search failed with status code {last_status}"
                 except Exception as e:
                     return f"Web search error: {str(e)}"
 
@@ -930,21 +941,32 @@ class AshenAIAgenticEngine:
                     harvest = getattr(self, '_source_harvest', [])
                     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
-                    def _ddg_search(q):
+                    def _ddg_search_with_retry(q):
                         u = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(q)}"
-                        r = requests.get(u, headers=headers, timeout=10)
-                        out = []
-                        if r.status_code == 200:
-                            for mm in re.finditer(r'<a[^>]*class="result__a"[^>]*href="(.*?)"[^>]*>(.*?)</a>',
-                                                  r.text, re.DOTALL):
-                                link = _ddg_real_url(mm.group(1))
-                                title = re.sub(r'<[^>]+>', '', mm.group(2)).strip()
-                                if link and not any(sk in link.lower() for sk in
-                                                    ['duckduckgo.com', 'facebook.com', 'twitter.com', 'x.com']):
-                                    out.append((link, title))
-                        return out
+                        last_status = None
+                        for attempt in range(3):
+                            r = requests.get(u, headers=headers, timeout=10)
+                            last_status = r.status_code
+                            if r.status_code == 200:
+                                out = []
+                                for mm in re.finditer(r'<a[^>]*class="result__a"[^>]*href="(.*?)"[^>]*>(.*?)</a>',
+                                                      r.text, re.DOTALL):
+                                    link = _ddg_real_url(mm.group(1))
+                                    title = re.sub(r'<[^>]+>', '', mm.group(2)).strip()
+                                    if link and not any(sk in link.lower() for sk in
+                                                        ['duckduckgo.com', 'facebook.com', 'twitter.com', 'x.com']):
+                                        out.append((link, title))
+                                if out:
+                                    return out
+                                break
+                            if r.status_code == 202:
+                                import time as _t
+                                _t.sleep(1.5)
+                                continue
+                            break
+                        return []
 
-                    search_links = _ddg_search(topic)
+                    search_links = _ddg_search_with_retry(topic)
                     if not search_links:
                         return f"Research failed: no results for '{topic}'"
                     research_report += f"## Initial Search Overview\n\nTopic: `{topic}`\nFound {len(search_links)} relevant results.\n\n"
@@ -1090,11 +1112,9 @@ class AshenAIAgenticEngine:
     def solve_with_agent(self, prompt):
         self.model.eval()
         self._source_harvest = []
+        # Spam filtering removed per user request. Intent classification is
+        # retained only for request routing.
         _label, _idx, _conf = self.classify_input(prompt)
-        if _label == "spam":
-            _spam_msg = "I don't respond to spam or unsolicited promotional messages."
-            self.history.append((prompt, _spam_msg))
-            return "", _spam_msg
         if _label == "request":
             self.pending_requests.append({"prompt": prompt, "confidence": _conf})
 
@@ -1186,15 +1206,9 @@ class AshenAIAgenticEngine:
     def solve_with_agent_stream(self, prompt):
         self.model.eval()
         self._source_harvest = []
+        # Spam filtering removed per user request. Intent classification is
+        # retained only for request routing.
         _label, _idx, _conf = self.classify_input(prompt)
-        if _label == "spam":
-            _spam_msg = "I don't respond to spam or unsolicited promotional messages."
-            self.history.append((prompt, _spam_msg))
-            yield {"type": "done", "thought": "", "response": _spam_msg,
-                   "model": os.path.basename(current_model_filename),
-                   "model_path": current_model_filename, "sources": [],
-                   "intent": self.last_intent}
-            return
         if _label == "request":
             self.pending_requests.append({"prompt": prompt, "confidence": _conf})
         if getattr(self.model, "is_qwen", False):
