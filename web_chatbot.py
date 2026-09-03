@@ -18,8 +18,12 @@ import subprocess
 import glob as glob_module
 import datetime
 import base64
+import secrets
+import hashlib
 import requests
-from urllib.parse import urlparse, parse_qs
+import urllib.request
+import urllib.error
+from urllib.parse import urlparse, parse_qs, urlencode
 from pathlib import Path
 
 # --- Session Storage ---
@@ -110,7 +114,14 @@ DEFAULT_SETTINGS = {
     "show_chain_of_thought": True,
     "auto_swarm_council": False,
     "auto_web_research": False,
-    "current_model": "ashen_gpt_model.pk1"
+    "current_model": "ashen_gpt_model.pk1",
+    "active_backend": "local",
+    "api_provider": "",
+    "api_base_url": "",
+    "api_key": "",
+    "api_model": "",
+    "oauth_client_id": "",
+    "oauth_client_secret": "",
 }
 
 def _resolve_settings_file():
@@ -187,6 +198,17 @@ def save_settings_to_json(settings_data, path=None):
     except Exception as e:
         print(f"[Settings] Failed to save {target}: {e}", flush=True)
         return False
+
+def _public_settings(s):
+    """Settings safe to send to the browser: API key masked, never raw."""
+    out = dict(s) if isinstance(s, dict) else {}
+    out['api_key_set'] = bool((s.get('api_key') or '').strip()) if isinstance(s, dict) else False
+    if out.get('api_key'):
+        out['api_key'] = ''
+    if out.get('oauth_client_secret'):
+        out['oauth_client_secret'] = ''
+    out['google_client_configured'] = bool((s.get('oauth_client_id') or '').strip()) if isinstance(s, dict) else False
+    return out
 
 def parse_cli_args():
     """Parse CLI args for settings + server options without breaking existing invocations."""
@@ -290,6 +312,50 @@ def set_default_model(model_path):
     else:
         print(f"[Model] Path not found: {normalized_path}", flush=True)
         return False
+
+def switch_model(filename):
+    """Hot-swap the active LOCAL model (mirrors /api/models/switch).
+
+    Returns (ok, resp_dict). Sets active_backend=local on success; the API
+    backend is handled by switch_api_model. Shared by the switch endpoint
+    and use_local_backend so both take the same path.
+    """
+    global model, m, reasoner, current_model_filename
+    # Qwen HF model directory (produced by qwen_finetune.py): load it
+    # live via QwenModelAdapter so chat-templated generation + class_head
+    # routing work without a server restart.
+    if os.path.isdir(filename):
+        try:
+            _ch = os.path.join(filename, "class_head.pt")
+            new_model = QwenModelAdapter(filename, device, class_head_path=_ch)
+            model = new_model
+            m = new_model
+            reasoner.model = new_model
+            current_model_filename = filename
+            resp_data = {'status': 'success', 'filename': filename, 'type': 'qwen-hf'}
+        except Exception as e:
+            return False, {'status': 'error', 'message': f'Qwen load failed: {e}'}
+    elif filename.endswith('.gguf'):
+        # gguf: mark active (served via llama.cpp elsewhere); no in-process reload
+        current_model_filename = filename
+        resp_data = {'status': 'success', 'filename': filename, 'type': 'gguf'}
+    elif os.path.exists(filename):
+        try:
+            with open(filename, 'rb') as f:
+                model = pickle.load(f)
+            model = model.to(device)
+            m = model
+            reasoner.model = model
+            current_model_filename = filename
+            resp_data = {'status': 'success', 'filename': filename}
+        except Exception as e:
+            return False, {'status': 'error', 'message': str(e)}
+    else:
+        return False, {'status': 'error', 'message': 'File not found'}
+    settings['current_model'] = current_model_filename
+    settings['active_backend'] = 'local'
+    save_settings_to_json({'current_model': current_model_filename, 'active_backend': 'local'})
+    return True, resp_data
 
 # Parse CLI args early so --settings overrides are respected and logged
 _cli_args = parse_cli_args()
@@ -715,6 +781,832 @@ class QwenModelAdapter:
         return self
 
 
+# --- API provider models (OpenAI-compatible, via API key) -------------------
+# Optional backend: answer through a hosted, OpenAI-compatible chat API
+# (OpenAI, OpenRouter, Groq, Together, DeepSeek, Ollama, LM Studio, vLLM, or
+# any custom base URL) instead of a local checkpoint. Local loading is
+# untouched — settings `active_backend` ("local" | "api") picks which one
+# answers. The key resolves as: settings.json `api_key` > ASHEN_API_KEY env
+# > the provider preset's own env var. Prefer env vars: settings.json is
+# git-tracked, so a key saved there could be committed by accident.
+API_PROVIDER_PRESETS = {
+    "openai":     {"base_url": "https://api.openai.com/v1",      "env": "OPENAI_API_KEY"},
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1",   "env": "OPENROUTER_API_KEY"},
+    "groq":       {"base_url": "https://api.groq.com/openai/v1", "env": "GROQ_API_KEY"},
+    "together":   {"base_url": "https://api.together.xyz/v1",    "env": "TOGETHER_API_KEY"},
+    "deepseek":   {"base_url": "https://api.deepseek.com/v1",    "env": "DEEPSEEK_API_KEY"},
+    "ollama":     {"base_url": "http://localhost:11434/v1",      "env": ""},
+    "lmstudio":   {"base_url": "http://localhost:1234/v1",       "env": ""},
+    "google":     {"base_url": "https://generativelanguage.googleapis.com", "env": ""},
+    "anthropic":  {"base_url": "https://api.anthropic.com",      "env": "ANTHROPIC_API_KEY"},
+    "custom":     {"base_url": "",                               "env": "ASHEN_API_KEY"},
+}
+
+API_SYSTEM_PROMPT = (
+    "You are Ashen GPT, a precise AI assistant. "
+    "Answer every question completely and directly — never ask the user what "
+    "angle or level of detail they want, and never deflect. "
+    "When a request needs current facts, reason step by step, then ground your "
+    "answer in the gathered sources and cite them inline as [1], [2], ... with a "
+    "Sources list at the end.\n\n"
+    "Wrap your brief step-by-step reasoning in <think>...</think> tags, then "
+    "give the final answer clearly separated from the reasoning."
+)
+
+
+def _mask_api_key(key):
+    if not key:
+        return "(not set)"
+    s = str(key)
+    if len(s) <= 8:
+        return "****"
+    return f"{s[:3]}...{s[-4:]}"
+
+
+def _resolve_api_key(s):
+    if (s.get("api_key") or "").strip():
+        return s["api_key"].strip()
+    if os.getenv("ASHEN_API_KEY", "").strip():
+        return os.getenv("ASHEN_API_KEY").strip()
+    preset = API_PROVIDER_PRESETS.get((s.get("api_provider") or "").lower(), {})
+    env_name = preset.get("env", "")
+    if env_name and os.getenv(env_name, "").strip():
+        return os.getenv(env_name).strip()
+    return ""
+
+
+def _resolve_api_base_url(s):
+    if (s.get("api_base_url") or "").strip():
+        return s["api_base_url"].strip().rstrip("/")
+    preset = API_PROVIDER_PRESETS.get((s.get("api_provider") or "").lower(), {})
+    return (preset.get("base_url") or "").rstrip("/")
+
+
+def _api_http_json(method, url, api_key, payload=None, timeout=60):
+    """Minimal stdlib JSON client for OpenAI-compatible APIs. Raises RuntimeError."""
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"connection failed: {e.reason}")
+
+
+class APIModelAdapter:
+    """OpenAI-compatible chat backend used as engine.model when active_backend=api.
+
+    Same role as QwenModelAdapter (eval/train/classify/chat interface) but every
+    answer comes from the provider API keyed by `api_key` — no local weights.
+    """
+    is_api = True
+    is_qwen = False
+
+    def __init__(self, base_url, api_key, model_name, timeout=120):
+        self.base_url = (base_url or "").rstrip("/")
+        self.api_key = api_key or ""
+        self.model_name = model_name or ""
+        self.timeout = timeout
+
+    @property
+    def name(self):
+        return self.model_name
+
+    def eval(self):
+        return self
+
+    def train(self, mode=True):
+        return self
+
+    def classify(self, text):
+        return None, None, None
+
+    def list_models(self, timeout=30):
+        """List all model ids available under this provider API key (GET /models)."""
+        obj = _api_http_json("GET", self.base_url + "/models", self.api_key, timeout=timeout)
+        items = obj.get("data", []) if isinstance(obj, dict) else []
+        out = []
+        for it in items:
+            if isinstance(it, dict) and it.get("id"):
+                out.append({"id": it["id"], "owned_by": it.get("owned_by", "")})
+        return sorted(out, key=lambda m: m["id"])
+
+    def chat(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        payload = {"model": self.model_name, "messages": messages,
+                   "temperature": temperature, "max_tokens": max_tokens,
+                   "top_p": top_p, "stream": False}
+        obj = _api_http_json("POST", self.base_url + "/chat/completions",
+                             self.api_key, payload, self.timeout)
+        msg = obj["choices"][0].get("message", {})
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        if reasoning and "<think>" not in content:
+            return f"<think>\n{reasoning}\n</think>\n{content}"
+        return content
+
+    def chat_stream(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        """Yield (reasoning_delta, content_delta) tuples from the SSE stream."""
+        payload = {"model": self.model_name, "messages": messages,
+                   "temperature": temperature, "max_tokens": max_tokens,
+                   "top_p": top_p, "stream": True}
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = "Bearer " + self.api_key
+        req = urllib.request.Request(self.base_url + "/chat/completions",
+                                     data=json.dumps(payload).encode("utf-8"),
+                                     headers=headers, method="POST")
+        try:
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                body = ""
+            raise RuntimeError(f"HTTP {e.code}: {body}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"connection failed: {e.reason}")
+        with resp:
+            for raw in resp:
+                try:
+                    line = raw.decode("utf-8", "replace").strip()
+                except Exception:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                body = line[5:].strip()
+                if body == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(body)
+                except Exception:
+                    continue
+                choices = obj.get("choices", []) if isinstance(obj, dict) else []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}) or {}
+                yield (delta.get("reasoning_content") or "", delta.get("content") or "")
+
+
+def build_api_adapter_from_settings(s, key_override=None, allow_no_model=False):
+    """Return an API adapter from settings, or None if not configured.
+
+    provider 'google' uses account-login (OAuth) Bearer tokens against the
+    Gemini API; every other provider uses the OpenAI-compatible API key flow.
+    allow_no_model=True builds the adapter for /models listing when no
+    api_model is picked yet.
+    """
+    if (s.get("api_provider") or "").lower() == "google":
+        if not _google_logged_in() and not allow_no_model:
+            return None
+        name = (s.get("api_model") or "").strip()
+        if not name and not allow_no_model:
+            return None
+        return GeminiOAuthAdapter(name)
+    if (s.get("api_provider") or "").lower() == "anthropic":
+        name = (s.get("api_model") or "").strip()
+        if not name and not allow_no_model:
+            return None
+        try:
+            anthropic_credential()
+        except RuntimeError:
+            if not allow_no_model:
+                return None
+        return AnthropicMessagesAdapter(name)
+    base = _resolve_api_base_url(s)
+    name = (s.get("api_model") or "").strip()
+    if not base or (not name and not allow_no_model):
+        return None
+    key = key_override if key_override is not None else _resolve_api_key(s)
+    return APIModelAdapter(base, key, name)
+
+
+def apply_backend_settings(s):
+    """Point reasoner.model at the API backend when active_backend=api."""
+    global model, m
+    if (s.get("active_backend") or "local").lower() != "api":
+        return False
+    adapter = build_api_adapter_from_settings(s)
+    if adapter is None:
+        print("[API] active_backend=api but provider/model is not configured; staying on local.", flush=True)
+        return False
+    model = adapter
+    m = adapter
+    reasoner.model = adapter
+    return True
+
+
+# ---------------------------------------------------------------------------
+# OAuth / provider-account login (additive: API keys keep working as-is).
+#
+# Only providers that let a site login yield API credentials are supported:
+#   openrouter : login on openrouter.ai authorizes this app and returns a
+#                user API key -> stored as the OpenRouter api_key.
+#   google     : standard OAuth2 with your own free "Desktop app" client ID
+#                from Google Cloud Console -> access/refresh tokens used as
+#                Bearer credentials against the Gemini API.
+# OpenAI / Anthropic / Groq / Together / DeepSeek / xAI expose no
+# OAuth-for-API flow, so they stay API-key-only.
+# OAuth tokens live in oauth_tokens.json (gitignored), never settings.json.
+# ---------------------------------------------------------------------------
+OAUTH_FILE_NAME = "oauth_tokens.json"
+
+OPENROUTER_OAUTH_AUTH_URL = "https://openrouter.ai/auth"
+OPENROUTER_OAUTH_KEYS_URL = "https://openrouter.ai/api/v1/auth/keys"
+
+GOOGLE_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_OAUTH_SCOPES = "https://www.googleapis.com/auth/cloud-platform"
+
+# Anthropic subscription login (Claude Pro/Max OAuth, same flow Claude Code
+# uses). Fixed first-party client/redirect: the user copies a code from the
+# provider site and pastes it here (no localhost callback possible).
+ANTHROPIC_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f9e"
+ANTHROPIC_OAUTH_AUTH_URL = "https://console.anthropic.com/oauth/authorize"
+ANTHROPIC_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+ANTHROPIC_OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
+ANTHROPIC_OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
+ANTHROPIC_API_BASE = "https://api.anthropic.com"
+ANTHROPIC_BETA_OAUTH = "oauth-2025-04-20"
+
+OAUTH_PROVIDERS = ("openrouter", "google", "anthropic")
+
+_OAUTH_PENDING = {}
+
+
+def _oauth_file():
+    override = os.environ.get("ASHEN_OAUTH_FILE")
+    if override:
+        return override
+    try:
+        base = os.path.dirname(os.path.abspath(SETTINGS_FILE))
+    except Exception:
+        base = "."
+    return os.path.join(base, OAUTH_FILE_NAME)
+
+
+def load_oauth_tokens():
+    try:
+        with open(_oauth_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_oauth_token(provider, entry):
+    toks = load_oauth_tokens()
+    toks[provider] = entry
+    try:
+        with open(_oauth_file(), "w", encoding="utf-8") as f:
+            json.dump(toks, f, indent=2)
+    except Exception:
+        pass
+
+
+def clear_oauth_token(provider):
+    toks = load_oauth_tokens()
+    toks.pop(provider, None)
+    try:
+        with open(_oauth_file(), "w", encoding="utf-8") as f:
+            json.dump(toks, f, indent=2)
+    except Exception:
+        pass
+
+
+def _google_logged_in():
+    g = load_oauth_tokens().get("google") or {}
+    return bool(g.get("access_token") or g.get("refresh_token"))
+
+
+def _pkce_pair():
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+def oauth_build_auth_url(provider, redirect_uri, client_id=""):
+    """Return (auth_url, verifier, state). Auth endpoints are overridable via
+    env (ASHEN_OAUTH_AUTH_URL_<PROVIDER>) for offline tests."""
+    state = secrets.token_urlsafe(16)
+    verifier, challenge = _pkce_pair()
+    if provider == "openrouter":
+        base = os.environ.get("ASHEN_OAUTH_AUTH_URL_OPENROUTER", OPENROUTER_OAUTH_AUTH_URL)
+        return "%s?%s" % (base, urlencode({"callback_url": redirect_uri})), verifier, state
+    if provider == "anthropic":
+        # Manual copy-paste flow: fixed console redirect, so redirect_uri arg
+        # is ignored and no localhost listener is involved.
+        base = os.environ.get("ASHEN_OAUTH_AUTH_URL_ANTHROPIC", ANTHROPIC_OAUTH_AUTH_URL)
+        qs = urlencode({
+            "code": "true",
+            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
+            "scope": ANTHROPIC_OAUTH_SCOPES,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        })
+        return "%s?%s" % (base, qs), verifier, state
+    if provider == "google":
+        base = os.environ.get("ASHEN_OAUTH_AUTH_URL_GOOGLE", GOOGLE_OAUTH_AUTH_URL)
+        qs = urlencode({
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": GOOGLE_OAUTH_SCOPES,
+            "access_type": "offline",
+            "prompt": "consent",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        })
+        return "%s?%s" % (base, qs), verifier, state
+    raise ValueError("unsupported oauth provider: %s" % provider)
+
+
+def _oauth_http_json(url, payload):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"HTTP {e.code}: {body}")
+
+
+def oauth_exchange_code(provider, code, verifier, redirect_uri, client_id="", client_secret=""):
+    """Exchange an authorization code for stored credentials. Token endpoints
+    are overridable via env (ASHEN_OAUTH_TOKEN_URL / ASHEN_OAUTH_KEYS_URL)."""
+    if provider == "openrouter":
+        keys_url = os.environ.get("ASHEN_OAUTH_KEYS_URL", OPENROUTER_OAUTH_KEYS_URL)
+        resp = _oauth_http_json(keys_url, {"code": code})
+        key = (resp.get("key") or "").strip()
+        if not key:
+            raise RuntimeError("OpenRouter login failed: no key returned.")
+        settings["api_provider"] = "openrouter"
+        settings["api_base_url"] = API_PROVIDER_PRESETS["openrouter"]["base_url"]
+        settings["api_key"] = key
+        save_settings_to_json({"api_provider": "openrouter",
+                               "api_base_url": settings["api_base_url"],
+                               "api_key": key})
+        save_oauth_token("openrouter", {"via": "login", "obtained_at": time.time()})
+        return f"Logged in with OpenRouter (key {_mask_api_key(key)})."
+    if provider == "google":
+        token_url = os.environ.get("ASHEN_OAUTH_TOKEN_URL", GOOGLE_OAUTH_TOKEN_URL)
+        payload = {"client_id": client_id, "redirect_uri": redirect_uri,
+                   "grant_type": "authorization_code", "code": code,
+                   "code_verifier": verifier}
+        if client_secret:
+            payload["client_secret"] = client_secret
+        resp = _oauth_http_json(token_url, payload)
+        if not resp.get("access_token"):
+            raise RuntimeError(f"Google login failed: {str(resp)[:300]}")
+        save_oauth_token("google", {
+            "access_token": resp["access_token"],
+            "refresh_token": resp.get("refresh_token", ""),
+            "expires_at": time.time() + int(resp.get("expires_in", 3600)) - 60,
+            "obtained_at": time.time(),
+        })
+        settings["api_provider"] = "google"
+        settings["api_base_url"] = API_PROVIDER_PRESETS["google"]["base_url"]
+        save_settings_to_json({"api_provider": "google",
+                               "api_base_url": settings["api_base_url"]})
+        note = "" if resp.get("refresh_token") else " (no refresh token; you may need to log in again later)"
+        return f"Logged in with Google{note}."
+    if provider == "anthropic":
+        token_url = os.environ.get("ASHEN_ANTHROPIC_TOKEN_URL", ANTHROPIC_OAUTH_TOKEN_URL)
+        resp = _oauth_http_json(token_url, {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
+            "code_verifier": verifier,
+        })
+        if not resp.get("access_token"):
+            raise RuntimeError(f"Anthropic login failed: {str(resp)[:300]}")
+        save_oauth_token("anthropic", {
+            "access_token": resp["access_token"],
+            "refresh_token": resp.get("refresh_token", ""),
+            "expires_at": time.time() + int(resp.get("expires_in", 3600)) - 60,
+            "obtained_at": time.time(),
+        })
+        settings["api_provider"] = "anthropic"
+        settings["api_base_url"] = API_PROVIDER_PRESETS["anthropic"]["base_url"]
+        save_settings_to_json({"api_provider": "anthropic",
+                               "api_base_url": settings["api_base_url"]})
+        return "Logged in with Anthropic (Claude subscription)."
+    raise ValueError("unsupported oauth provider: %s" % provider)
+
+
+def google_access_token():
+    """Return a fresh Google access token, refreshing it when expired."""
+    toks = load_oauth_tokens().get("google") or {}
+    if toks.get("access_token") and toks.get("expires_at", 0) > time.time():
+        return toks["access_token"]
+    if not toks.get("refresh_token"):
+        raise RuntimeError("Google login expired or missing. Log in with Google again.")
+    payload = {"client_id": settings.get("oauth_client_id", ""),
+               "grant_type": "refresh_token",
+               "refresh_token": toks["refresh_token"]}
+    if settings.get("oauth_client_secret"):
+        payload["client_secret"] = settings["oauth_client_secret"]
+    token_url = os.environ.get("ASHEN_OAUTH_TOKEN_URL", GOOGLE_OAUTH_TOKEN_URL)
+    resp = _oauth_http_json(token_url, payload)
+    if not resp.get("access_token"):
+        raise RuntimeError("Google token refresh failed. Log in with Google again.")
+    toks["access_token"] = resp["access_token"]
+    toks["expires_at"] = time.time() + int(resp.get("expires_in", 3600)) - 60
+    if resp.get("refresh_token"):
+        toks["refresh_token"] = resp["refresh_token"]
+    save_oauth_token("google", toks)
+    return toks["access_token"]
+
+
+def _anthropic_logged_in():
+    a = load_oauth_tokens().get("anthropic") or {}
+    return bool(a.get("access_token") or a.get("refresh_token"))
+
+
+def anthropic_credential():
+    """Return ('bearer', token) for a subscription login, or ('key', api_key)
+    for a classic Anthropic API key. Raises RuntimeError if neither exists."""
+    toks = load_oauth_tokens().get("anthropic") or {}
+    if toks.get("access_token") and toks.get("expires_at", 0) > time.time():
+        return ("bearer", toks["access_token"])
+    if toks.get("refresh_token"):
+        token_url = os.environ.get("ASHEN_ANTHROPIC_TOKEN_URL", ANTHROPIC_OAUTH_TOKEN_URL)
+        resp = _oauth_http_json(token_url, {
+            "grant_type": "refresh_token",
+            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "refresh_token": toks["refresh_token"],
+        })
+        if not resp.get("access_token"):
+            raise RuntimeError("Anthropic token refresh failed. Log in with Anthropic again.")
+        toks["access_token"] = resp["access_token"]
+        toks["expires_at"] = time.time() + int(resp.get("expires_in", 3600)) - 60
+        if resp.get("refresh_token"):
+            toks["refresh_token"] = resp["refresh_token"]
+        save_oauth_token("anthropic", toks)
+        return ("bearer", toks["access_token"])
+    key = _resolve_api_key(settings)
+    if key:
+        return ("key", key)
+    raise RuntimeError("No Anthropic login or API key. Log in with Anthropic or set an API key.")
+
+
+def _anthropic_http(method, path, payload=None, stream=False):
+    base = os.environ.get("ASHEN_ANTHROPIC_API_BASE",
+                          API_PROVIDER_PRESETS["anthropic"]["base_url"]).rstrip("/")
+    mode, cred = anthropic_credential()
+    headers = {"anthropic-version": "2023-06-01"}
+    if mode == "bearer":
+        headers["Authorization"] = "Bearer " + cred
+        headers["anthropic-beta"] = ANTHROPIC_BETA_OAUTH
+    else:
+        headers["x-api-key"] = cred
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        if not stream:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        out = []
+        for raw in _anthropic_sse_lines(req):
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            delta = obj.get("delta", {}) if isinstance(obj, dict) else {}
+            dtype = delta.get("type", "")
+            if dtype == "text_delta":
+                out.append(("", delta.get("text", "")))
+            elif dtype == "thinking_delta":
+                out.append((delta.get("thinking", ""), ""))
+        return out
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"Anthropic API error: HTTP {e.code} {body}")
+
+
+def _anthropic_sse_lines(req):
+    with urllib.request.urlopen(req, timeout=120) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if line.startswith("data:"):
+                body = line[5:].strip()
+                if body and body != "[DONE]":
+                    yield body
+
+
+def _anthropic_content_to_text(resp):
+    texts, thoughts = [], []
+    try:
+        blocks = resp.get("content", [])
+    except Exception:
+        return "", ""
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "thinking" and b.get("thinking"):
+            thoughts.append(b["thinking"])
+        elif b.get("type") == "text" and b.get("text"):
+            texts.append(b["text"])
+    return "".join(thoughts), "".join(texts)
+
+
+class AnthropicMessagesAdapter:
+    """Claude-subscription (OAuth) or API-key adapter for the Messages API."""
+    is_api = True
+    is_qwen = False
+
+    def __init__(self, model_name, timeout=120):
+        self.model_name = model_name or ""
+        self.api_provider = "anthropic"
+        self.base_url = os.environ.get(
+            "ASHEN_ANTHROPIC_API_BASE",
+            API_PROVIDER_PRESETS["anthropic"]["base_url"]).rstrip("/")
+        self.api_key = ""  # OAuth mode carries no key; display only
+        self.timeout = timeout
+
+    @property
+    def name(self):
+        return self.model_name
+
+    def eval(self):
+        return self
+
+    def train(self, mode=True):
+        return self
+
+    def classify(self, text):
+        return None, None, None
+
+    def to(self, device):
+        return self
+
+    def list_models(self, timeout=30):
+        data = _anthropic_http("GET", "/v1/models")
+        items = data.get("data", []) if isinstance(data, dict) else []
+        return sorted(({"id": m["id"]} for m in items
+                       if isinstance(m, dict) and m.get("id")),
+                      key=lambda m: m["id"])
+
+    def _body(self, messages, max_tokens):
+        system, conv = [], []
+        for m in messages:
+            if m.get("role") == "system":
+                system.append(m.get("content", ""))
+            else:
+                role = "assistant" if m.get("role") == "assistant" else "user"
+                conv.append({"role": role, "content": m.get("content", "")})
+        body = {"model": self.model_name, "max_tokens": max_tokens or 1024,
+                "messages": conv}
+        if system:
+            body["system"] = "\n".join(system)
+        return body
+
+    def chat(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        resp = _anthropic_http("POST", "/v1/messages",
+                               self._body(messages, max_tokens))
+        thought, text = _anthropic_content_to_text(resp)
+        if thought and text and "<think>" not in text:
+            return f"<think>\n{thought.strip()}\n</think>\n{text}"
+        return text or thought
+
+    def chat_stream(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        body = self._body(messages, max_tokens)
+        body["stream"] = True
+        for thought, text in _anthropic_http("POST", "/v1/messages", body, stream=True):
+            yield thought, text
+
+
+def _gemini_http(method, path, payload=None, stream=False):
+    base = os.environ.get("ASHEN_GEMINI_API_BASE",
+                          API_PROVIDER_PRESETS["google"]["base_url"]).rstrip("/")
+    url = base + path + ("?alt=sse" if stream else "")
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": "Bearer " + google_access_token()}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        if not stream:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        out = []
+        with urllib.request.urlopen(req, timeout=120) as r:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                body = line[5:].strip()
+                if body and body != "[DONE]":
+                    try:
+                        out.append(json.loads(body))
+                    except Exception:
+                        pass
+        return out
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"Google API error: HTTP {e.code} {body}")
+
+
+def _gemini_parts_to_text(resp):
+    texts, thoughts = [], []
+    try:
+        cands = resp.get("candidates", [])
+    except Exception:
+        return "", ""
+    for cand in cands:
+        for part in (cand.get("content") or {}).get("parts", []):
+            t = part.get("text", "")
+            if not t:
+                continue
+            (thoughts if part.get("thought") else texts).append(t)
+    return "".join(thoughts), "".join(texts)
+
+
+class GeminiOAuthAdapter:
+    """Google-account login adapter for the Gemini API (Bearer tokens)."""
+    is_api = True
+    is_qwen = False
+
+    def __init__(self, model_name, timeout=120):
+        self.model_name = model_name or ""
+        self.api_provider = "google"
+        self.timeout = timeout
+
+    @property
+    def name(self):
+        return self.model_name
+
+    def eval(self):
+        return self
+
+    def train(self, mode=True):
+        return self
+
+    def classify(self, text):
+        return None, None, None
+
+    def to(self, device):
+        return self
+
+    def list_models(self, timeout=30):
+        data = _gemini_http("GET", "/v1beta/models")
+        out = []
+        for m in data.get("models", []):
+            name = m.get("name", "")
+            mid = name.split("/", 1)[1] if "/" in name else name
+            if mid:
+                out.append({"id": mid})
+        return sorted(out, key=lambda m: m["id"])
+
+    def _contents(self, messages):
+        contents = []
+        for m in messages:
+            role = "model" if m.get("role") == "assistant" else "user"
+            contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
+        return contents
+
+    def chat(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        resp = _gemini_http("POST", f"/v1beta/models/{self.model_name}:generateContent",
+                            {"contents": self._contents(messages)})
+        thought, text = _gemini_parts_to_text(resp)
+        if thought and text and "<think>" not in text:
+            return f"<think>\n{thought.strip()}\n</think>\n{text}"
+        return text or thought
+
+    def chat_stream(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        chunks = _gemini_http("POST", f"/v1beta/models/{self.model_name}:streamGenerateContent",
+                              {"contents": self._contents(messages)}, stream=True)
+        for resp in chunks:
+            yield _gemini_parts_to_text(resp)
+
+
+def oauth_status_dict():
+    """JSON-safe login status for /api/oauth/status (no secrets)."""
+    toks = load_oauth_tokens()
+    out = {"openrouter": {"linked": False}, "google": {"linked": False},
+           "anthropic": {"linked": False},
+           "google_client_configured": bool((settings.get("oauth_client_id") or "").strip())}
+    if toks.get("openrouter"):
+        out["openrouter"] = {"linked": True, "via": "site login",
+                             "key": _mask_api_key(_resolve_api_key(settings))}
+    g = toks.get("google")
+    if g and (g.get("access_token") or g.get("refresh_token")):
+        out["google"] = {"linked": True,
+                         "state": "active" if g.get("expires_at", 0) > time.time()
+                         else "expired (auto-refreshes on use)"}
+    a = toks.get("anthropic")
+    if a and (a.get("access_token") or a.get("refresh_token")):
+        out["anthropic"] = {"linked": True, "via": "Claude subscription",
+                            "state": "active" if a.get("expires_at", 0) > time.time()
+                            else "expired (auto-refreshes on use)"}
+    return out
+
+
+def oauth_login_begin(provider, host):
+    """Start a site-login flow.
+
+    Returns (auth_url, state, manual). manual=True means the provider uses a
+    fixed console redirect, so the user copies a code from the provider site
+    and finishes via oauth_login_complete (no popup polling).
+    """
+    if provider not in OAUTH_PROVIDERS:
+        raise ValueError("no site login exists for '%s'. Supported: openrouter, google, anthropic." % provider)
+    client_id = (settings.get("oauth_client_id") or "")
+    if provider == "google" and not client_id.strip():
+        raise RuntimeError("Google login needs oauth_client_id first (Settings -> API Models).")
+    redirect_uri = f"http://{host}/oauth/callback"
+    auth_url, verifier, state = oauth_build_auth_url(provider, redirect_uri, client_id)
+    _OAUTH_PENDING[state] = {"provider": provider, "verifier": verifier,
+                             "redirect_uri": redirect_uri, "ts": time.time()}
+    return auth_url, state, (provider == "anthropic")
+
+
+def oauth_login_complete(code, state):
+    """Finish a site-login flow from the /oauth/callback redirect."""
+    pending = _OAUTH_PENDING.pop(state, None)
+    if pending is None:
+        raise RuntimeError("unknown or expired login request. Start again.")
+    return oauth_exchange_code(pending["provider"], code, pending["verifier"],
+                               pending["redirect_uri"],
+                               settings.get("oauth_client_id") or "",
+                               settings.get("oauth_client_secret") or "")
+
+
+def active_model_label():
+    mdl = globals().get("reasoner") and getattr(reasoner, "model", None)
+    if getattr(mdl, "is_api", False):
+        return f"api:{mdl.model_name}"
+    return os.path.basename(globals().get("current_model_filename") or "")
+
+
+def switch_api_model(model_id, provider=None, base_url=None, api_key=None):
+    """Activate an API-key model (mirrors /api-use; keeps local install intact)."""
+    global model, m
+    if provider:
+        settings['api_provider'] = provider
+        preset = API_PROVIDER_PRESETS.get(provider, {})
+        if preset.get('base_url') and not base_url:
+            base_url = preset['base_url']
+    if base_url:
+        settings['api_base_url'] = base_url
+    if api_key:
+        settings['api_key'] = api_key
+    if model_id:
+        settings['api_model'] = model_id
+    settings['active_backend'] = 'api'
+    save_settings_to_json({k: settings[k] for k in
+                           ('api_provider', 'api_base_url', 'api_key', 'api_model', 'active_backend')
+                           if k in settings})
+    adapter = build_api_adapter_from_settings(settings)
+    if adapter is None:
+        print("[API] missing provider base URL or model name; not switched.", flush=True)
+        return False
+    model = adapter
+    m = adapter
+    reasoner.model = adapter
+    via = getattr(adapter, 'base_url', None) or 'Google account login'
+    keymask = _mask_api_key(getattr(adapter, 'api_key', ''))
+    print(f"[API] backend -> api  model={adapter.model_name} via {via} "
+          f"(key {keymask})", flush=True)
+    return True
+
+
+def use_local_backend():
+    """Switch answering back to the local checkpoint (keeps API settings saved)."""
+    path = settings.get('current_model', DEFAULT_MODEL_FILENAME)
+    settings['active_backend'] = 'local'
+    save_settings_to_json({'active_backend': 'local'})
+    return switch_model(path)
+
+
 # --- Safe checkpoint loader -------------------------------------------------
 # Checkpoints are pickled as ashen_gpt_trainer.AshenGPTLanguageModel. Importing
 # that module would run the ENTIRE training pipeline (no __main__ guard), so we
@@ -744,35 +1636,44 @@ else:
 # adapter; everything else is the legacy pickle checkpoint. When the model is a
 # Qwen dir, `m` is a QwenModelAdapter (exposes generate/generate_stream/classify
 # and is chat-templated), so the agentic engine's routing still works.
-if os.path.isdir(current_model_filename):
-    _ch_path = os.path.join(current_model_filename, "class_head.pt")
-    print(f"Loading Qwen HF model from directory: {current_model_filename}")
-    try:
-        model = QwenModelAdapter(current_model_filename, device, class_head_path=_ch_path)
-        print("Qwen model loaded via QwenModelAdapter (chat-templated, class_head="
-              f"{'present' if model.class_head is not None else 'absent'}).")
-    except Exception as e:
-        print(f"Qwen load failed ({e}). Falling back to default pickle model...")
-        current_model_filename = DEFAULT_MODEL_FILENAME
-if not os.path.isdir(current_model_filename) and os.path.exists(current_model_filename):
-    print(f"Loading Ashen GPT model parameters from {current_model_filename}...")
-    try:
-            with open(current_model_filename, 'rb') as f:
-                model = _load_ashen_checkpoint(current_model_filename)
-            print("Model loaded successfully via pickle (remapped from ashen_gpt_trainer)!")
-    except (pickle.UnpicklingError, Exception) as e:
-        print(f"Pickle load failed ({e}). Trying torch.load fallback...")
+# API backend: if settings ask for it and a provider/model is configured,
+# answer through the provider API key and skip local weights entirely.
+_api_adapter = build_api_adapter_from_settings(settings)
+if _api_adapter is not None and (settings.get('active_backend') or 'local').lower() == 'api':
+    model = _api_adapter
+    print(f"[Model] API backend active: {model.model_name} via {model.base_url} "
+          f"(key {_mask_api_key(model.api_key)})", flush=True)
+else:
+    _api_adapter = None
+    if os.path.isdir(current_model_filename):
+        _ch_path = os.path.join(current_model_filename, "class_head.pt")
+        print(f"Loading Qwen HF model from directory: {current_model_filename}")
         try:
-            model = torch.load(current_model_filename, map_location=device)
-            print("Model loaded successfully via torch.load!")
-        except Exception as torch_e:
-            print(f"Checkpoint unreadable ({torch_e}). Initializing new model...")
-            model = AshenGPTLanguageModel(vocab_size)
-elif not os.path.exists(current_model_filename) and not os.path.isdir(current_model_filename):
-    print(f"No checkpoint found at {current_model_filename}. Initializing new Ashen GPT model...")
-    model = AshenGPTLanguageModel(vocab_size)
+            model = QwenModelAdapter(current_model_filename, device, class_head_path=_ch_path)
+            print("Qwen model loaded via QwenModelAdapter (chat-templated, class_head="
+                  f"{'present' if model.class_head is not None else 'absent'}).")
+        except Exception as e:
+            print(f"Qwen load failed ({e}). Falling back to default pickle model...")
+            current_model_filename = DEFAULT_MODEL_FILENAME
+    if _api_adapter is None and not os.path.isdir(current_model_filename) and os.path.exists(current_model_filename):
+        print(f"Loading Ashen GPT model parameters from {current_model_filename}...")
+        try:
+                with open(current_model_filename, 'rb') as f:
+                    model = _load_ashen_checkpoint(current_model_filename)
+                print("Model loaded successfully via pickle (remapped from ashen_gpt_trainer)!")
+        except (pickle.UnpicklingError, Exception) as e:
+            print(f"Pickle load failed ({e}). Trying torch.load fallback...")
+            try:
+                model = torch.load(current_model_filename, map_location=device)
+                print("Model loaded successfully via torch.load!")
+            except Exception as torch_e:
+                print(f"Checkpoint unreadable ({torch_e}). Initializing new model...")
+                model = AshenGPTLanguageModel(vocab_size)
+    elif _api_adapter is None and not os.path.exists(current_model_filename) and not os.path.isdir(current_model_filename):
+        print(f"No checkpoint found at {current_model_filename}. Initializing new Ashen GPT model...")
+        model = AshenGPTLanguageModel(vocab_size)
 
-m = model.to(device) if not getattr(model, "is_qwen", False) else model
+m = model.to(device) if not getattr(model, "is_qwen", False) and not getattr(model, "is_api", False) else model
 
 # --- Draft Model Support ---
 draft_model_filename = 'ashen_gpt_model_draft.pk1'  # Default draft model path
@@ -1436,6 +2337,10 @@ class AshenAIAgenticEngine:
         spam / not_spam / question / answer / request from training data."""
         try:
             label, idx, conf = self.model.classify(prompt)
+            if label is None or conf is None:
+                # Backends without a classification head (e.g. API models).
+                self.last_intent = None
+                return None, None, None
             self.last_intent = {"label": label, "confidence": round(conf, 4)}
             return label, idx, conf
         except Exception as e:
@@ -1541,6 +2446,142 @@ class AshenAIAgenticEngine:
                "model_path": current_model_filename, "sources": [],
                "intent": self.last_intent}
 
+    def _api_messages(self, prompt):
+        msgs = [{"role": "system", "content": API_SYSTEM_PROMPT}]
+        for u, a in self.history[-2:]:
+            msgs.append({"role": "user", "content": u})
+            msgs.append({"role": "assistant", "content": a})
+        msgs.append({"role": "user", "content": prompt})
+        return msgs
+
+    @staticmethod
+    def _split_api_thought(text):
+        mm = re.search(r'<think>([\s\S]*?)(?:</think>|$)', text)
+        if mm:
+            return mm.group(1).strip(), text[mm.end():].strip()
+        return "", text.strip()
+
+    @torch.no_grad()
+    def _solve_api(self, prompt):
+        """Isolated solve path for API-key models (APIModelAdapter).
+
+        Mirrors _solve_qwen: single OpenAI-compatible chat call, no local
+        ### Instruction:/### Response: framing, returns (thought, resp).
+        """
+        self.model.eval()
+        messages = self._api_messages(prompt)
+        try:
+            full = self.model.chat(messages, temperature=self.temperature,
+                                   max_tokens=self.max_new_tokens, top_p=self.top_p)
+        except Exception as e:
+            return "", f"API request failed: {e}"
+        thought, resp = self._split_api_thought(full)
+        self.history.append((prompt, resp))
+        return thought, resp
+
+    @torch.no_grad()
+    def _solve_api_stream(self, prompt):
+        """Streaming solve path for API-key models (APIModelAdapter)."""
+        self.model.eval()
+        self._source_harvest = []  # reset per-turn source harvesting
+        label = getattr(self.model, "model_name", "api-model")
+        messages = self._api_messages(prompt)
+        try:
+            chunks = self.model.chat_stream(messages, temperature=self.temperature,
+                                            max_tokens=self.max_new_tokens, top_p=self.top_p)
+            chunk_iter = iter(chunks)
+            peek = next(chunk_iter, None)
+        except Exception as e:
+            err = f"API request failed: {e}"
+            yield {"type": "response_delta", "chunk": err}
+            yield {"type": "done", "thought": "", "response": err,
+                   "model": label, "model_path": f"api:{label}",
+                   "sources": [], "intent": self.last_intent}
+            return
+        if peek is None:
+            err = "API returned an empty stream."
+            yield {"type": "response_delta", "chunk": err}
+            yield {"type": "done", "thought": "", "response": err,
+                   "model": label, "model_path": f"api:{label}",
+                   "sources": [], "intent": self.last_intent}
+            return
+        full_reason = ""
+        content = ""
+        thought_sent = 0
+        resp_sent = 0
+        saw_close = False
+        thought_done = False
+        native_reasoning = False
+        stream_error = None
+        try:
+            for reasoning, delta in [peek] + list(chunk_iter):
+                if reasoning:
+                    native_reasoning = True
+                    full_reason += reasoning
+                    yield {"type": "thought_delta", "chunk": reasoning}
+                    thought_sent += len(reasoning)
+                if not delta:
+                    continue
+                content += delta
+                if native_reasoning:
+                    # Provider streams reasoning separately: everything in
+                    # content is the answer (strip any inline think blocks).
+                    if not thought_done:
+                        thought_done = True
+                        yield {"type": "thought_done"}
+                    no_think = re.sub(r'<think>[\s\S]*?(?:</think>|$)', '', content)
+                    nr = no_think[resp_sent:]
+                    if nr:
+                        yield {"type": "response_delta", "chunk": nr}
+                        resp_sent = len(no_think)
+                elif not saw_close:
+                    if "</think>" in content:
+                        saw_close = True
+                        before, after = content.split("</think>", 1)
+                        nt = before[thought_sent:]
+                        if nt:
+                            yield {"type": "thought_delta", "chunk": nt}
+                        thought_sent = len(before)
+                        thought_done = True
+                        yield {"type": "thought_done"}
+                        if after.strip():
+                            yield {"type": "response_delta", "chunk": after}
+                            resp_sent = len(after)
+                    else:
+                        nt = content[thought_sent:]
+                        if nt:
+                            yield {"type": "thought_delta", "chunk": nt}
+                        thought_sent = len(content)
+                else:
+                    nr = content[resp_sent:]
+                    if nr:
+                        yield {"type": "response_delta", "chunk": nr}
+                        resp_sent = len(content)
+        except Exception as e:
+            stream_error = str(e)
+        if native_reasoning:
+            thought = full_reason.strip()
+            extra, resp = self._split_api_thought(content)
+            if extra:
+                thought = (thought + "\n" + extra).strip()
+            if not resp:
+                resp = re.sub(r'<think>[\s\S]*?(?:</think>|$)', '', content).strip()
+        else:
+            thought, resp = self._split_api_thought(content)
+            if not thought_done:
+                thought_done = True
+                yield {"type": "thought_done"}
+            if not saw_close and resp and resp_sent == 0:
+                # Model never emitted <think>: what streamed as "thought"
+                # is actually the answer — re-emit it as the response.
+                yield {"type": "response_delta", "chunk": resp}
+        if stream_error:
+            resp = (resp + f"\n\n[stream interrupted: {stream_error}]").strip()
+        self.history.append((prompt, resp))
+        yield {"type": "done", "thought": thought, "response": resp,
+               "model": label, "model_path": f"api:{label}",
+               "sources": [], "intent": self.last_intent}
+
     @torch.no_grad()
     def solve_with_agent(self, prompt):
         self.model.eval()
@@ -1554,6 +2595,9 @@ class AshenAIAgenticEngine:
 
         # Qwen HF model: route to the isolated chat-templated solve path so the
         # custom-model ### Instruction:/### Response: framing is never injected.
+        if getattr(self.model, "is_api", False):
+            return self._solve_api(prompt)
+
         if getattr(self.model, "is_qwen", False):
             return self._solve_qwen(prompt)
 
@@ -1687,6 +2731,10 @@ class AshenAIAgenticEngine:
             self.pending_requests.append({"prompt": prompt, "confidence": _conf})
 
         # Qwen HF model: route to the isolated chat-templated streaming solve path.
+        if getattr(self.model, "is_api", False):
+            yield from self._solve_api_stream(prompt)
+            return
+
         if getattr(self.model, "is_qwen", False):
             yield from self._solve_qwen_stream(prompt)
             return
@@ -2362,6 +3410,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
                         <button onclick="switchTab('local')" id="tab-local" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-950 text-cyan-300 border border-cyan-800/60 transition">Local Checkpoints</button>
                         <button onclick="switchTab('hf')" id="tab-hf" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-400 hover:text-white transition">Hugging Face Hub (All Models)</button>
                         <button onclick="switchTab('upload')" id="tab-upload" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-400 hover:text-white transition">Upload Model</button>
+                        <button onclick="switchTab('api')" id="tab-api" class="px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-400 hover:text-white transition">🌐 API Models</button>
                     </div>
                     <button onclick="scanPcModels()" class="px-3 py-1.5 bg-indigo-950 hover:bg-indigo-900 text-indigo-200 rounded-lg text-xs font-semibold border border-indigo-700/60 transition">🔍 Scan PC for Models</button>
                 </div>
@@ -2391,6 +3440,39 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     <div class="flex items-center space-x-3">
                         <input type="file" id="model-file-input" accept=".pk1,.pt,.pth,.gguf" class="block w-full text-xs text-slate-400 file:mr-4 file:py-2 file:px-4 file:rounded-lg file:border-0 file:text-xs file:font-semibold file:bg-cyan-950 file:text-cyan-300 hover:file:bg-cyan-900 cursor-pointer border border-slate-700 rounded-lg bg-slate-950">
                         <button onclick="uploadModel()" class="bg-cyan-600 hover:bg-cyan-500 text-slate-950 px-4 py-2 rounded-lg font-bold text-xs shrink-0 transition">UPLOAD</button>
+                    </div>
+                </div>
+
+                <!-- API Models Tab (OpenAI-compatible providers, via API key) -->
+                <div id="section-api" class="space-y-3 hidden">
+                    <h3 class="text-xs font-semibold text-emerald-300 uppercase tracking-wider">Provider Models <span id="api-backend-badge" class="ml-2 px-1.5 py-0.5 bg-slate-800 text-slate-400 text-[10px] rounded border border-slate-700">backend: …</span></h3>
+                    <div class="text-[11px] text-slate-500">Lists every model id available under the provider key (<code class="text-emerald-300">GET /models</code>). Configure provider + key in ⚙️ Settings → API Models, or override below for one listing. Local install is never touched.</div>
+                    <div class="grid grid-cols-3 gap-2">
+                        <input type="text" id="api-list-provider" placeholder="provider (e.g. openai)" class="bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-emerald-100 placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-mono">
+                        <input type="text" id="api-list-base" placeholder="base URL override (optional)" class="bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-emerald-100 placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-mono">
+                        <input type="password" id="api-list-key" placeholder="API key override (optional)" autocomplete="off" class="bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-emerald-100 placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-mono">
+                    </div>
+                    <div class="flex space-x-2">
+                        <button onclick="loadApiModels()" class="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-slate-950 font-bold text-xs rounded-lg transition shrink-0">🔄 LIST PROVIDER MODELS</button>
+                        <button onclick="setBackend('local')" class="px-4 py-2 bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold text-xs rounded-lg transition shrink-0">USE LOCAL BACKEND</button>
+                    </div>
+                    <div class="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-2">
+                        <div class="text-[11px] text-slate-400 font-semibold">🔑 PROVIDER ACCOUNT LOGIN <span class="text-slate-500 font-normal">— log in on the provider site instead of pasting a key (OpenRouter / Google / Anthropic Claude Pro-Max; OpenAI, Groq & co. are key-only — a ChatGPT plan never grants API access)</span></div>
+                        <div id="oauth-status" class="text-[11px] text-slate-500 font-mono">Checking logins...</div>
+                        <div class="flex flex-wrap gap-2">
+                            <button onclick="oauthLogin('openrouter')" class="px-3 py-1.5 bg-orange-950 hover:bg-orange-900 text-orange-200 rounded-lg text-xs font-semibold border border-orange-800/60 transition">Login with OpenRouter</button>
+                            <button onclick="oauthLogin('google')" class="px-3 py-1.5 bg-sky-950 hover:bg-sky-900 text-sky-200 rounded-lg text-xs font-semibold border border-sky-800/60 transition">Login with Google</button>
+                            <button onclick="oauthLogin('anthropic')" class="px-3 py-1.5 bg-amber-950 hover:bg-amber-900 text-amber-200 rounded-lg text-xs font-semibold border border-amber-800/60 transition">Login with Anthropic</button>
+                            <button onclick="oauthLogout('')" class="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs transition">Logout all</button>
+                        </div>
+                        <div id="oauth-code-box" class="hidden flex flex-wrap gap-2 items-center">
+                            <span class="text-[11px] text-slate-400">Paste the code from the provider site:</span>
+                            <input type="text" id="oauth-code" placeholder="authorization code" class="bg-slate-950 border border-slate-700 rounded-lg p-1.5 text-xs text-emerald-100 placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-mono w-64">
+                            <button onclick="oauthComplete()" class="px-3 py-1.5 bg-emerald-700 hover:bg-emerald-600 text-white rounded-lg text-xs font-semibold transition">COMPLETE LOGIN</button>
+                        </div>
+                    </div>
+                    <div id="api-model-list" class="bg-slate-950 border border-slate-800 rounded-lg p-3 max-h-72 overflow-y-auto space-y-2 text-xs font-mono">
+                        <div class="text-slate-500">Click LIST PROVIDER MODELS to fetch ids under your key...</div>
                     </div>
                 </div>
 
@@ -2612,6 +3694,68 @@ HTML_PAGE = r"""<!DOCTYPE html>
                             <input type="checkbox" id="setting-auto-web-research" class="sr-only peer">
                             <div class="w-11 h-6 bg-slate-700 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-cyan-600"></div>
                         </label>
+                    </div>
+                </div>
+
+                <!-- API Models (OpenAI-compatible, via API key) -->
+                <div class="pt-4 border-t border-slate-800">
+                    <h3 class="text-sm font-semibold text-emerald-300 mb-3 flex items-center gap-2">
+                        <span class="inline-block w-2 h-2 rounded-full bg-emerald-400"></span>
+                        🌐 API Models (OpenAI-Compatible)
+                    </h3>
+                    <div class="space-y-3">
+                        <div class="space-y-1">
+                            <span class="text-slate-300 font-medium">Answering Backend</span>
+                            <select id="setting-api-backend" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-emerald-200">
+                                <option value="local">local — installed checkpoints (unchanged)</option>
+                                <option value="api">api — provider model via API key</option>
+                            </select>
+                            <div class="text-slate-500 text-[10px]">Switches which backend answers. Local weights are never modified.</div>
+                        </div>
+                        <div class="grid grid-cols-2 gap-2">
+                            <div class="space-y-1">
+                                <span class="text-slate-300 font-medium">Provider</span>
+                                <select id="setting-api-provider" onchange="syncApiBasePlaceholder()" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-emerald-200">
+                                    <option value="">— select —</option>
+                                    <option value="openai">OpenAI</option>
+                                    <option value="openrouter">OpenRouter</option>
+                                    <option value="groq">Groq</option>
+                                    <option value="together">Together</option>
+                                    <option value="deepseek">DeepSeek</option>
+                                    <option value="ollama">Ollama (localhost)</option>
+                                    <option value="lmstudio">LM Studio (localhost)</option>
+                                    <option value="google">Google (account login → Gemini)</option>
+                                    <option value="anthropic">Anthropic (login or key → Messages API)</option>
+                                    <option value="custom">Custom URL</option>
+                                </select>
+                            </div>
+                            <div class="space-y-1">
+                                <span class="text-slate-300 font-medium">API Model Id</span>
+                                <input type="text" id="setting-api-model" placeholder="e.g. gpt-4o-mini" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-emerald-100 placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-mono">
+                            </div>
+                        </div>
+                        <div class="space-y-1">
+                            <span class="text-slate-300 font-medium">Base URL <span class="text-slate-500">(blank = provider default)</span></span>
+                            <input type="text" id="setting-api-base" placeholder="https://api.openai.com/v1" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-emerald-100 placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-mono">
+                        </div>
+                        <div class="space-y-1">
+                            <span class="text-slate-300 font-medium">API Key <span id="api-key-saved" class="text-emerald-400 text-[10px]"></span></span>
+                            <input type="password" id="setting-api-key" placeholder="sk-... (leave blank to keep saved key)" autocomplete="off" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-emerald-100 placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-mono">
+                            <div class="text-slate-500 text-[10px]">Saved to <code class="text-emerald-300">settings.json</code> (git-tracked — prefer <code class="text-emerald-300">ASHEN_API_KEY</code> env var). Key is never echoed back; blank keeps the saved one.</div>
+                        </div>
+                        <div class="space-y-1 pt-2 border-t border-slate-800">
+                            <span class="text-slate-300 font-medium">Google OAuth Client <span class="text-slate-500">(only needed for Login with Google — free "Desktop app" client from Google Cloud Console)</span></span>
+                            <div class="grid grid-cols-2 gap-2">
+                                <input type="text" id="setting-oauth-client-id" placeholder="Google client ID" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-emerald-100 placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-mono">
+                                <input type="password" id="setting-oauth-client-secret" placeholder="Client secret (blank keeps saved)" autocomplete="off" class="w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-emerald-100 placeholder-slate-500 focus:outline-none focus:border-emerald-500 font-mono">
+                            </div>
+                            <div class="text-slate-500 text-[10px]">Secret is never echoed back; blank keeps the saved one. Login tokens are stored in gitignored <code class="text-emerald-300">oauth_tokens.json</code>.</div>
+                        </div>
+                        <div class="flex items-center gap-2">
+                            <button onclick="fetchApiModelsIntoSettings()" class="px-3 py-1.5 bg-emerald-950 hover:bg-emerald-900 text-emerald-200 rounded-lg text-xs font-semibold border border-emerald-700/60 transition">🔄 FETCH MODELS UNDER KEY</button>
+                            <span id="api-settings-status" class="text-[11px] text-slate-500 font-mono"></span>
+                        </div>
+                        <select id="setting-api-model-list" onchange="document.getElementById('setting-api-model').value=this.value" class="hidden w-full bg-slate-950 border border-slate-700 rounded-lg p-2 text-xs text-emerald-200"></select>
                     </div>
                 </div>
 
@@ -3668,6 +4812,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
             settings.show_chain_of_thought = document.getElementById('setting-show-cot').checked;
             settings.auto_swarm_council = document.getElementById('setting-auto-swarm-council').checked;
             settings.auto_web_research = document.getElementById('setting-auto-web-research').checked;
+            settings.active_backend = document.getElementById('setting-api-backend').value;
+            settings.api_provider = document.getElementById('setting-api-provider').value;
+            settings.api_base_url = document.getElementById('setting-api-base').value.trim();
+            settings.api_model = document.getElementById('setting-api-model').value.trim();
+            const _k = document.getElementById('setting-api-key').value;
+            if (_k) settings.api_key = _k;  // blank keeps the saved key server-side
+            const _cid = document.getElementById('setting-oauth-client-id')?.value.trim();
+            if (_cid !== undefined) settings.oauth_client_id = _cid;
+            const _cs = document.getElementById('setting-oauth-client-secret')?.value;
+            if (_cs) settings.oauth_client_secret = _cs;  // blank keeps the saved secret server-side
             
             // Also save current model path - guard against template placeholder leaking
             let m = window.currentModelFilename;
@@ -3749,6 +4903,19 @@ HTML_PAGE = r"""<!DOCTYPE html>
                 // Auto Swarm + Council enrichment
                 if (s.auto_swarm_council !== undefined) setChecked('setting-auto-swarm-council', s.auto_swarm_council);
                 if (s.auto_web_research !== undefined) setChecked('setting-auto-web-research', s.auto_web_research);
+                // API backend (key itself is never echoed back; api_key_set flags a saved one)
+                if (s.active_backend) setVal('setting-api-backend', s.active_backend);
+                if (s.api_provider !== undefined) setVal('setting-api-provider', s.api_provider);
+                if (s.api_base_url !== undefined) setVal('setting-api-base', s.api_base_url);
+                if (s.api_model !== undefined) setVal('setting-api-model', s.api_model);
+                const _ks = document.getElementById('api-key-saved');
+                if (_ks) _ks.textContent = s.api_key_set ? '(saved — blank keeps it)' : '(not set)';
+                const _ki = document.getElementById('setting-api-key');
+                if (_ki) _ki.value = '';
+                if (s.oauth_client_id !== undefined) setVal('setting-oauth-client-id', s.oauth_client_id);
+                const _csi = document.getElementById('setting-oauth-client-secret');
+                if (_csi) _csi.value = '';
+                syncApiBasePlaceholder();
                 // sidebar
                 const ctxEl = document.getElementById('sidebar-ctx');
                 const gpuEl = document.getElementById('sidebar-gpu');
@@ -3759,12 +4926,13 @@ HTML_PAGE = r"""<!DOCTYPE html>
         }
 
         function switchTab(tab) {
-            ['local', 'hf', 'upload'].forEach(t => {
+            ['local', 'hf', 'upload', 'api'].forEach(t => {
                 document.getElementById(`section-${t}`).classList.add('hidden');
                 document.getElementById(`tab-${t}`).className = 'px-3 py-1.5 rounded-lg text-xs font-semibold bg-slate-800 text-slate-400 hover:text-white transition';
             });
             document.getElementById(`section-${tab}`).classList.remove('hidden');
             document.getElementById(`tab-${tab}`).className = 'px-3 py-1.5 rounded-lg text-xs font-semibold bg-cyan-950 text-cyan-300 border border-cyan-800/60 transition';
+            if (tab === 'api' && typeof refreshBackendBadge === 'function') { refreshBackendBadge(); refreshOauthStatus(); }
         }
 
         async function loadModelsList() {
@@ -3897,11 +5065,275 @@ HTML_PAGE = r"""<!DOCTYPE html>
                     document.getElementById('active-model-name').textContent = filename;
                     statusEl.textContent = `Successfully activated ${filename}!`;
                     loadModelsList();
+                    if (typeof refreshBackendBadge === 'function') refreshBackendBadge();
                 } else {
                     statusEl.textContent = `Error: ${data.message}`;
                 }
             } catch (err) {
                 statusEl.textContent = 'Failed to switch model.';
+            }
+        }
+
+        const API_BASE_DEFAULTS = {
+            openai: 'https://api.openai.com/v1', openrouter: 'https://openrouter.ai/api/v1',
+            groq: 'https://api.groq.com/openai/v1', together: 'https://api.together.xyz/v1',
+            deepseek: 'https://api.deepseek.com/v1', ollama: 'http://localhost:11434/v1',
+            lmstudio: 'http://localhost:1234/v1',
+            google: 'https://generativelanguage.googleapis.com (account login, no key)',
+            anthropic: 'https://api.anthropic.com (login or key)'
+        };
+
+        function syncApiBasePlaceholder() {
+            const p = document.getElementById('setting-api-provider')?.value;
+            const b = document.getElementById('setting-api-base');
+            if (b) b.placeholder = (p && API_BASE_DEFAULTS[p]) || 'https://api.openai.com/v1';
+        }
+
+        async function refreshBackendBadge() {
+            try {
+                const res = await fetch('/api/backend');
+                const data = await res.json();
+                const badge = document.getElementById('api-backend-badge');
+                if (badge) {
+                    const label = data.backend === 'api' ? `backend: api (${data.api_model || '?'})` : 'backend: local';
+                    badge.textContent = label;
+                }
+                const mEl = document.getElementById('active-model-name');
+                if (mEl && data.backend === 'api' && data.api_model) mEl.textContent = 'api:' + data.api_model;
+            } catch (e) { /* badge stays as-is */ }
+        }
+
+        async function loadApiModels() {
+            const listEl = document.getElementById('api-model-list');
+            const body = {};
+            const pv = document.getElementById('api-list-provider')?.value.trim();
+            const bv = document.getElementById('api-list-base')?.value.trim();
+            const kv = document.getElementById('api-list-key')?.value;
+            if (pv) body.provider = pv;
+            if (bv) body.base_url = bv;
+            if (kv) body.api_key = kv;
+            listEl.innerHTML = '<div class="text-slate-500">Querying provider GET /models under your key...</div>';
+            try {
+                const res = await fetch('/api/api-models', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                refreshBackendBadge();
+                if (data.status !== 'success') {
+                    listEl.innerHTML = `<div class="text-red-400">Error: ${(data.message || 'unknown').replace(/</g, '&lt;')}</div>`;
+                    return;
+                }
+                if (!data.models.length) {
+                    listEl.innerHTML = '<div class="text-slate-500">Key is valid but the provider returned zero models.</div>';
+                    return;
+                }
+                listEl.innerHTML = `<div class="text-emerald-400 mb-1">${data.models.length} model(s) via ${data.base_url} (key ${data.key})${data.current_api_model ? ` — active: ${data.current_api_model}` : ''}</div>`;
+                data.models.forEach(mdl => {
+                    const item = document.createElement('div');
+                    item.className = 'flex justify-between items-center bg-slate-900 p-2 rounded border border-slate-800';
+                    const isCur = mdl.id === data.current_api_model && data.active_backend === 'api';
+                    item.innerHTML = `
+                        <div>
+                            <span class="text-emerald-300 font-bold">${mdl.id.replace(/</g, '&lt;')}</span>
+                            ${mdl.owned_by ? `<span class="text-slate-500 ml-2">(${String(mdl.owned_by).replace(/</g, '&lt;')})</span>` : ''}
+                            ${isCur ? '<span class="mt-1 inline-block px-1.5 py-0.5 bg-emerald-950 text-emerald-300 text-[10px] rounded border border-emerald-800 ml-1">ACTIVE</span>' : ''}
+                        </div>
+                        ${!isCur ? `<button onclick="useApiModel('${mdl.id.replace(/\\/g, '/').replace(/'/g, "\\'")}')" class="px-2.5 py-1 bg-emerald-900 hover:bg-emerald-800 text-emerald-200 rounded text-[11px] transition">USE API MODEL</button>` : ''}
+                    `;
+                    listEl.appendChild(item);
+                });
+            } catch (err) {
+                listEl.innerHTML = '<div class="text-red-400">Failed to reach the provider API.</div>';
+            }
+        }
+
+        async function useApiModel(modelId) {
+            const statusEl = document.getElementById('upload-status');
+            const body = { model: modelId };
+            const pv = document.getElementById('api-list-provider')?.value.trim();
+            const bv = document.getElementById('api-list-base')?.value.trim();
+            const kv = document.getElementById('api-list-key')?.value;
+            if (pv) body.provider = pv;
+            if (bv) body.base_url = bv;
+            if (kv) body.api_key = kv;
+            statusEl.textContent = `Activating API model ${modelId}...`;
+            try {
+                const res = await fetch('/api/api-use', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    document.getElementById('active-model-name').textContent = 'api:' + data.model;
+                    window.currentModelFilename = data.model_path;
+                    statusEl.textContent = `Now answering with API model ${data.model} (local install untouched).`;
+                    loadApiModels();
+                } else {
+                    statusEl.textContent = `Error: ${data.message}`;
+                }
+            } catch (err) {
+                statusEl.textContent = 'Failed to activate API model.';
+            }
+        }
+
+        async function refreshOauthStatus() {
+            const el = document.getElementById('oauth-status');
+            try {
+                const res = await fetch('/api/oauth/status');
+                const data = await res.json();
+                const o = data.oauth || {};
+                const bits = [];
+                bits.push(o.openrouter?.linked ? `OpenRouter: <span class="text-orange-300">logged in (${o.openrouter.key || 'key'})</span>` : 'OpenRouter: not linked');
+                bits.push(o.google?.linked ? `Google: <span class="text-sky-300">logged in (${o.google.state || ''})</span>` : 'Google: not linked');
+                bits.push(o.anthropic?.linked ? `Anthropic: <span class="text-amber-300">logged in (${o.anthropic.state || ''})</span>` : 'Anthropic: not linked');
+                if (el) el.innerHTML = bits.join(' &nbsp;•&nbsp; ');
+            } catch (e) { if (el) el.textContent = 'Login status unavailable.'; }
+        }
+
+        let _oauthPoll = null;
+        async function oauthLogin(provider) {
+            const el = document.getElementById('oauth-status');
+            if (el) el.textContent = `Starting ${provider} login...`;
+            try {
+                const res = await fetch('/api/oauth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider })
+                });
+                const data = await res.json();
+                if (data.status !== 'success') {
+                    if (el) el.textContent = 'Login error: ' + (data.message || 'unknown');
+                    return;
+                }
+                if (data.manual) {
+                    // Copy-paste flow (Anthropic): log in on the provider site,
+                    // then paste the code below.
+                    window._oauthState = data.state;
+                    window._oauthProvider = provider;
+                    window.open(data.auth_url, '_blank');
+                    const box = document.getElementById('oauth-code-box');
+                    if (box) box.classList.remove('hidden');
+                    if (el) el.textContent = 'Log in on the provider site, paste the code below, then COMPLETE LOGIN.';
+                    return;
+                }
+                window.open(data.auth_url, '_blank', 'width=520,height=640');
+                if (el) el.textContent = 'Complete the login in the popup, then wait...';
+                if (_oauthPoll) clearInterval(_oauthPoll);
+                const t0 = Date.now();
+                _oauthPoll = setInterval(async () => {
+                    await refreshOauthStatus();
+                    const txt = document.getElementById('oauth-status')?.textContent || '';
+                    if (txt.includes('logged in') || Date.now() - t0 > 180000) {
+                        clearInterval(_oauthPoll); _oauthPoll = null;
+                        loadApiModels();
+                    }
+                }, 3000);
+            } catch (err) {
+                if (el) el.textContent = 'Login request failed.';
+            }
+        }
+
+        async function oauthComplete() {
+            const el = document.getElementById('oauth-status');
+            const code = document.getElementById('oauth-code')?.value.trim();
+            if (!code) { if (el) el.textContent = 'Paste the authorization code first.'; return; }
+            if (el) el.textContent = 'Completing login...';
+            try {
+                const res = await fetch('/api/oauth/complete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider: window._oauthProvider || 'anthropic', code, state: window._oauthState || '' })
+                });
+                const data = await res.json();
+                if (data.status !== 'success') {
+                    if (el) el.textContent = 'Login error: ' + (data.message || 'unknown');
+                    return;
+                }
+                document.getElementById('oauth-code-box')?.classList.add('hidden');
+                const inp = document.getElementById('oauth-code');
+                if (inp) inp.value = '';
+                await refreshOauthStatus();
+                if (el) el.textContent = (data.message || 'Logged in.') + ' Loading models...';
+                loadApiModels();
+            } catch (err) {
+                if (el) el.textContent = 'Login request failed.';
+            }
+        }
+
+        async function oauthLogout(provider) {
+            try {
+                await fetch('/api/oauth/logout', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ provider })
+                });
+            } finally {
+                refreshOauthStatus();
+                refreshBackendBadge();
+            }
+        }
+
+        async function setBackend(which) {
+            const statusEl = document.getElementById('upload-status') || document.getElementById('settings-status');
+            try {
+                const res = await fetch('/api/backend', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ backend: which })
+                });
+                const data = await res.json();
+                if (data.status === 'success') {
+                    const mEl = document.getElementById('active-model-name');
+                    if (mEl) mEl.textContent = which === 'api' ? 'api:' + (data.model || '') : String(data.model || '').split('\\\\').pop().split('/').pop();
+                    if (which === 'local') window.currentModelFilename = data.model;
+                    if (statusEl) statusEl.textContent = `Backend → ${which} (${data.model}).`;
+                    refreshBackendBadge();
+                    if (typeof loadModelsList === 'function') loadModelsList();
+                } else if (statusEl) {
+                    statusEl.textContent = `Error: ${data.message}`;
+                }
+            } catch (err) {
+                if (statusEl) statusEl.textContent = 'Backend switch failed.';
+            }
+        }
+
+        async function fetchApiModelsIntoSettings() {
+            const statusEl = document.getElementById('api-settings-status');
+            const body = {};
+            const pv = document.getElementById('setting-api-provider')?.value;
+            const bv = document.getElementById('setting-api-base')?.value.trim();
+            const kv = document.getElementById('setting-api-key')?.value;
+            if (pv) body.provider = pv;
+            if (bv) body.base_url = bv;
+            if (kv) body.api_key = kv;
+            statusEl.textContent = 'fetching...';
+            try {
+                const res = await fetch('/api/api-models', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body)
+                });
+                const data = await res.json();
+                if (data.status !== 'success') {
+                    statusEl.textContent = 'Error: ' + (data.message || 'unknown');
+                    return;
+                }
+                const sel = document.getElementById('setting-api-model-list');
+                sel.innerHTML = '';
+                data.models.forEach(mdl => {
+                    const o = document.createElement('option');
+                    o.value = mdl.id; o.textContent = mdl.id;
+                    sel.appendChild(o);
+                });
+                sel.classList.remove('hidden');
+                const cur = document.getElementById('setting-api-model').value.trim();
+                if (cur) sel.value = cur;
+                statusEl.textContent = `${data.models.length} model(s) under key ${data.key} — pick one, then SAVE SETTINGS.`;
+            } catch (err) {
+                statusEl.textContent = 'Fetch failed.';
             }
         }
 
@@ -4503,6 +5935,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         // Initialize workspace file tree and load saved settings on page load
         loadWorkspaceDir('');
         loadSettings();
+        if (typeof refreshBackendBadge === 'function') refreshBackendBadge();
         
         // Set current model filename in JS scope
         window.currentModelFilename = '{{current_model_filename}}';
@@ -4744,7 +6177,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.end_headers()
-                self.wfile.write(json.dumps({'status': 'success', 'settings': loaded}).encode('utf-8'))
+                self.wfile.write(json.dumps({'status': 'success', 'settings': _public_settings(loaded)}).encode('utf-8'))
             except Exception as e:
                 self.send_response(500)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -4800,6 +6233,45 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                 'model': os.path.basename(current_model_filename),
                 'model_path': current_model_filename
             }).encode('utf-8'))
+        elif path == '/api/backend':
+            active = 'api' if getattr(reasoner.model, 'is_api', False) else 'local'
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({
+                'status': 'success', 'backend': active,
+                'local_model': current_model_filename,
+                'api_model': settings.get('api_model', ''),
+                'api_provider': settings.get('api_provider', ''),
+                'api_base_url': _resolve_api_base_url(settings),
+                'api_key': _mask_api_key(_resolve_api_key(settings)),
+                'api_key_set': bool((settings.get('api_key') or '').strip()),
+                'oauth': oauth_status_dict(),
+            }).encode('utf-8'))
+        elif path == '/api/oauth/status':
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({'status': 'success',
+                                         'oauth': oauth_status_dict()}).encode('utf-8'))
+        elif path == '/oauth/callback':
+            code = query.get('code', [''])[0]
+            state = query.get('state', [''])[0]
+            try:
+                msg = oauth_login_complete(code, state) if code and state else 'Missing code/state.'
+            except Exception as e:
+                msg = f'Login failed: {e}'
+            print(f"[OAuth] callback: {msg}", flush=True)
+            page = ("<html><body style='font-family:sans-serif'>"
+                    f"<h3>{msg}</h3>"
+                    "<p>You can close this window and return to Ashen.</p>"
+                    "</body></html>")
+            body = page.encode('utf-8')
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             self.send_response(404)
             self.end_headers()
@@ -4995,6 +6467,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             body = self.rfile.read(content_length)
             data = json.loads(body.decode('utf-8'))
             reasoner.update_settings(data)
+            apply_backend_settings(settings)
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
@@ -5096,6 +6569,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                 # apply to live model without requiring restart
                 try:
                     reasoner.update_settings(data)
+                    apply_backend_settings(settings)
                     print(f"[Settings] Applied live: temp={data.get('temperature')} top_k={data.get('top_k')} precision={data.get('precision')} model={data.get('current_model')}", flush=True)
                 except Exception as e:
                     print(f"[Settings] Failed to apply live: {e}", flush=True)
@@ -5104,7 +6578,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.end_headers()
-                self.wfile.write(json.dumps({'status': 'saved', 'settings': load_settings_from_json()}).encode('utf-8'))
+                self.wfile.write(json.dumps({'status': 'saved', 'settings': _public_settings(load_settings_from_json())}).encode('utf-8'))
             else:
                 self.send_response(500)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -5117,7 +6591,7 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
                 self.end_headers()
-                self.wfile.write(json.dumps({'status': 'success', 'settings': loaded}).encode('utf-8'))
+                self.wfile.write(json.dumps({'status': 'success', 'settings': _public_settings(loaded)}).encode('utf-8'))
             except Exception as e:
                 self.send_response(500)
                 self.send_header('Content-Type', 'application/json; charset=utf-8')
@@ -5208,39 +6682,177 @@ class ChatHandler(http.server.SimpleHTTPRequestHandler):
             data = json.loads(body.decode('utf-8'))
             filename = data.get('filename', '')
 
-            # Qwen HF model directory (produced by qwen_finetune.py): load it
-            # live via QwenModelAdapter so chat-templated generation + class_head
-            # routing work without a server restart.
-            if os.path.isdir(filename):
-                try:
-                    _ch = os.path.join(filename, "class_head.pt")
-                    new_model = QwenModelAdapter(filename, device, class_head_path=_ch)
-                    reasoner.model = new_model
-                    current_model_filename = filename
-                    resp_data = {'status': 'success', 'filename': filename, 'type': 'qwen-hf'}
-                except Exception as e:
-                    resp_data = {'status': 'error', 'message': f'Qwen load failed: {e}'}
-            elif filename.endswith('.gguf'):
-                # gguf: mark active (served via llama.cpp elsewhere); no in-process reload
-                current_model_filename = filename
-                resp_data = {'status': 'success', 'filename': filename, 'type': 'gguf'}
-            elif os.path.exists(filename):
-                try:
-                    with open(filename, 'rb') as f:
-                        model = pickle.load(f)
-                    model = model.to(device)
-                    reasoner.model = model
-                    current_model_filename = filename
-                    resp_data = {'status': 'success', 'filename': filename}
-                except Exception as e:
-                    resp_data = {'status': 'error', 'message': str(e)}
-            else:
-                resp_data = {'status': 'error', 'message': 'File not found'}
+            # Local hot-swap (Qwen HF dir / .gguf marker / pickle). Shared
+            # helper also flips active_backend back to local.
+            _ok, resp_data = switch_model(filename)
 
             self.send_response(200)
             self.send_header('Content-Type', 'application/json; charset=utf-8')
             self.end_headers()
             self.wfile.write(json.dumps(resp_data).encode('utf-8'))
+
+        elif self.path == '/api/api-models':
+            # List all models available under the provider API key (GET /models).
+            content_length = int(self.headers.get('Content-Length', 0))
+            try:
+                data = json.loads(self.rfile.read(content_length).decode('utf-8')) if content_length else {}
+            except Exception:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            key_override = (data.get('api_key') or '').strip() or None
+            base_override = (data.get('base_url') or '').strip() or None
+            provider_override = (data.get('provider') or '').strip() or None
+            s = dict(settings)
+            if provider_override:
+                s['api_provider'] = provider_override
+                preset = API_PROVIDER_PRESETS.get(provider_override, {})
+                if preset.get('base_url') and not base_override and not (s.get('api_base_url') or '').strip():
+                    s['api_base_url'] = preset['base_url']
+            if base_override:
+                s['api_base_url'] = base_override
+            adapter = build_api_adapter_from_settings(s, key_override=key_override,
+                                                        allow_no_model=True)
+            if adapter is None:
+                resp_data = {'status': 'error',
+                             'message': 'API provider not configured (set provider/base URL + model or key, or log in with /api/oauth/login).'}
+            else:
+                try:
+                    listed = adapter.list_models()
+                    resp_data = {'status': 'success', 'models': listed,
+                                 'provider': s.get('api_provider', ''),
+                                 'base_url': getattr(adapter, 'base_url', None) or 'Google account login',
+                                 'key': _mask_api_key(getattr(adapter, 'api_key', '')),
+                                 'current_api_model': settings.get('api_model', ''),
+                                 'active_backend': settings.get('active_backend', 'local')}
+                except Exception as e:
+                    resp_data = {'status': 'error', 'message': str(e)}
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp_data).encode('utf-8'))
+
+        elif self.path == '/api/api-use':
+            # Answer through an API-key model (keeps the local install intact).
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+            ok = switch_api_model(data.get('model', ''),
+                                  provider=(data.get('provider') or '').strip() or None,
+                                  base_url=(data.get('base_url') or '').strip() or None,
+                                  api_key=(data.get('api_key') or '').strip() or None)
+            if ok:
+                reasoner.update_settings(settings)
+                resp_data = {'status': 'success', 'model': settings.get('api_model', ''),
+                             'model_path': f"api:{settings.get('api_model', '')}",
+                             'backend': 'api'}
+            else:
+                resp_data = {'status': 'error',
+                             'message': 'API provider not configured (set provider/base URL + model, or key).'}
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp_data).encode('utf-8'))
+
+        elif self.path == '/api/backend':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            data = json.loads(body.decode('utf-8'))
+            want = (data.get('backend') or '').strip().lower()
+            if want == 'api':
+                if not (settings.get('api_model') or '').strip():
+                    resp_data = {'status': 'error',
+                                 'message': 'No api_model set — list /api/api-models then /api/api-use first.'}
+                else:
+                    settings['active_backend'] = 'api'
+                    save_settings_to_json({'active_backend': 'api'})
+                    apply_backend_settings(settings)
+                    reasoner.update_settings(settings)
+                    resp_data = {'status': 'success', 'backend': 'api',
+                                 'model': settings.get('api_model', '')}
+            elif want == 'local':
+                if use_local_backend():
+                    reasoner.update_settings(settings)
+                    resp_data = {'status': 'success', 'backend': 'local',
+                                 'model': current_model_filename}
+                else:
+                    resp_data = {'status': 'error', 'message': 'Local model reload failed.'}
+            else:
+                resp_data = {'status': 'error', 'message': 'Use {"backend": "local"|"api"}.'}
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp_data).encode('utf-8'))
+
+        elif self.path == '/api/oauth/login':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body.decode('utf-8')) if body else {}
+            except Exception:
+                data = {}
+            provider = ((data.get('provider') or '').strip().lower())
+            try:
+                host = self.headers.get('Host', 'localhost:5000')
+                auth_url, login_state, manual = oauth_login_begin(provider, host)
+                resp_data = {'status': 'success', 'provider': provider,
+                             'auth_url': auth_url, 'state': login_state,
+                             'manual': manual}
+            except Exception as e:
+                resp_data = {'status': 'error', 'message': str(e)}
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp_data).encode('utf-8'))
+
+        elif self.path == '/api/oauth/complete':
+            # Finish a manual copy-paste login (Anthropic): {provider, code, state}.
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body.decode('utf-8')) if body else {}
+            except Exception:
+                data = {}
+            try:
+                code = (data.get('code') or '').strip()
+                login_state = (data.get('state') or '').strip()
+                if not code or not login_state:
+                    raise RuntimeError("paste the authorization code first.")
+                msg = oauth_login_complete(code, login_state)
+                resp_data = {'status': 'success', 'message': msg,
+                             'oauth': oauth_status_dict()}
+            except Exception as e:
+                resp_data = {'status': 'error', 'message': str(e)}
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps(resp_data).encode('utf-8'))
+
+        elif self.path == '/api/oauth/logout':
+            content_length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(content_length)
+            try:
+                data = json.loads(body.decode('utf-8')) if body else {}
+            except Exception:
+                data = {}
+            target = (data.get('provider') or '').strip().lower()
+            targets = [target] if target else list(OAUTH_PROVIDERS)
+            for t in targets:
+                if t not in OAUTH_PROVIDERS:
+                    continue
+                clear_oauth_token(t)
+                if t == 'openrouter' and settings.get('api_provider') == 'openrouter':
+                    settings['api_key'] = ''
+                    save_settings_to_json({'api_key': ''})
+            if (settings.get('active_backend') or 'local').lower() == 'api' \
+                    and build_api_adapter_from_settings(settings) is None:
+                use_local_backend()
+            reasoner.update_settings(settings)
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json; charset=utf-8')
+            self.end_headers()
+            self.wfile.write(json.dumps({'status': 'success',
+                                         'oauth': oauth_status_dict()}).encode('utf-8'))
 
         elif self.path == '/api/models/upload':
             content_length = int(self.headers.get('Content-Length', 0))

@@ -33,6 +33,12 @@ import argparse
 import pickle
 import base64
 import threading
+import webbrowser
+import secrets
+import hashlib
+import urllib.request
+import urllib.error
+import urllib.parse
 
 import torch
 import torch.nn as nn
@@ -143,6 +149,13 @@ DEFAULT_SETTINGS = {
     "auto_swarm_council": False,
     "auto_web_research": False,
     "current_model": "ashen_gpt_model.pk1",
+    "active_backend": "local",
+    "api_provider": "",
+    "api_base_url": "",
+    "api_key": "",
+    "api_model": "",
+    "oauth_client_id": "",
+    "oauth_client_secret": "",
 }
 
 
@@ -629,6 +642,753 @@ class QwenModelAdapter:
 
 
 # =====================================================================
+#  API provider models (OpenAI-compatible, via API key)
+# =====================================================================
+# Optional backend: answer through a hosted, OpenAI-compatible chat API
+# (OpenAI, OpenRouter, Groq, Together, DeepSeek, Ollama, LM Studio, vLLM, or
+# any custom base URL) instead of a local checkpoint. Local loading is
+# untouched — settings `active_backend` ("local" | "api") picks which one
+# answers. The key resolves as: settings.json `api_key` > ASHEN_API_KEY env
+# > the provider preset's own env var. Prefer env vars: settings.json is
+# git-tracked, so a key saved there could be committed by accident.
+API_PROVIDER_PRESETS = {
+    "openai":     {"base_url": "https://api.openai.com/v1",      "env": "OPENAI_API_KEY"},
+    "openrouter": {"base_url": "https://openrouter.ai/api/v1",   "env": "OPENROUTER_API_KEY"},
+    "groq":       {"base_url": "https://api.groq.com/openai/v1", "env": "GROQ_API_KEY"},
+    "together":   {"base_url": "https://api.together.xyz/v1",    "env": "TOGETHER_API_KEY"},
+    "deepseek":   {"base_url": "https://api.deepseek.com/v1",    "env": "DEEPSEEK_API_KEY"},
+    "ollama":     {"base_url": "http://localhost:11434/v1",      "env": ""},
+    "lmstudio":   {"base_url": "http://localhost:1234/v1",       "env": ""},
+    "google":     {"base_url": "https://generativelanguage.googleapis.com", "env": ""},
+    "anthropic":  {"base_url": "https://api.anthropic.com",      "env": "ANTHROPIC_API_KEY"},
+    "custom":     {"base_url": "",                               "env": "ASHEN_API_KEY"},
+}
+
+API_SYSTEM_PROMPT = (
+    "You are Ashen GPT, a precise AI assistant. "
+    "Answer every question completely and directly — never ask the user what "
+    "angle or level of detail they want, and never deflect. "
+    "When a request needs current facts, reason step by step, then ground your "
+    "answer in the gathered sources and cite them inline as [1], [2], ... with a "
+    "Sources list at the end.\n\n"
+    "Wrap your brief step-by-step reasoning in <think>...</think> tags, then "
+    "give the final answer clearly separated from the reasoning."
+)
+
+
+def _mask_api_key(key):
+    if not key:
+        return "(not set)"
+    s = str(key)
+    if len(s) <= 8:
+        return "****"
+    return f"{s[:3]}...{s[-4:]}"
+
+
+def _resolve_api_key(s):
+    if (s.get("api_key") or "").strip():
+        return s["api_key"].strip()
+    if os.getenv("ASHEN_API_KEY", "").strip():
+        return os.getenv("ASHEN_API_KEY").strip()
+    preset = API_PROVIDER_PRESETS.get((s.get("api_provider") or "").lower(), {})
+    env_name = preset.get("env", "")
+    if env_name and os.getenv(env_name, "").strip():
+        return os.getenv(env_name).strip()
+    return ""
+
+
+def _resolve_api_base_url(s):
+    if (s.get("api_base_url") or "").strip():
+        return s["api_base_url"].strip().rstrip("/")
+    preset = API_PROVIDER_PRESETS.get((s.get("api_provider") or "").lower(), {})
+    return (preset.get("base_url") or "").rstrip("/")
+
+
+def _api_http_json(method, url, api_key, payload=None, timeout=60):
+    """Minimal stdlib JSON client for OpenAI-compatible APIs. Raises RuntimeError."""
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"HTTP {e.code}: {body}")
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"connection failed: {e.reason}")
+
+
+class APIModelAdapter:
+    """OpenAI-compatible chat backend used as engine.model when active_backend=api.
+
+    Same role as QwenModelAdapter (eval/train/classify/chat interface) but every
+    answer comes from the provider API keyed by `api_key` — no local weights.
+    """
+    is_api = True
+    is_qwen = False
+
+    def __init__(self, base_url, api_key, model_name, timeout=120):
+        self.base_url = (base_url or "").rstrip("/")
+        self.api_key = api_key or ""
+        self.model_name = model_name or ""
+        self.timeout = timeout
+
+    @property
+    def name(self):
+        return self.model_name
+
+    def eval(self):
+        return self
+
+    def train(self, mode=True):
+        return self
+
+    def classify(self, text):
+        return None, None, None
+
+    def list_models(self, timeout=30):
+        """List all model ids available under this provider API key (GET /models)."""
+        obj = _api_http_json("GET", self.base_url + "/models", self.api_key, timeout=timeout)
+        items = obj.get("data", []) if isinstance(obj, dict) else []
+        out = []
+        for it in items:
+            if isinstance(it, dict) and it.get("id"):
+                out.append({"id": it["id"], "owned_by": it.get("owned_by", "")})
+        return sorted(out, key=lambda m: m["id"])
+
+    def chat(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        payload = {"model": self.model_name, "messages": messages,
+                   "temperature": temperature, "max_tokens": max_tokens,
+                   "top_p": top_p, "stream": False}
+        obj = _api_http_json("POST", self.base_url + "/chat/completions",
+                             self.api_key, payload, self.timeout)
+        msg = obj["choices"][0].get("message", {})
+        content = msg.get("content") or ""
+        reasoning = msg.get("reasoning_content") or ""
+        if reasoning and "<think>" not in content:
+            return f"<think>\n{reasoning}\n</think>\n{content}"
+        return content
+
+    def chat_stream(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        """Yield (reasoning_delta, content_delta) tuples from the SSE stream."""
+        payload = {"model": self.model_name, "messages": messages,
+                   "temperature": temperature, "max_tokens": max_tokens,
+                   "top_p": top_p, "stream": True}
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = "Bearer " + self.api_key
+        req = urllib.request.Request(self.base_url + "/chat/completions",
+                                     data=json.dumps(payload).encode("utf-8"),
+                                     headers=headers, method="POST")
+        try:
+            resp = urllib.request.urlopen(req, timeout=self.timeout)
+        except urllib.error.HTTPError as e:
+            try:
+                body = e.read().decode("utf-8", "replace")[:300]
+            except Exception:
+                body = ""
+            raise RuntimeError(f"HTTP {e.code}: {body}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"connection failed: {e.reason}")
+        with resp:
+            for raw in resp:
+                try:
+                    line = raw.decode("utf-8", "replace").strip()
+                except Exception:
+                    continue
+                if not line.startswith("data:"):
+                    continue
+                body = line[5:].strip()
+                if body == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(body)
+                except Exception:
+                    continue
+                choices = obj.get("choices", []) if isinstance(obj, dict) else []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {}) or {}
+                yield (delta.get("reasoning_content") or "", delta.get("content") or "")
+
+
+def build_api_adapter_from_settings(s, key_override=None, allow_no_model=False):
+    """Return an API adapter from settings, or None if not configured.
+
+    provider 'google' uses account-login (OAuth) Bearer tokens against the
+    Gemini API; every other provider uses the OpenAI-compatible API key flow.
+    allow_no_model=True builds the adapter for /models listing when no
+    api_model is picked yet.
+    """
+    if (s.get("api_provider") or "").lower() == "google":
+        if not _google_logged_in() and not allow_no_model:
+            return None
+        name = (s.get("api_model") or "").strip()
+        if not name and not allow_no_model:
+            return None
+        return GeminiOAuthAdapter(name)
+    if (s.get("api_provider") or "").lower() == "anthropic":
+        name = (s.get("api_model") or "").strip()
+        if not name and not allow_no_model:
+            return None
+        try:
+            anthropic_credential()
+        except RuntimeError:
+            if not allow_no_model:
+                return None
+        return AnthropicMessagesAdapter(name)
+    base = _resolve_api_base_url(s)
+    name = (s.get("api_model") or "").strip()
+    if not base or (not name and not allow_no_model):
+        return None
+    key = key_override if key_override is not None else _resolve_api_key(s)
+    return APIModelAdapter(base, key, name)
+
+
+def apply_backend_settings(s):
+    """Point reasoner.model at the API backend when active_backend=api."""
+    global model, m
+    if (s.get("active_backend") or "local").lower() != "api":
+        return False
+    adapter = build_api_adapter_from_settings(s)
+    if adapter is None:
+        print("[API] active_backend=api but provider/model is not configured; staying on local.", flush=True)
+        return False
+    model = adapter
+    m = adapter
+    reasoner.model = adapter
+    return True
+
+
+# ---------------------------------------------------------------------------
+# OAuth / provider-account login (additive: API keys keep working as-is).
+#
+# Only providers that let a site login yield API credentials are supported:
+#   openrouter : login on openrouter.ai authorizes this app and returns a
+#                user API key -> stored as the OpenRouter api_key.
+#   google     : standard OAuth2 with your own free "Desktop app" client ID
+#                from Google Cloud Console -> access/refresh tokens used as
+#                Bearer credentials against the Gemini API.
+# OpenAI / Anthropic / Groq / Together / DeepSeek / xAI expose no
+# OAuth-for-API flow, so they stay API-key-only.
+# OAuth tokens live in oauth_tokens.json (gitignored), never settings.json.
+# ---------------------------------------------------------------------------
+OAUTH_FILE_NAME = "oauth_tokens.json"
+
+OPENROUTER_OAUTH_AUTH_URL = "https://openrouter.ai/auth"
+OPENROUTER_OAUTH_KEYS_URL = "https://openrouter.ai/api/v1/auth/keys"
+
+GOOGLE_OAUTH_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_OAUTH_TOKEN_URL = "https://oauth2.googleapis.com/token"
+GOOGLE_OAUTH_SCOPES = "https://www.googleapis.com/auth/cloud-platform"
+
+# Anthropic subscription login (Claude Pro/Max OAuth, same flow Claude Code
+# uses). Fixed first-party client/redirect: the user copies a code from the
+# provider site and pastes it here (no localhost callback possible).
+ANTHROPIC_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f9e"
+ANTHROPIC_OAUTH_AUTH_URL = "https://console.anthropic.com/oauth/authorize"
+ANTHROPIC_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token"
+ANTHROPIC_OAUTH_REDIRECT_URI = "https://console.anthropic.com/oauth/code/callback"
+ANTHROPIC_OAUTH_SCOPES = "org:create_api_key user:profile user:inference"
+ANTHROPIC_API_BASE = "https://api.anthropic.com"
+ANTHROPIC_BETA_OAUTH = "oauth-2025-04-20"
+
+OAUTH_PROVIDERS = ("openrouter", "google", "anthropic")
+
+
+def _oauth_file():
+    override = os.environ.get("ASHEN_OAUTH_FILE")
+    if override:
+        return override
+    try:
+        base = os.path.dirname(os.path.abspath(SETTINGS_FILE))
+    except Exception:
+        base = "."
+    return os.path.join(base, OAUTH_FILE_NAME)
+
+
+def load_oauth_tokens():
+    try:
+        with open(_oauth_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_oauth_token(provider, entry):
+    toks = load_oauth_tokens()
+    toks[provider] = entry
+    try:
+        with open(_oauth_file(), "w", encoding="utf-8") as f:
+            json.dump(toks, f, indent=2)
+    except Exception:
+        pass
+
+
+def clear_oauth_token(provider):
+    toks = load_oauth_tokens()
+    toks.pop(provider, None)
+    try:
+        with open(_oauth_file(), "w", encoding="utf-8") as f:
+            json.dump(toks, f, indent=2)
+    except Exception:
+        pass
+
+
+def _google_logged_in():
+    g = load_oauth_tokens().get("google") or {}
+    return bool(g.get("access_token") or g.get("refresh_token"))
+
+
+def _pkce_pair():
+    verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).rstrip(b"=").decode()
+    challenge = base64.urlsafe_b64encode(
+        hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    return verifier, challenge
+
+
+def oauth_build_auth_url(provider, redirect_uri, client_id=""):
+    """Return (auth_url, verifier, state). Auth endpoints are overridable via
+    env (ASHEN_OAUTH_AUTH_URL_<PROVIDER>) for offline tests."""
+    state = secrets.token_urlsafe(16)
+    verifier, challenge = _pkce_pair()
+    if provider == "openrouter":
+        base = os.environ.get("ASHEN_OAUTH_AUTH_URL_OPENROUTER", OPENROUTER_OAUTH_AUTH_URL)
+        return "%s?%s" % (base, urllib.parse.urlencode({"callback_url": redirect_uri})), verifier, state
+    if provider == "anthropic":
+        # Manual copy-paste flow: fixed console redirect, so redirect_uri arg
+        # is ignored and no localhost listener is involved.
+        base = os.environ.get("ASHEN_OAUTH_AUTH_URL_ANTHROPIC", ANTHROPIC_OAUTH_AUTH_URL)
+        qs = urllib.parse.urlencode({
+            "code": "true",
+            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "response_type": "code",
+            "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
+            "scope": ANTHROPIC_OAUTH_SCOPES,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        })
+        return "%s?%s" % (base, qs), verifier, state
+    if provider == "google":
+        base = os.environ.get("ASHEN_OAUTH_AUTH_URL_GOOGLE", GOOGLE_OAUTH_AUTH_URL)
+        qs = urllib.parse.urlencode({
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "response_type": "code",
+            "scope": GOOGLE_OAUTH_SCOPES,
+            "access_type": "offline",
+            "prompt": "consent",
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+            "state": state,
+        })
+        return "%s?%s" % (base, qs), verifier, state
+    raise ValueError("unsupported oauth provider: %s" % provider)
+
+
+def _oauth_http_json(url, payload):
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url, data=data,
+                                 headers={"Content-Type": "application/json"},
+                                 method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"HTTP {e.code}: {body}")
+
+
+def oauth_exchange_code(provider, code, verifier, redirect_uri, client_id="", client_secret=""):
+    """Exchange an authorization code for stored credentials. Token endpoints
+    are overridable via env (ASHEN_OAUTH_TOKEN_URL / ASHEN_OAUTH_KEYS_URL)."""
+    if provider == "openrouter":
+        keys_url = os.environ.get("ASHEN_OAUTH_KEYS_URL", OPENROUTER_OAUTH_KEYS_URL)
+        resp = _oauth_http_json(keys_url, {"code": code})
+        key = (resp.get("key") or "").strip()
+        if not key:
+            raise RuntimeError("OpenRouter login failed: no key returned.")
+        settings["api_provider"] = "openrouter"
+        settings["api_base_url"] = API_PROVIDER_PRESETS["openrouter"]["base_url"]
+        settings["api_key"] = key
+        save_settings_to_json({"api_provider": "openrouter",
+                               "api_base_url": settings["api_base_url"],
+                               "api_key": key})
+        save_oauth_token("openrouter", {"via": "login", "obtained_at": time.time()})
+        return f"Logged in with OpenRouter (key {_mask_api_key(key)})."
+    if provider == "google":
+        token_url = os.environ.get("ASHEN_OAUTH_TOKEN_URL", GOOGLE_OAUTH_TOKEN_URL)
+        payload = {"client_id": client_id, "redirect_uri": redirect_uri,
+                   "grant_type": "authorization_code", "code": code,
+                   "code_verifier": verifier}
+        if client_secret:
+            payload["client_secret"] = client_secret
+        resp = _oauth_http_json(token_url, payload)
+        if not resp.get("access_token"):
+            raise RuntimeError(f"Google login failed: {str(resp)[:300]}")
+        save_oauth_token("google", {
+            "access_token": resp["access_token"],
+            "refresh_token": resp.get("refresh_token", ""),
+            "expires_at": time.time() + int(resp.get("expires_in", 3600)) - 60,
+            "obtained_at": time.time(),
+        })
+        settings["api_provider"] = "google"
+        settings["api_base_url"] = API_PROVIDER_PRESETS["google"]["base_url"]
+        save_settings_to_json({"api_provider": "google",
+                               "api_base_url": settings["api_base_url"]})
+        note = "" if resp.get("refresh_token") else " (no refresh token; you may need to log in again later)"
+        return f"Logged in with Google{note}."
+    if provider == "anthropic":
+        token_url = os.environ.get("ASHEN_ANTHROPIC_TOKEN_URL", ANTHROPIC_OAUTH_TOKEN_URL)
+        resp = _oauth_http_json(token_url, {
+            "grant_type": "authorization_code",
+            "code": code,
+            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "redirect_uri": ANTHROPIC_OAUTH_REDIRECT_URI,
+            "code_verifier": verifier,
+        })
+        if not resp.get("access_token"):
+            raise RuntimeError(f"Anthropic login failed: {str(resp)[:300]}")
+        save_oauth_token("anthropic", {
+            "access_token": resp["access_token"],
+            "refresh_token": resp.get("refresh_token", ""),
+            "expires_at": time.time() + int(resp.get("expires_in", 3600)) - 60,
+            "obtained_at": time.time(),
+        })
+        settings["api_provider"] = "anthropic"
+        settings["api_base_url"] = API_PROVIDER_PRESETS["anthropic"]["base_url"]
+        save_settings_to_json({"api_provider": "anthropic",
+                               "api_base_url": settings["api_base_url"]})
+        return "Logged in with Anthropic (Claude subscription)."
+    raise ValueError("unsupported oauth provider: %s" % provider)
+
+
+def google_access_token():
+    """Return a fresh Google access token, refreshing it when expired."""
+    toks = load_oauth_tokens().get("google") or {}
+    if toks.get("access_token") and toks.get("expires_at", 0) > time.time():
+        return toks["access_token"]
+    if not toks.get("refresh_token"):
+        raise RuntimeError("Google login expired or missing. Run /login google again.")
+    payload = {"client_id": settings.get("oauth_client_id", ""),
+               "grant_type": "refresh_token",
+               "refresh_token": toks["refresh_token"]}
+    if settings.get("oauth_client_secret"):
+        payload["client_secret"] = settings["oauth_client_secret"]
+    token_url = os.environ.get("ASHEN_OAUTH_TOKEN_URL", GOOGLE_OAUTH_TOKEN_URL)
+    resp = _oauth_http_json(token_url, payload)
+    if not resp.get("access_token"):
+        raise RuntimeError("Google token refresh failed. Run /login google again.")
+    toks["access_token"] = resp["access_token"]
+    toks["expires_at"] = time.time() + int(resp.get("expires_in", 3600)) - 60
+    if resp.get("refresh_token"):
+        toks["refresh_token"] = resp["refresh_token"]
+    save_oauth_token("google", toks)
+    return toks["access_token"]
+
+
+def _anthropic_logged_in():
+    a = load_oauth_tokens().get("anthropic") or {}
+    return bool(a.get("access_token") or a.get("refresh_token"))
+
+
+def anthropic_credential():
+    """Return ('bearer', token) for a subscription login, or ('key', api_key)
+    for a classic Anthropic API key. Raises RuntimeError if neither exists."""
+    toks = load_oauth_tokens().get("anthropic") or {}
+    if toks.get("access_token") and toks.get("expires_at", 0) > time.time():
+        return ("bearer", toks["access_token"])
+    if toks.get("refresh_token"):
+        token_url = os.environ.get("ASHEN_ANTHROPIC_TOKEN_URL", ANTHROPIC_OAUTH_TOKEN_URL)
+        resp = _oauth_http_json(token_url, {
+            "grant_type": "refresh_token",
+            "client_id": ANTHROPIC_OAUTH_CLIENT_ID,
+            "refresh_token": toks["refresh_token"],
+        })
+        if not resp.get("access_token"):
+            raise RuntimeError("Anthropic token refresh failed. Run /login anthropic again.")
+        toks["access_token"] = resp["access_token"]
+        toks["expires_at"] = time.time() + int(resp.get("expires_in", 3600)) - 60
+        if resp.get("refresh_token"):
+            toks["refresh_token"] = resp["refresh_token"]
+        save_oauth_token("anthropic", toks)
+        return ("bearer", toks["access_token"])
+    key = _resolve_api_key(settings)
+    if key:
+        return ("key", key)
+    raise RuntimeError("No Anthropic login or API key. Run /login anthropic or set /api-key.")
+
+
+def _anthropic_http(method, path, payload=None, stream=False):
+    base = os.environ.get("ASHEN_ANTHROPIC_API_BASE",
+                          API_PROVIDER_PRESETS["anthropic"]["base_url"]).rstrip("/")
+    mode, cred = anthropic_credential()
+    headers = {"anthropic-version": "2023-06-01"}
+    if mode == "bearer":
+        headers["Authorization"] = "Bearer " + cred
+        headers["anthropic-beta"] = ANTHROPIC_BETA_OAUTH
+    else:
+        headers["x-api-key"] = cred
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    if data is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(base + path, data=data, headers=headers, method=method)
+    try:
+        if not stream:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        out = []
+        for raw in _anthropic_sse_lines(req):
+            try:
+                obj = json.loads(raw)
+            except Exception:
+                continue
+            delta = obj.get("delta", {}) if isinstance(obj, dict) else {}
+            dtype = delta.get("type", "")
+            if dtype == "text_delta":
+                out.append(("", delta.get("text", "")))
+            elif dtype == "thinking_delta":
+                out.append((delta.get("thinking", ""), ""))
+        return out
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"Anthropic API error: HTTP {e.code} {body}")
+
+
+def _anthropic_sse_lines(req):
+    with urllib.request.urlopen(req, timeout=120) as r:
+        for raw in r:
+            line = raw.decode("utf-8", "replace").strip()
+            if line.startswith("data:"):
+                body = line[5:].strip()
+                if body and body != "[DONE]":
+                    yield body
+
+
+def _anthropic_content_to_text(resp):
+    texts, thoughts = [], []
+    try:
+        blocks = resp.get("content", [])
+    except Exception:
+        return "", ""
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        if b.get("type") == "thinking" and b.get("thinking"):
+            thoughts.append(b["thinking"])
+        elif b.get("type") == "text" and b.get("text"):
+            texts.append(b["text"])
+    return "".join(thoughts), "".join(texts)
+
+
+class AnthropicMessagesAdapter:
+    """Claude-subscription (OAuth) or API-key adapter for the Messages API."""
+    is_api = True
+    is_qwen = False
+
+    def __init__(self, model_name, timeout=120):
+        self.model_name = model_name or ""
+        self.api_provider = "anthropic"
+        self.base_url = os.environ.get(
+            "ASHEN_ANTHROPIC_API_BASE",
+            API_PROVIDER_PRESETS["anthropic"]["base_url"]).rstrip("/")
+        self.api_key = ""  # OAuth mode carries no key; display only
+        self.timeout = timeout
+
+    @property
+    def name(self):
+        return self.model_name
+
+    def eval(self):
+        return self
+
+    def train(self, mode=True):
+        return self
+
+    def classify(self, text):
+        return None, None, None
+
+    def to(self, device):
+        return self
+
+    def list_models(self, timeout=30):
+        data = _anthropic_http("GET", "/v1/models")
+        items = data.get("data", []) if isinstance(data, dict) else []
+        return sorted(({"id": m["id"]} for m in items
+                       if isinstance(m, dict) and m.get("id")),
+                      key=lambda m: m["id"])
+
+    def _body(self, messages, max_tokens):
+        system, conv = [], []
+        for m in messages:
+            if m.get("role") == "system":
+                system.append(m.get("content", ""))
+            else:
+                role = "assistant" if m.get("role") == "assistant" else "user"
+                conv.append({"role": role, "content": m.get("content", "")})
+        body = {"model": self.model_name, "max_tokens": max_tokens or 1024,
+                "messages": conv}
+        if system:
+            body["system"] = "\n".join(system)
+        return body
+
+    def chat(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        resp = _anthropic_http("POST", "/v1/messages",
+                               self._body(messages, max_tokens))
+        thought, text = _anthropic_content_to_text(resp)
+        if thought and text and "<think>" not in text:
+            return f"<think>\n{thought.strip()}\n</think>\n{text}"
+        return text or thought
+
+    def chat_stream(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        body = self._body(messages, max_tokens)
+        body["stream"] = True
+        for thought, text in _anthropic_http("POST", "/v1/messages", body, stream=True):
+            yield thought, text
+
+
+def _gemini_http(method, path, payload=None, stream=False):
+    base = os.environ.get("ASHEN_GEMINI_API_BASE",
+                          API_PROVIDER_PRESETS["google"]["base_url"]).rstrip("/")
+    url = base + path + ("?alt=sse" if stream else "")
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"Authorization": "Bearer " + google_access_token()}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        if not stream:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                return json.loads(r.read().decode("utf-8", "replace"))
+        out = []
+        with urllib.request.urlopen(req, timeout=120) as r:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                body = line[5:].strip()
+                if body and body != "[DONE]":
+                    try:
+                        out.append(json.loads(body))
+                    except Exception:
+                        pass
+        return out
+    except urllib.error.HTTPError as e:
+        try:
+            body = e.read().decode("utf-8", "replace")[:300]
+        except Exception:
+            body = ""
+        raise RuntimeError(f"Google API error: HTTP {e.code} {body}")
+
+
+def _gemini_parts_to_text(resp):
+    texts, thoughts = [], []
+    try:
+        cands = resp.get("candidates", [])
+    except Exception:
+        return "", ""
+    for cand in cands:
+        for part in (cand.get("content") or {}).get("parts", []):
+            t = part.get("text", "")
+            if not t:
+                continue
+            (thoughts if part.get("thought") else texts).append(t)
+    return "".join(thoughts), "".join(texts)
+
+
+class GeminiOAuthAdapter:
+    """Google-account login adapter for the Gemini API (Bearer tokens)."""
+    is_api = True
+    is_qwen = False
+
+    def __init__(self, model_name, timeout=120):
+        self.model_name = model_name or ""
+        self.api_provider = "google"
+        self.timeout = timeout
+
+    @property
+    def name(self):
+        return self.model_name
+
+    def eval(self):
+        return self
+
+    def train(self, mode=True):
+        return self
+
+    def classify(self, text):
+        return None, None, None
+
+    def to(self, device):
+        return self
+
+    def list_models(self, timeout=30):
+        data = _gemini_http("GET", "/v1beta/models")
+        out = []
+        for m in data.get("models", []):
+            name = m.get("name", "")
+            mid = name.split("/", 1)[1] if "/" in name else name
+            if mid:
+                out.append({"id": mid})
+        return sorted(out, key=lambda m: m["id"])
+
+    def _contents(self, messages):
+        contents = []
+        for m in messages:
+            role = "model" if m.get("role") == "assistant" else "user"
+            contents.append({"role": role, "parts": [{"text": m.get("content", "")}]})
+        return contents
+
+    def chat(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        resp = _gemini_http("POST", f"/v1beta/models/{self.model_name}:generateContent",
+                            {"contents": self._contents(messages)})
+        thought, text = _gemini_parts_to_text(resp)
+        if thought and text and "<think>" not in text:
+            return f"<think>\n{thought.strip()}\n</think>\n{text}"
+        return text or thought
+
+    def chat_stream(self, messages, temperature=0.7, max_tokens=250, top_p=0.9):
+        chunks = _gemini_http("POST", f"/v1beta/models/{self.model_name}:streamGenerateContent",
+                              {"contents": self._contents(messages)}, stream=True)
+        for resp in chunks:
+            yield _gemini_parts_to_text(resp)
+
+
+def oauth_status_lines():
+    lines = []
+    toks = load_oauth_tokens()
+    g = toks.get("google")
+    if g and (g.get("access_token") or g.get("refresh_token")):
+        state = "active" if g.get("expires_at", 0) > time.time() else "expired (auto-refreshes on use)"
+        lines.append(f"google: logged in ({state})")
+    if toks.get("openrouter"):
+        lines.append(f"openrouter: logged in via site (key {_mask_api_key(_resolve_api_key(settings))})")
+    a = toks.get("anthropic")
+    if a and (a.get("access_token") or a.get("refresh_token")):
+        state = "active" if a.get("expires_at", 0) > time.time() else "expired (auto-refreshes on use)"
+        lines.append(f"anthropic: logged in with Claude subscription ({state})")
+    if not lines:
+        lines.append("No provider logins. API keys (if set) still work as before.")
+        lines.append("Account login supported: openrouter, google, anthropic (Claude Pro/Max).")
+        lines.append("API-key-only (no site login exists): openai, groq, together, deepseek, xai, custom.")
+    return lines
+
+
+# =====================================================================
 #  Safe checkpoint loader (legacy .pk1 remapped to this module)
 # =====================================================================
 class _AshenUnpickler(pickle.Unpickler):
@@ -654,35 +1414,44 @@ if os.path.exists(current_model_filename):
 else:
     print(f"[Model] Saved model not found, using default: {current_model_filename}")
 
-if os.path.isdir(current_model_filename):
-    _ch_path = os.path.join(current_model_filename, "class_head.pt")
-    print(f"Loading Qwen HF model from directory: {current_model_filename}")
-    try:
-        model = QwenModelAdapter(current_model_filename, device, class_head_path=_ch_path)
-        print("Qwen model loaded via QwenModelAdapter (chat-templated, class_head="
-              f"{'present' if model.class_head is not None else 'absent'}).")
-    except Exception as e:
-        print(f"Qwen load failed ({e}). Falling back to default pickle model...")
-        current_model_filename = DEFAULT_MODEL_FILENAME
-if not os.path.isdir(current_model_filename) and os.path.exists(current_model_filename):
-    print(f"Loading Ashen GPT model parameters from {current_model_filename}...")
-    try:
-        with open(current_model_filename, 'rb') as f:
-            model = _load_ashen_checkpoint(current_model_filename)
-        print("Model loaded successfully via pickle (remapped from ashen_gpt_trainer)!")
-    except Exception as e:
-        print(f"Pickle load failed ({e}). Trying torch.load fallback...")
+# API backend: if settings ask for it and a provider/model is configured,
+# answer through the provider API key and skip local weights entirely.
+_api_adapter = build_api_adapter_from_settings(settings)
+if _api_adapter is not None and (settings.get('active_backend') or 'local').lower() == 'api':
+    model = _api_adapter
+    print(f"[Model] API backend active: {model.model_name} via {model.base_url} "
+          f"(key {_mask_api_key(model.api_key)})")
+else:
+    _api_adapter = None
+    if os.path.isdir(current_model_filename):
+        _ch_path = os.path.join(current_model_filename, "class_head.pt")
+        print(f"Loading Qwen HF model from directory: {current_model_filename}")
         try:
-            model = torch.load(current_model_filename, map_location=device)
-            print("Model loaded successfully via torch.load!")
-        except Exception as torch_e:
-            print(f"Checkpoint unreadable ({torch_e}). Initializing new model...")
-            model = AshenGPTLanguageModel(vocab_size)
-elif not os.path.exists(current_model_filename) and not os.path.isdir(current_model_filename):
-    print(f"No checkpoint found at {current_model_filename}. Initializing new Ashen GPT model...")
-    model = AshenGPTLanguageModel(vocab_size)
+            model = QwenModelAdapter(current_model_filename, device, class_head_path=_ch_path)
+            print("Qwen model loaded via QwenModelAdapter (chat-templated, class_head="
+                  f"{'present' if model.class_head is not None else 'absent'}).")
+        except Exception as e:
+            print(f"Qwen load failed ({e}). Falling back to default pickle model...")
+            current_model_filename = DEFAULT_MODEL_FILENAME
+    if _api_adapter is None and not os.path.isdir(current_model_filename) and os.path.exists(current_model_filename):
+        print(f"Loading Ashen GPT model parameters from {current_model_filename}...")
+        try:
+            with open(current_model_filename, 'rb') as f:
+                model = _load_ashen_checkpoint(current_model_filename)
+            print("Model loaded successfully via pickle (remapped from ashen_gpt_trainer)!")
+        except Exception as e:
+            print(f"Pickle load failed ({e}). Trying torch.load fallback...")
+            try:
+                model = torch.load(current_model_filename, map_location=device)
+                print("Model loaded successfully via torch.load!")
+            except Exception as torch_e:
+                print(f"Checkpoint unreadable ({torch_e}). Initializing new model...")
+                model = AshenGPTLanguageModel(vocab_size)
+    elif _api_adapter is None and not os.path.exists(current_model_filename) and not os.path.isdir(current_model_filename):
+        print(f"No checkpoint found at {current_model_filename}. Initializing new Ashen GPT model...")
+        model = AshenGPTLanguageModel(vocab_size)
 
-m = model.to(device) if not getattr(model, "is_qwen", False) else model
+m = model.to(device) if not getattr(model, "is_qwen", False) and not getattr(model, "is_api", False) else model
 
 # Draft model (speculative decoding) — optional
 draft_model_filename = 'ashen_gpt_model_draft.pk1'
@@ -1011,6 +1780,10 @@ class AshenAIAgenticEngine:
     def classify_input(self, prompt):
         try:
             label, idx, conf = self.model.classify(prompt)
+            if label is None or conf is None:
+                # Backends without a classification head (e.g. API models).
+                self.last_intent = None
+                return None, None, None
             self.last_intent = {"label": label, "confidence": round(conf, 4)}
             return label, idx, conf
         except Exception as e:
@@ -1108,6 +1881,142 @@ class AshenAIAgenticEngine:
                "model_path": current_model_filename, "sources": [],
                "intent": self.last_intent}
 
+    def _api_messages(self, prompt):
+        msgs = [{"role": "system", "content": API_SYSTEM_PROMPT}]
+        for u, a in self.history[-2:]:
+            msgs.append({"role": "user", "content": u})
+            msgs.append({"role": "assistant", "content": a})
+        msgs.append({"role": "user", "content": prompt})
+        return msgs
+
+    @staticmethod
+    def _split_api_thought(text):
+        mm = re.search(r'<think>([\s\S]*?)(?:</think>|$)', text)
+        if mm:
+            return mm.group(1).strip(), text[mm.end():].strip()
+        return "", text.strip()
+
+    @torch.no_grad()
+    def _solve_api(self, prompt):
+        """Isolated solve path for API-key models (APIModelAdapter).
+
+        Mirrors _solve_qwen: single OpenAI-compatible chat call, no local
+        ### Instruction:/### Response: framing, returns (thought, resp).
+        """
+        self.model.eval()
+        messages = self._api_messages(prompt)
+        try:
+            full = self.model.chat(messages, temperature=self.temperature,
+                                   max_tokens=self.max_new_tokens, top_p=self.top_p)
+        except Exception as e:
+            return "", f"API request failed: {e}"
+        thought, resp = self._split_api_thought(full)
+        self.history.append((prompt, resp))
+        return thought, resp
+
+    @torch.no_grad()
+    def _solve_api_stream(self, prompt):
+        """Streaming solve path for API-key models (APIModelAdapter)."""
+        self.model.eval()
+        self._source_harvest = []
+        label = getattr(self.model, "model_name", "api-model")
+        messages = self._api_messages(prompt)
+        try:
+            chunks = self.model.chat_stream(messages, temperature=self.temperature,
+                                            max_tokens=self.max_new_tokens, top_p=self.top_p)
+            chunk_iter = iter(chunks)
+            peek = next(chunk_iter, None)
+        except Exception as e:
+            err = f"API request failed: {e}"
+            yield {"type": "response_delta", "chunk": err}
+            yield {"type": "done", "thought": "", "response": err,
+                   "model": label, "model_path": f"api:{label}",
+                   "sources": [], "intent": self.last_intent}
+            return
+        if peek is None:
+            err = "API returned an empty stream."
+            yield {"type": "response_delta", "chunk": err}
+            yield {"type": "done", "thought": "", "response": err,
+                   "model": label, "model_path": f"api:{label}",
+                   "sources": [], "intent": self.last_intent}
+            return
+        full_reason = ""
+        content = ""
+        thought_sent = 0
+        resp_sent = 0
+        saw_close = False
+        thought_done = False
+        native_reasoning = False
+        stream_error = None
+        try:
+            for reasoning, delta in [peek] + list(chunk_iter):
+                if reasoning:
+                    native_reasoning = True
+                    full_reason += reasoning
+                    yield {"type": "thought_delta", "chunk": reasoning}
+                    thought_sent += len(reasoning)
+                if not delta:
+                    continue
+                content += delta
+                if native_reasoning:
+                    # Provider streams reasoning separately: everything in
+                    # content is the answer (strip any inline think blocks).
+                    if not thought_done:
+                        thought_done = True
+                        yield {"type": "thought_done"}
+                    no_think = re.sub(r'<think>[\s\S]*?(?:</think>|$)', '', content)
+                    nr = no_think[resp_sent:]
+                    if nr:
+                        yield {"type": "response_delta", "chunk": nr}
+                        resp_sent = len(no_think)
+                elif not saw_close:
+                    if "</think>" in content:
+                        saw_close = True
+                        before, after = content.split("</think>", 1)
+                        nt = before[thought_sent:]
+                        if nt:
+                            yield {"type": "thought_delta", "chunk": nt}
+                        thought_sent = len(before)
+                        thought_done = True
+                        yield {"type": "thought_done"}
+                        if after.strip():
+                            yield {"type": "response_delta", "chunk": after}
+                            resp_sent = len(after)
+                    else:
+                        nt = content[thought_sent:]
+                        if nt:
+                            yield {"type": "thought_delta", "chunk": nt}
+                        thought_sent = len(content)
+                else:
+                    nr = content[resp_sent:]
+                    if nr:
+                        yield {"type": "response_delta", "chunk": nr}
+                        resp_sent = len(content)
+        except Exception as e:
+            stream_error = str(e)
+        if native_reasoning:
+            thought = full_reason.strip()
+            extra, resp = self._split_api_thought(content)
+            if extra:
+                thought = (thought + "\n" + extra).strip()
+            if not resp:
+                resp = re.sub(r'<think>[\s\S]*?(?:</think>|$)', '', content).strip()
+        else:
+            thought, resp = self._split_api_thought(content)
+            if not thought_done:
+                thought_done = True
+                yield {"type": "thought_done"}
+            if not saw_close and resp and resp_sent == 0:
+                # Model never emitted <think>: what streamed as "thought"
+                # is actually the answer — re-emit it as the response.
+                yield {"type": "response_delta", "chunk": resp}
+        if stream_error:
+            resp = (resp + f"\n\n[stream interrupted: {stream_error}]").strip()
+        self.history.append((prompt, resp))
+        yield {"type": "done", "thought": thought, "response": resp,
+               "model": label, "model_path": f"api:{label}",
+               "sources": [], "intent": self.last_intent}
+
     @torch.no_grad()
     def solve_with_agent(self, prompt):
         self.model.eval()
@@ -1117,6 +2026,9 @@ class AshenAIAgenticEngine:
         _label, _idx, _conf = self.classify_input(prompt)
         if _label == "request":
             self.pending_requests.append({"prompt": prompt, "confidence": _conf})
+
+        if getattr(self.model, "is_api", False):
+            return self._solve_api(prompt)
 
         if getattr(self.model, "is_qwen", False):
             return self._solve_qwen(prompt)
@@ -1211,6 +2123,9 @@ class AshenAIAgenticEngine:
         _label, _idx, _conf = self.classify_input(prompt)
         if _label == "request":
             self.pending_requests.append({"prompt": prompt, "confidence": _conf})
+        if getattr(self.model, "is_api", False):
+            yield from self._solve_api_stream(prompt)
+            return
         if getattr(self.model, "is_qwen", False):
             yield from self._solve_qwen_stream(prompt)
             return
@@ -1754,11 +2669,12 @@ def switch_model(model_path):
             except Exception as te:
                 print(f"[Model] load failed ({te})")
                 return False
-    m = model.to(device) if not getattr(model, "is_qwen", False) else model
+    m = model.to(device) if not getattr(model, "is_qwen", False) and not getattr(model, "is_api", False) else model
     reasoner.model = m
     current_model_filename = normalized
     settings['current_model'] = normalized
-    save_settings_to_json({'current_model': normalized})
+    settings['active_backend'] = 'local'
+    save_settings_to_json({'current_model': normalized, 'active_backend': 'local'})
     print(f"[Model] switched -> {normalized}  ({'Qwen' if getattr(model, 'is_qwen', False) else 'custom'})")
     return True
 
@@ -1864,6 +2780,9 @@ def cmd_models():
     if not models:
         print("No models found.")
         return
+    backend = 'api' if getattr(reasoner.model, 'is_api', False) else 'local'
+    print(f"[Backend] active={backend}  local={os.path.basename(current_model_filename)}  "
+          f"api={settings.get('api_model') or '(none)'}")
     print(f"{'ACTIVE':<6} {'NAME':<28} {'SIZE(MB)':>9}  PATH")
     print("-" * 90)
     for mdl in models:
@@ -1877,8 +2796,296 @@ def cmd_model(arg):
         _apply_settings_to_engine()
 
 
+def active_model_label():
+    mdl = getattr(reasoner, "model", None)
+    if getattr(mdl, "is_api", False):
+        return f"api:{mdl.model_name}"
+    return os.path.basename(current_model_filename)
+
+
+def switch_api_model(model_id, provider=None, base_url=None, api_key=None):
+    """Activate an API-key model (mirrors /api/api-use in web_chatbot.py)."""
+    global model, m
+    if provider:
+        settings['api_provider'] = provider
+        preset = API_PROVIDER_PRESETS.get(provider, {})
+        if preset.get('base_url') and not base_url:
+            base_url = preset['base_url']
+    if base_url:
+        settings['api_base_url'] = base_url
+    if api_key:
+        settings['api_key'] = api_key
+    if model_id:
+        settings['api_model'] = model_id
+    settings['active_backend'] = 'api'
+    save_settings_to_json({k: settings[k] for k in
+                           ('api_provider', 'api_base_url', 'api_key', 'api_model', 'active_backend')
+                           if k in settings})
+    adapter = build_api_adapter_from_settings(settings)
+    if adapter is None:
+        print("[API] missing provider base URL or model name; not switched.")
+        return False
+    model = adapter
+    m = adapter
+    reasoner.model = adapter
+    via = getattr(adapter, 'base_url', None) or 'Google account login'
+    keymask = _mask_api_key(getattr(adapter, 'api_key', ''))
+    print(f"[API] backend -> api  model={adapter.model_name} via {via} "
+          f"(key {keymask})")
+    return True
+
+
+def use_local_backend():
+    """Switch answering back to the local checkpoint (keeps API settings saved)."""
+    path = settings.get('current_model', DEFAULT_MODEL_FILENAME)
+    settings['active_backend'] = 'local'
+    save_settings_to_json({'active_backend': 'local'})
+    return switch_model(path)
+
+
+def cmd_api_key(arg):
+    a = arg.strip()
+    if not a:
+        print(f"[API] provider={settings.get('api_provider') or '(none)'} "
+              f"base={_resolve_api_base_url(settings) or '(none)'} "
+              f"model={settings.get('api_model') or '(none)'} "
+              f"key={_mask_api_key(_resolve_api_key(settings))} "
+              f"backend={settings.get('active_backend', 'local')}")
+        return
+    if a.lower() == 'clear':
+        settings['api_key'] = ''
+        save_settings_to_json({'api_key': ''})
+        print("[API] key cleared from settings.json (env fallback still applies).")
+        return
+    settings['api_key'] = a
+    save_settings_to_json({'api_key': a})
+    apply_backend_settings(settings)
+    print(f"[API] key saved ({_mask_api_key(a)}). Prefer ASHEN_API_KEY env — settings.json is git-tracked.")
+
+
+def cmd_api_provider(arg):
+    a = arg.strip()
+    if not a:
+        print(f"[API] provider={settings.get('api_provider') or '(none)'} "
+              f"base={settings.get('api_base_url') or '(none)'} "
+              f"(presets: {', '.join(sorted(API_PROVIDER_PRESETS))})")
+        return
+    if a.lower() in API_PROVIDER_PRESETS and a.lower() != 'custom':
+        settings['api_provider'] = a.lower()
+        settings['api_base_url'] = API_PROVIDER_PRESETS[a.lower()]['base_url']
+    else:
+        settings['api_provider'] = 'custom'
+        settings['api_base_url'] = a
+    save_settings_to_json({'api_provider': settings['api_provider'],
+                           'api_base_url': settings['api_base_url']})
+    apply_backend_settings(settings)
+    print(f"[API] provider={settings['api_provider']} base={settings['api_base_url']}")
+
+
+def cmd_api_models():
+    adapter = build_api_adapter_from_settings(settings, allow_no_model=True)
+    if adapter is None:
+        print("[API] configure first: /api-provider <name|url> then /api-key <key> (or env var), or /login <openrouter|google>.")
+        return
+    try:
+        models = adapter.list_models()
+    except Exception as e:
+        print(f"[API] list failed: {e}")
+        return
+    cur = settings.get('api_model', '')
+    via = getattr(adapter, 'base_url', None) or 'Google account login'
+    keymask = _mask_api_key(getattr(adapter, 'api_key', ''))
+    print(f"[API] {len(models)} model(s) via {via} (key {keymask}):")
+    for mm in models:
+        mark = "●" if mm['id'] == cur else ""
+        print(f"  {mark:<2} {mm['id']}")
+
+
+def cmd_api_use(arg):
+    mid = arg.strip()
+    if not mid:
+        print("[API] usage: /api-use <model-id>  (see /api-models)")
+        return
+    if switch_api_model(mid):
+        _apply_settings_to_engine()
+
+
+def cmd_backend(arg):
+    a = arg.strip().lower()
+    if not a:
+        active = 'api' if getattr(reasoner.model, 'is_api', False) else 'local'
+        print(f"[Backend] active={active} local={os.path.basename(current_model_filename)} "
+              f"api={settings.get('api_model') or '(none)'}")
+        return
+    if a == 'api':
+        if not (settings.get('api_model') or '').strip():
+            print("[Backend] no api_model set — run /api-models then /api-use <id>.")
+            return
+        settings['active_backend'] = 'api'
+        save_settings_to_json({'active_backend': 'api'})
+        apply_backend_settings(settings)
+        _apply_settings_to_engine()
+    elif a == 'local':
+        use_local_backend()
+        _apply_settings_to_engine()
+    else:
+        print("[Backend] usage: /backend [local|api]")
+
+
+def _start_oauth_callback():
+    """Ephemeral localhost listener for the provider redirect.
+    Returns (server, captured_dict, redirect_uri)."""
+    import http.server as _hs
+    got = {}
+
+    class _H(_hs.BaseHTTPRequestHandler):
+        def do_GET(self):
+            from urllib.parse import urlparse as _up, parse_qs as _pq
+            q = _pq(_up(self.path).query)
+            got["code"] = (q.get("code") or [""])[0]
+            got["state"] = (q.get("state") or [""])[0]
+            body = b"<html><body><h3>Login received. You can close this window.</h3></body></html>"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    srv = _hs.HTTPServer(("127.0.0.1", 0), _H)
+    threading.Thread(target=srv.handle_request, daemon=True).start()
+    return srv, got, f"http://127.0.0.1:{srv.server_address[1]}/callback"
+
+
+def cmd_login(arg):
+    parts = arg.strip().split(None, 1)
+    p = parts[0].lower() if parts else ""
+    inline_code = parts[1].strip() if len(parts) > 1 else ""
+    if not p:
+        for line in oauth_status_lines():
+            print("[Login] " + line)
+        return
+    if p not in OAUTH_PROVIDERS:
+        print(f"[Login] no site login exists for '{p}'. Supported: openrouter, google, anthropic (Claude Pro/Max). "
+              "Everything else is API-key-only (OpenAI included — a ChatGPT plan never grants API access): "
+              "/api-provider <name>, /api-key <key>.")
+        return
+    if p == "anthropic":
+        # Manual flow: Anthropic's redirect is fixed to its console, so the
+        # user copies a code from the provider site and pastes it here.
+        try:
+            auth_url, verifier, _state = oauth_build_auth_url(p, "")
+        except Exception as e:
+            print(f"[Login] {e}")
+            return
+        code = inline_code
+        if not code:
+            print("[Login] log in with your Claude Pro/Max account here (opens browser):")
+            print(auth_url)
+            try:
+                webbrowser.open(auth_url)
+            except Exception:
+                pass
+            try:
+                code = input("[Login] paste the authorization code: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\n[Login] cancelled.")
+                return
+        if not code:
+            print("[Login] no code given.")
+            return
+        try:
+            msg = oauth_exchange_code(p, code, verifier, ANTHROPIC_OAUTH_REDIRECT_URI)
+        except Exception as e:
+            print(f"[Login] failed: {e}")
+            return
+        print("[Login] " + msg)
+        print("[Login] models available under this login:")
+        cmd_api_models()
+        print("[Login] pick one with /api-use <model-id> (switches answering to it).")
+        return
+    client_id = (settings.get("oauth_client_id") or "") if p == "google" else ""
+    if p == "google" and not client_id.strip():
+        print("[Login] Google needs your own OAuth client ID (free 'Desktop app' client from Google Cloud Console).")
+        print("        Set it with: /settings-set oauth_client_id=<id>  (plus oauth_client_secret=<secret> if yours has one),")
+        print("        then run /login google again.")
+        return
+    srv, got, redirect_uri = _start_oauth_callback()
+    try:
+        auth_url, verifier, state = oauth_build_auth_url(p, redirect_uri, client_id)
+    except Exception as e:
+        try:
+            srv.server_close()
+        except Exception:
+            pass
+        print(f"[Login] {e}")
+        return
+    print(f"[Login] opening browser for {p} login ...")
+    print(f"[Login] if nothing opens, visit:\n{auth_url}")
+    try:
+        webbrowser.open(auth_url)
+    except Exception:
+        pass
+    deadline = time.time() + 180
+    while time.time() < deadline and "code" not in got:
+        time.sleep(0.5)
+    try:
+        srv.server_close()
+    except Exception:
+        pass
+    if not got.get("code"):
+        print("[Login] timed out waiting for the provider callback.")
+        return
+    if got.get("state") and got["state"] != state:
+        print("[Login] state mismatch — aborted.")
+        return
+    try:
+        msg = oauth_exchange_code(p, got["code"], verifier, redirect_uri,
+                                  client_id, settings.get("oauth_client_secret") or "")
+    except Exception as e:
+        print(f"[Login] failed: {e}")
+        return
+    print("[Login] " + msg)
+    print("[Login] models available under this login:")
+    cmd_api_models()
+    print("[Login] pick one with /api-use <model-id> (switches answering to it).")
+
+
+def cmd_logout(arg):
+    p = arg.strip().lower()
+    targets = [p] if p else list(OAUTH_PROVIDERS)
+    for t in targets:
+        if t not in OAUTH_PROVIDERS:
+            print(f"[Login] unknown provider '{t}'.")
+            continue
+        clear_oauth_token(t)
+        if t == "openrouter" and settings.get("api_provider") == "openrouter":
+            settings["api_key"] = ""
+            save_settings_to_json({"api_key": ""})
+        print(f"[Login] logged out of {t}.")
+    if (settings.get("active_backend") or "local").lower() == "api" \
+            and build_api_adapter_from_settings(settings) is None:
+        use_local_backend()
+        print("[Login] API backend no longer has credentials; switched back to local.")
+
+
+def cmd_account(arg):
+    for line in oauth_status_lines():
+        print("[Account] " + line)
+    print(f"[Account] provider={settings.get('api_provider') or '(none)'} "
+          f"model={settings.get('api_model') or '(none)'} "
+          f"backend={settings.get('active_backend', 'local')}")
+
+
 def cmd_settings_show():
-    print(json.dumps(settings, indent=2))
+    masked = dict(settings)
+    if masked.get('api_key'):
+        masked['api_key'] = _mask_api_key(masked['api_key'])
+    if masked.get('oauth_client_secret'):
+        masked['oauth_client_secret'] = '****'
+    print(json.dumps(masked, indent=2))
 
 
 def cmd_settings_set(arg):
@@ -1906,8 +3113,10 @@ def cmd_settings_set(arg):
         return
     settings.update(updates)
     save_settings_to_json(updates)
+    apply_backend_settings(settings)
     _apply_settings_to_engine()
-    print(f"[Settings] saved: {updates}")
+    _shown = {k: (_mask_api_key(v) if k == 'api_key' else ('****' if k == 'oauth_client_secret' and v else v)) for k, v in updates.items()}
+    print(f"[Settings] saved: {_shown}")
 
 
 def cmd_persona(arg):
@@ -2156,7 +3365,7 @@ def run_streaming(prompt):
     thought/response/source content is guaranteed the same as the web UI.
     """
     show_cot = settings.get('show_chain_of_thought', True)
-    model_label = os.path.basename(current_model_filename)
+    model_label = active_model_label()
     _think_start = time.time()
     _tok = 0
     resp_buf = []
@@ -2297,8 +3506,8 @@ if __name__ == "__main__":
 
     print()
     print(THEME['hdr'] + cyber_box("ASHEN GPT // AGENTIC CORE", [
-        f"{THEME['ai']}model ›{RESET} {os.path.basename(current_model_filename)} "
-        f"({('Qwen' if getattr(model, 'is_qwen', False) else 'custom .pk1')})",
+        f"{THEME['ai']}model ›{RESET} {active_model_label()} "
+        f"({('API' if getattr(model, 'is_api', False) else 'Qwen' if getattr(model, 'is_qwen', False) else 'custom .pk1')})",
         f"{THEME['ai']}core  ›{RESET} chain-of-thought · intent-classify · agentic tools",
         f"{THEME['ai']}mesh  ›{RESET} Swarm+Council · deep-web research · self-improvement",
     ]) + RESET)
@@ -2435,6 +3644,30 @@ if __name__ == "__main__":
             if cmd.startswith('/model '):
                 cmd_model(cmd[7:])
                 continue
+            if cmd == '/api-models':
+                cmd_api_models()
+                continue
+            if cmd.startswith('/api-use '):
+                cmd_api_use(cmd[9:])
+                continue
+            if cmd.startswith('/api-key'):
+                cmd_api_key(cmd[8:])
+                continue
+            if cmd.startswith('/api-provider'):
+                cmd_api_provider(cmd[14:])
+                continue
+            if cmd == '/backend' or cmd.startswith('/backend '):
+                cmd_backend(cmd[8:])
+                continue
+            if cmd == '/login' or cmd.startswith('/login '):
+                cmd_login(cmd[6:])
+                continue
+            if cmd == '/logout' or cmd.startswith('/logout '):
+                cmd_logout(cmd[7:])
+                continue
+            if cmd == '/account':
+                cmd_account('')
+                continue
             if cmd == '/settings':
                 cmd_settings_show()
                 continue
@@ -2496,6 +3729,14 @@ if __name__ == "__main__":
   /exit /quit       Exit
   /models           List discovered checkpoints + HF model dirs
   /model <path>     Hot-swap the active model (pk1 file or Qwen HF dir)
+  /backend [local|api]  Show or switch answering backend (local weights vs API key)
+  /api-provider <name|url>  Set API provider preset or custom OpenAI-compatible base URL
+  /api-key <key|clear>      Save/clear API key (masked; ASHEN_API_KEY env preferred)
+  /api-models       List all models available under the provider API key
+  /api-use <model-id>       Answer through an API model (keeps local install intact)
+  /login [openrouter|google|anthropic]  Log in on the provider site; models load through that login
+  /logout [provider]          Drop a provider login (tokens are gitignored)
+  /account            Show provider logins + active backend
   /settings [k=v]   Show settings, or set e.g. /settings temperature=0.6 max_new_tokens=300
   /persona <name>   Set persona
   /swarm [--agents N --mode M] <task>   Multi-agent swarm
