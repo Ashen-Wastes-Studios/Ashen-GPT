@@ -555,4 +555,15 @@ run_*.bat              # Windows launch scripts
 
 ## License
 
-Distributed under the MIT License. See `LICENSE` for details.
+This repo is dual-licensed. **Code is Apache-2.0; model weights are OpenRAIL-M.**
+
+| Files | License |
+|---|---|
+| `chatbot.py`, `web_chatbot.py` (CLI + web UI) | Apache-2.0 (`LICENSE-CODE`) |
+| Training / fine-tuning: `ashen_gpt_trainer.py`, `qwen_finetune.py` | Apache-2.0 (`LICENSE-CODE`) |
+| Tooling, scripts, notebooks, launchers, docs, configs (`scrape_*`, `scripts/`, `web_chatbot/`, `*.bat`, `*.ipynb`, `settings.json`) | Apache-2.0 (`LICENSE-CODE`) |
+| Model weights: `ashen_gpt_model/`, `*.pk1`, `*.gguf` exports | OpenRAIL-M (`LICENSE-MODEL`) |
+| Model data: `train_split.txt`, `val_split.txt`, `code_train_split.txt`, `vocab.txt` | OpenRAIL-M (`LICENSE-MODEL`) |
+
+Model derivatives inherit the OpenRAIL-M use restrictions (Attachment A).
+Third-party dirs (`Qwen_Qwen3.5-0.8B/`, `tools/llama.cpp/`) keep their upstream licenses.

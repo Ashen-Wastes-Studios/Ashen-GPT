@@ -1,21 +1,29 @@
-MIT License
-
+Ashen AI Base — Dual License Notice
 Copyright (c) 2026 Ashen Wastes Studios
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+This repository is covered by TWO licenses, depending on the file:
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+1. Apache License 2.0 (see LICENSE-CODE) covers all SOURCE CODE, including:
+   - chatbot.py (terminal CLI) and web_chatbot.py (browser UI + server)
+   - Training and fine-tuning code: ashen_gpt_trainer.py, qwen_finetune.py
+   - Data tooling: scrape_*.py, create_validation_split.py, search_helpers.py,
+     fix_search_fn.py, time-testing.py, scripts/, web_chatbot/
+   - Notebooks, launcher scripts (*.bat, *.ipynb), documentation, and configs.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+2. BigScience Open RAIL-M License, dated August 18, 2022 (see LICENSE-MODEL)
+   covers all MODEL ARTIFACTS, including:
+   - Model weights and checkpoints: ashen_gpt_model/ (merged weights,
+     config, tokenizer, chat template, class_head.pt),
+     ashen_gpt_model.pk1, ashen_gpt_model_dpo.pk1, and any *.gguf exports.
+   - Model training/evaluation data: train_split.txt, val_split.txt,
+     code_train_split.txt, vocab.txt.
+   - Any fine-tunes, distillations, or other Derivatives of the Model (as
+     defined in LICENSE-MODEL). Note the Open RAIL-M use-based restrictions
+     (Attachment A) travel with derivatives — see LICENSE-MODEL §4(a).
+
+Third-party components keep their own licenses (e.g. Qwen_Qwen3.5-0.8B/
+and tools/llama.cpp/ are upstream distributions, not covered by either
+file above).
+
+If a file is not clearly a model artifact listed above, assume Apache-2.0.
+See README.md ("License" section) for the per-file summary.
