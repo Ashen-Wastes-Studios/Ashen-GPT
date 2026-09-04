@@ -12,9 +12,18 @@ Behavioral guidance (no-deflection, web-research + citation) is baked into the S
 data via the Qwen chat template — NOT injected at inference — per the project rule
 that ALL "how to respond" behavior lives in training data, never in the prompt.
 
+GGUF output: every run also exports the merged checkpoint as a quantized GGUF
+file (default `ashen_gpt_model-Q4_K_M.gguf`) via the llama.cpp converter +
+llama-quantize (auto-downloaded into `tools/llama.cpp/`). Disable with
+QWEN_GGUF=0; change type with QWEN_GGUF_QUANT=Q8_0; export an existing
+checkpoint without training via `--export-gguf-only [hf_dir] [out.gguf]`.
+
 Run:  cuda\\Scripts\\python.exe qwen_finetune.py
 """
 import sys, os, json, math, time, random, gc, copy, shutil, re, atexit
+import subprocess
+import urllib.request
+import zipfile
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -35,6 +44,174 @@ def _is_hf_model_dir(path):
         return False
     return any(f.endswith(".safetensors") or f == "pytorch_model.bin"
                for f in os.listdir(path))
+
+
+# --- GGUF export (Q4_K_M) ----------------------------------------------------
+# Finetuning outputs a quantized GGUF alongside the merged HF dir, ready for
+# LMStudio / Ollama / llama.cpp (the model hub already lists *.gguf files).
+# Pipeline: HF dir -> F16 GGUF (convert_hf_to_gguf.py) -> quantized GGUF
+# (llama-quantize; K-quants need the C++ quantizer, hence the binary). The
+# converter script and the Windows llama-quantize.exe are auto-downloaded into
+# GGUF_TOOLS on first use; only the pip packages `gguf` (+ `sentencepiece` if
+# missing) are installed. Env knobs: QWEN_GGUF=0 disables; QWEN_GGUF_QUANT picks
+# the llama-quantize type; QWEN_GGUF_OUT picks the output path;
+# QWEN_GGUF_KEEP_F16=1 keeps the intermediate F16 file; QWEN_GGUF_EVERY=N also
+# exports on periodic checkpoints every N iters (default 0 = final only). The
+# intent-routing head stays as class_head.pt next to the HF dir — the GGUF
+# carries the LM weights only.
+# Standalone, no training: python qwen_finetune.py --export-gguf-only [hf_dir] [out.gguf]
+GGUF_ENABLED = os.environ.get("QWEN_GGUF", "1") == "1"
+GGUF_QUANT = os.environ.get("QWEN_GGUF_QUANT", "Q4_K_M")
+_GGUF_OUT_ENV = os.environ.get("QWEN_GGUF_OUT")
+GGUF_OUT = _GGUF_OUT_ENV or os.path.join(HERE, "ashen_gpt_model-%s.gguf" % GGUF_QUANT)
+GGUF_KEEP_F16 = os.environ.get("QWEN_GGUF_KEEP_F16", "0") == "1"
+GGUF_EVERY = int(os.environ.get("QWEN_GGUF_EVERY", "0") or 0)
+GGUF_TOOLS = os.environ.get("QWEN_GGUF_TOOLS", os.path.join(HERE, "tools", "llama.cpp"))
+_GGUF_CONVERTER_URL = ("https://raw.githubusercontent.com/ggml-org/llama.cpp/"
+                       "master/convert_hf_to_gguf.py")
+_GGUF_RELEASE_API = "https://api.github.com/repos/ggml-org/llama.cpp/releases/latest"
+
+
+def _gguf_run(cmd):
+    print("[gguf] $ " + " ".join(cmd), flush=True)
+    subprocess.run(cmd, check=True)
+
+
+def _gguf_pip_install(pkg):
+    print("[gguf] installing missing dep: %s" % pkg, flush=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", pkg], check=True)
+
+
+def _gguf_ensure_deps():
+    try:
+        import gguf  # noqa: F401
+    except Exception:
+        _gguf_pip_install("gguf")
+    try:
+        import sentencepiece  # noqa: F401
+    except Exception:
+        try:
+            _gguf_pip_install("sentencepiece")
+        except Exception as e:
+            print("[gguf] WARNING: sentencepiece install failed (%s); "
+                  "BPE conversion may still work." % e, flush=True)
+
+
+def _gguf_ensure_converter():
+    dst = os.path.join(GGUF_TOOLS, "convert_hf_to_gguf.py")
+    if os.path.isfile(dst):
+        return dst
+    os.makedirs(GGUF_TOOLS, exist_ok=True)
+    print("[gguf] downloading converter -> %s" % dst, flush=True)
+    urllib.request.urlretrieve(_GGUF_CONVERTER_URL, dst)
+    return dst
+
+
+def _gguf_ensure_quantize_bin():
+    for cand in (os.path.join(GGUF_TOOLS, "llama-quantize.exe"),
+                 os.path.join(GGUF_TOOLS, "build", "bin", "llama-quantize.exe")):
+        if os.path.isfile(cand):
+            return cand
+    print("[gguf] llama-quantize.exe not found; fetching latest llama.cpp "
+          "windows release ...", flush=True)
+    with urllib.request.urlopen(_GGUF_RELEASE_API) as r:
+        rel = json.load(r)
+    assets = rel.get("assets", []) if isinstance(rel, dict) else []
+    scored = []
+    for a in assets:
+        n = str(a.get("name", ""))
+        nl = n.lower()
+        if not nl.endswith(".zip") or "win" not in nl or "android" in nl:
+            continue
+        score = 0
+        if "cuda" in nl or "cublas" in nl:
+            score += 3
+        if "x64" in nl:
+            score += 1
+        scored.append((score, a))
+    if not scored:
+        raise RuntimeError(
+            "no windows llama.cpp release asset found; download one manually "
+            "(see https://github.com/ggml-org/llama.cpp/releases) and place "
+            "llama-quantize.exe in %s" % GGUF_TOOLS)
+    scored.sort(key=lambda t: t[0], reverse=True)
+    asset = scored[0][1]
+    zpath = os.path.join(GGUF_TOOLS, asset["name"])
+    if not os.path.isfile(zpath):
+        print("[gguf] downloading %s ..." % asset["name"], flush=True)
+        urllib.request.urlretrieve(asset["browser_download_url"], zpath)
+    with zipfile.ZipFile(zpath) as zf:
+        names = zf.namelist()
+        q = [n for n in names if os.path.basename(n).lower() == "llama-quantize.exe"]
+        if not q:
+            raise RuntimeError("llama-quantize.exe not inside %s" % asset["name"])
+        zf.extract(q[0], GGUF_TOOLS)
+        binpath = os.path.join(GGUF_TOOLS, q[0])
+        # some zips nest the exe under build/bin/ — flatten to GGUF_TOOLS
+        flat = os.path.join(GGUF_TOOLS, "llama-quantize.exe")
+        if os.path.abspath(binpath) != os.path.abspath(flat):
+            try:
+                if os.path.isfile(flat):
+                    os.remove(flat)
+                os.rename(binpath, flat)
+            except OSError:
+                flat = binpath
+        else:
+            flat = binpath
+        for n in names:
+            if n.lower().endswith(".dll"):
+                try:
+                    zf.extract(n, GGUF_TOOLS)
+                except Exception:
+                    pass
+        return flat
+
+
+def _gguf_f16_path(out_path, quant):
+    d = os.path.dirname(out_path)
+    b = os.path.basename(out_path)
+    if b.endswith(".gguf"):
+        b = b[:-len(".gguf")]
+    suffix = "-" + quant
+    if b.endswith(suffix):
+        b = b[:-len(suffix)]
+    return os.path.join(d, b + "-f16.gguf") if d else b + "-f16.gguf"
+
+
+def export_gguf(hf_dir=None, out_path=None, quant=None):
+    """Convert a merged HF dir -> F16 GGUF -> quantized GGUF. Returns out path."""
+    hf_dir = hf_dir or OUT_DIR
+    quant = quant or GGUF_QUANT
+    out_path = out_path or GGUF_OUT
+    if not _is_hf_model_dir(hf_dir):
+        raise RuntimeError("not a HuggingFace model dir: %s" % hf_dir)
+    _gguf_ensure_deps()
+    converter = _gguf_ensure_converter()
+    quantize = _gguf_ensure_quantize_bin()
+    f16_path = _gguf_f16_path(out_path, quant)
+    _gguf_run([sys.executable, converter, hf_dir,
+               "--outfile", f16_path, "--outtype", "f16"])
+    threads = str(os.cpu_count() or 8)
+    _gguf_run([quantize, f16_path, out_path, quant, threads])
+    for p in (f16_path, out_path):
+        if os.path.isfile(p):
+            print("[gguf] %s: %.2f GB" % (os.path.basename(p), os.path.getsize(p) / 1e9),
+                  flush=True)
+    if not GGUF_KEEP_F16 and os.path.isfile(f16_path):
+        os.remove(f16_path)
+        print("[gguf] removed intermediate %s" % f16_path, flush=True)
+    print("[gguf] DONE -> %s (%s); intent head stays in %s" % (out_path, quant, CLASS_HEAD_PT),
+          flush=True)
+    return out_path
+
+
+if "--export-gguf-only" in sys.argv:
+    _idx = sys.argv.index("--export-gguf-only")
+    _rest = [a for a in sys.argv[_idx + 1:] if not a.startswith("--")]
+    _hf_only = _rest[0] if len(_rest) > 0 else OUT_DIR
+    _out_only = _rest[1] if len(_rest) > 1 else GGUF_OUT
+    export_gguf(_hf_only, _out_only, GGUF_QUANT)
+    sys.exit(0)
 
 
 def qwen_upscale_2x(model, dtype=torch.bfloat16):
@@ -675,6 +852,11 @@ def save_checkpoint(model, it):
     shutil.copytree(OUT_DIR, hist)
     print(f"[qwen_finetune] checkpoint@{it} -> {OUT_DIR} (history: {hist})", flush=True)
     _log(f"[qwen_finetune] checkpoint@{it} -> {OUT_DIR} (history: {hist})")
+    if GGUF_ENABLED and GGUF_EVERY and it % GGUF_EVERY == 0 and it != MAX_ITERS:
+        try:
+            export_gguf(OUT_DIR, GGUF_OUT, GGUF_QUANT)
+        except Exception as e:
+            print(f"[qwen_finetune] GGUF export skipped @{it}: {e}", flush=True)
     return merged
 for it in range(1, MAX_ITERS + 1):
     model.train(); class_head.train()
@@ -784,6 +966,14 @@ for it in range(1, MAX_ITERS + 1):
 # --- save: merged HF model + class head ------------------------------------
 _log(f"[qwen_finetune] training complete ({MAX_ITERS} iters) — writing final checkpoint")
 model = save_checkpoint(model, MAX_ITERS)
+if GGUF_ENABLED:
+    try:
+        export_gguf(OUT_DIR, GGUF_OUT, GGUF_QUANT)
+        _log(f"[qwen_finetune] DONE -> GGUF ({GGUF_QUANT}): {GGUF_OUT}")
+    except Exception as e:
+        _log(f"[qwen_finetune] GGUF export FAILED: {e} "
+             f"(HF dir {OUT_DIR} is still usable; retry later with "
+             f"python qwen_finetune.py --export-gguf-only)")
 _log(f"[qwen_finetune] DONE -> merged model: {OUT_DIR}")
 _log(f"[qwen_finetune] class_head: {CLASS_HEAD_PT}")
 _log("[qwen_finetune] Point settings.json 'current_model' at this dir to use it.")

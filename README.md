@@ -26,6 +26,153 @@ CoT display — is consistent across CLI and web.
 
 ---
 
+## Prerequisites & Requirements
+
+### System Requirements
+
+| Component | Minimum | Recommended | Notes |
+|---|---|---|---|
+| **OS** | Windows 10/11, Linux | Windows 11, Ubuntu 22.04+ | Windows is primary dev target |
+| **Python** | 3.10 | 3.11 or 3.12 | Bundled `cuda/` venv uses 3.11 |
+| **GPU** | CUDA-capable, 4 GB VRAM | RTX 3060 Ti / 4070 / 4080 (8–16 GB) | 4-bit inference works on 4 GB; fine-tune needs 8 GB+ |
+| **CUDA Toolkit** | 11.8 or 12.x | 12.1–12.6 | Must match PyTorch CUDA build |
+| **cuDNN** | 8.x | 8.9+ | Included with CUDA toolkit |
+| **RAM** | 16 GB | 32 GB+ | Dataset mmap + training buffers |
+| **Disk** | 20 GB free | 50 GB+ | Models, checkpoints, datasets |
+
+### Python Dependencies
+
+| Package | Version | Purpose | Required For |
+|---|---|---|---|
+| `torch` | ≥2.3, CUDA 118/121/124 | Core tensor ops, autograd, CUDA kernels | All training & inference |
+| `torchvision` | Matching torch | Vision utilities (unused but bundled) | Bundled with torch |
+| `transformers` | ≥4.42 | Qwen3.5 HF loading, chat templates, tokenizers | `qwen_finetune.py`, `QwenModelAdapter` |
+| `peft` | ≥0.11 | LoRA adapters, `merge_and_unload()` | `qwen_finetune.py` |
+| `bitsandbytes` | ≥0.43 | 4-bit/8-bit quantization (NF4, FP4) | Optional 4-bit inference |
+| `tiktoken` | ≥0.7 | GPT-2 BPE (legacy model) | `ashen_gpt_trainer.py` |
+| `requests` | ≥2.31 | HTTP for web search, HF downloads | Web tools, model downloads |
+| `huggingface-hub` | ≥0.23 | `snapshot_download`, repo APIs | HF model download endpoint |
+| `safetensors` | ≥0.4 | Fast weight loading | HF checkpoint I/O |
+| `accelerate` | ≥0.31 | Device map, mixed precision | Large model loading |
+| `gguf` | ≥0.10 | GGUF file read/write (quantization) | `qwen_finetune.py` GGUF export |
+| `llama-cpp-python` | ≥0.2.70 | GGUF inference (optional) | GGUF model serving |
+| `numpy` | ≥1.26 | Array ops, data pipeline | All |
+| `pyyaml` | ≥6.0 | Config parsing | Settings, HF config |
+
+### Optional / Advanced
+
+| Package | Version | Purpose |
+|---|---|---|
+| `llama.cpp` (built) | Master branch | `convert_hf_to_gguf.py` + `llama-quantize` for Q4_K_M export |
+| `flash-attn` | ≥2.5 | Faster attention (requires build) |
+| `xformers` | ≥0.0.27 | Memory-efficient attention |
+| `wandb` | ≥0.17 | Experiment tracking (if enabled) |
+
+### One-Line Install (Bundled CUDA Venv)
+
+The repo includes a pre-built CUDA virtualenv at `cuda/` with torch + transformers + peft + bitsandbytes. This is the **recommended** path on Windows:
+
+```cmd
+cd C:\dev\Ashen AI Base
+call cuda\Scripts\activate.bat
+python -m pip install --upgrade pip
+python -m pip install huggingface-hub safetensors accelerate gguf llama-cpp-python numpy pyyaml
+```
+
+### Manual Install (Clean Venv)
+
+If you prefer a fresh environment:
+
+```cmd
+python -m venv venv --system-site-packages
+call venv\Scripts\activate.bat
+python -m pip install --upgrade pip
+
+# PyTorch with CUDA (pick ONE matching your CUDA toolkit)
+# CUDA 12.1 (recommended for RTX 30/40 series)
+python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+# CUDA 11.8
+# python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118
+
+# Core ML stack
+python -m pip install transformers peft bitsandbytes tiktoken requests huggingface-hub safetensors accelerate
+
+# GGUF / quantization
+python -m pip install gguf llama-cpp-python
+
+# Utilities
+python -m pip install numpy pyyaml
+```
+
+### Building `llama.cpp` Tools (for GGUF Quantization)
+
+The `qwen_finetune.py` GGUF export (`QWEN_GGUF=1`) auto-downloads `convert_hf_to_gguf.py` and `llama-quantize.exe` into `tools/llama.cpp/` on first run. To build manually:
+
+```cmd
+# Prereqs: Visual Studio 2022 (Desktop C++), CMake 3.20+, CUDA Toolkit
+git clone https://github.com/ggml-org/llama.cpp tools/llama.cpp
+cd tools/llama.cpp
+mkdir build && cd build
+cmake -DGGML_CUDA=ON -DCMAKE_BUILD_TYPE=Release ..
+cmake --build . --config Release -j
+# Produces: llama-quantize.exe, convert_hf_to_gguf.py (in parent convert dir)
+```
+
+> **Windows note:** Pre-built `llama-quantize.exe` is committed at repo root for convenience. The auto-downloader fetches release binaries if the build step is skipped.
+
+### Verification Checklist
+
+After install, confirm each component loads:
+
+```cmd
+cuda\Scripts\python.exe -c "
+import torch; print(f'torch {torch.__version__} CUDA={torch.version.cuda} GPU={torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"CPU\"}')
+import transformers; print(f'transformers {transformers.__version__}')
+import peft; print(f'peft {peft.__version__}')
+import bitsandbytes; print(f'bitsandbytes {bitsandbytes.__version__}')
+import tiktoken; print(f'tiktoken {tiktoken.__version__}')
+import requests; print(f'requests {requests.__version__}')
+import huggingface_hub; print(f'huggingface-hub {huggingface_hub.__version__}')
+import safetensors; print(f'safetensors {safetensors.__version__}')
+import accelerate; print(f'accelerate {accelerate.__version__}')
+import gguf; print(f'gguf {gguf.__version__}')
+import llama_cpp; print(f'llama-cpp-python {llama_cpp.__version__}')
+print('All imports OK')
+"
+```
+
+Expected output (versions may vary):
+```
+torch 2.4.0 CUDA=12.1 GPU=NVIDIA GeForce RTX 3060 Ti
+transformers 4.43.0
+peft 0.12.0
+bitsandbytes 0.43.3
+tiktoken 0.7.0
+requests 2.32.3
+huggingface-hub 0.24.0
+safetensors 0.4.5
+accelerate 0.33.0
+gguf 0.19.0
+llama-cpp-python 0.2.90
+All imports OK
+```
+
+---
+
+## Quick Start Commands
+
+| Task | Command |
+|---|---|
+| **Activate bundled venv** | `call cuda\Scripts\activate.bat` |
+| **Run web chatbot** | `python web_chatbot.py` → http://localhost:5000 |
+| **Run CLI chatbot** | `python chatbot.py` |
+| **Fine-tune Qwen (LoRA bf16)** | `python qwen_finetune.py` |
+| **Fine-tune + GGUF Q4_K_M export** | `set QWEN_GGUF=1 && set QWEN_GGUF_QUANT=Q4_K_M && python qwen_finetune.py` |
+| **Legacy pre-training** | `python ashen_gpt_trainer.py` |
+| **Run benchmark** | `[TOOL: run_benchmark()]` in chat or web UI button |
+
+---
+
 ## Key Architectural Features
 
 | Component | Qwen fine-tune (`ashen_gpt_model/`) | Legacy custom (`ashen_gpt_model.pk1`) |
