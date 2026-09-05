@@ -1135,6 +1135,27 @@ SFT_DATASET = [
     {
         "instruction": "Can you keep track of my project tasks?",
         "response": "<think>\nThe user wants ongoing task tracking. I should confirm I'll maintain the list as they add items.\n</think>\nYes — share your tasks and I'll keep a running list, flag due dates, and surface what's next. What's the first task?"
+    },
+    # --- Local file/shell tools: emit [TOOL: ...], consume [OBSERVATION] ---
+    {
+        "instruction": "What files are in the current directory?",
+        "response": "<think>\nThe user wants a directory listing. I should use the list_dir tool rather than guessing.\n</think>\n[TOOL: list_dir(dir_path='.')]"
+    },
+    {
+        "instruction": "What files are in the current directory?\n\n[OBSERVATION from list_dir]:\n/tmp/work (3 entries):\n[FILE] app.py\n[FILE] notes.txt\n[DIR]  tests\nContinue toward the user's request using the observation above.",
+        "response": "<think>\nThe observation lists the directory contents. I should report them directly.\n</think>\nThe current directory holds 2 files and 1 folder:\n- app.py\n- notes.txt\n- tests/ (directory)"
+    },
+    {
+        "instruction": "Read notes.txt and tell me what it says.",
+        "response": "<think>\nThe user wants a file's contents. I should read it with the read_file tool.\n</think>\n[TOOL: read_file(file_path='notes.txt')]"
+    },
+    {
+        "instruction": "Run the test suite with pytest.",
+        "response": "<think>\nThe user wants a terminal command run. I should use run_shell_command.\n</think>\n[TOOL: run_shell_command(command='python -m pytest -q')]"
+    },
+    {
+        "instruction": "Make a folder called drafts.",
+        "response": "<think>\nThe user wants a directory created. I should use the make_dir tool.\n</think>\n[TOOL: make_dir(dir_path='drafts')]"
     }
 ]
 

@@ -148,6 +148,8 @@ DEFAULT_SETTINGS = {
     "show_chain_of_thought": True,
     "auto_swarm_council": False,
     "auto_web_research": False,
+    "allow_file_tools": True,
+    "allow_shell_tools": True,
     "current_model": "ashen_gpt_model.pk1",
     "active_backend": "local",
     "api_provider": "",
@@ -478,6 +480,40 @@ class AshenGPTLanguageModel(nn.Module):
             yield index, tok_id
 
 
+# --- Local file/shell tools callable by the loaded model -------------------
+# Defined BEFORE QwenModelAdapter: the adapter appends LOCAL_TOOLS_SPEC to its
+# system prompt at construction, and construction happens at import time (the
+# startup model load), so the spec must already exist at this point in the file.
+# The model invokes exactly one tool per turn as:
+#   [TOOL: name(arg='value', ...)]
+# then waits for the [OBSERVATION] before continuing. Keep the spec short —
+# it is appended verbatim to the Qwen/API system prompts (direct user order),
+# and the same syntax is taught via SFT examples in qwen_finetune.py.
+LOCAL_TOOLS_SPEC = (
+    "Available local tools — emit exactly one per turn as "
+    "[TOOL: name(arg='value', ...)] on its own line, then wait for the "
+    "[OBSERVATION] before continuing:\n"
+    "- read_file(file_path='...') — read a text file (first ~8KB)\n"
+    "- write_file(file_path='...', content='...') — create/overwrite a file "
+    "(parent dirs auto-created)\n"
+    "- list_dir(dir_path='...') — list a directory (default: working dir)\n"
+    "- make_dir(dir_path='...') — create a directory incl. parents\n"
+    "- remove_path(path='...') — delete a file or directory tree\n"
+    "- run_shell_command(command='...') — run a terminal command in the "
+    "working dir (60s timeout), e.g. python, pip, git, pytest\n"
+    "- glob(pattern='...'), grep_search(pattern='...'), "
+    "web_search(query='...'), browse_url(url='...'), "
+    "deep_research(topic='...')\n"
+    "After the [OBSERVATION] arrives, continue reasoning and answer. "
+    "Never invent tool output."
+)
+
+# Commands refused even when shell tools are enabled (destructive/system).
+SHELL_BLOCKLIST = (
+    "rm -rf /", "rm -rf c:", "rm -rf c:/", "mkfs", ":(){:|:&};:",
+    "format c:", "format d:", "dd if=", "shutdown /s", "shutdown -h now",
+)
+
 # =====================================================================
 #  Qwen3.5 HF model adapter
 # =====================================================================
@@ -555,6 +591,9 @@ class QwenModelAdapter:
             "4. End with the final answer clearly separated from the reasoning. For "
             "graded/math tasks, give the result last."
         )
+        # Local file/shell tools the model may invoke (direct user order — the
+        # model needs the tool syntax to call execute_tool at all).
+        self.system_prompt = self.system_prompt + "\n\n" + LOCAL_TOOLS_SPEC
 
     def _chat_ids(self, user_text, history=None, add_generation_prompt=True):
         msgs = [{"role": "system", "content": self.system_prompt}]
@@ -1491,6 +1530,70 @@ def _ddg_real_url(href):
 # =====================================================================
 #  Agentic reasoning engine
 # =====================================================================
+# --- Local tool parsing/safety helpers (LOCAL_TOOLS_SPEC + SHELL_BLOCKLIST live
+# near the top of the file, before QwenModelAdapter, which appends the spec to its
+# system prompt during the import-time model load) ---
+
+
+def _parse_tool_call(text):
+    """Parse the first [TOOL: name(args)] call. Returns (name, kwargs, args_str) or None.
+
+    Values may be 'single-quoted', \"double-quoted\", or bare (unquoted, up to
+    the next comma or closing paren) so numeric args like max_searches=5 work.
+    """
+    m = re.search(r'\[TOOL:\s*([a-zA-Z_][a-zA-Z0-9_]*)\((.*?)\)\]', text, re.DOTALL)
+    if not m:
+        return None
+    name, args_str = m.group(1), m.group(2)
+    kwargs = {}
+    for am in re.finditer(
+            r"([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*(?:'((?:[^'\\]|\\.)*)'|\"((?:[^\"\\]|\\.)*)\"|([^\s,\)]+))",
+            args_str, re.DOTALL):
+        key = am.group(1)
+        if am.group(2) is not None:
+            val = am.group(2).replace("\\'", "'").replace("\\\\", "\\")
+        elif am.group(3) is not None:
+            val = am.group(3).replace('\\"', '"').replace("\\\\", "\\")
+        else:
+            val = am.group(4)
+        kwargs[key] = val
+    return name, kwargs, args_str
+
+
+def _resolve_tool_path(p, base=None):
+    """Resolve a model-supplied path against base (default: WORKING_DIR/cwd)."""
+    p = (p or "").strip()
+    if not p:
+        return ""
+    if os.path.isabs(p):
+        return os.path.normpath(p)
+    if base is None:
+        base = globals().get("WORKING_DIR") or os.getcwd()
+    return os.path.normpath(os.path.join(base, p))
+
+
+def _tool_kind_blocked(kind):
+    """Kill-switch: settings allow_*_tools (default on) + ASHEN_ALLOW_* env (0 disables)."""
+    if kind == "shell":
+        if os.environ.get("ASHEN_ALLOW_SHELL", "1") == "0":
+            return True
+        try:
+            return not settings.get("allow_shell_tools", True)
+        except NameError:
+            return False
+    if os.environ.get("ASHEN_ALLOW_FILES", "1") == "0":
+        return True
+    try:
+        return not settings.get("allow_file_tools", True)
+    except NameError:
+        return False
+
+
+def _is_dangerous_shell(cmd):
+    low = (cmd or "").lower()
+    return any(b in low for b in SHELL_BLOCKLIST)
+
+
 class AshenAIAgenticEngine:
     def __init__(self, model, decode_fn, encode_fn, device, max_steps=5):
         self.model = model
@@ -1518,6 +1621,8 @@ class AshenAIAgenticEngine:
         self.cpu_offload_layers = 0
         self.auto_swarm_council = False
         self.auto_web_research = False
+        self.allow_file_tools = True  # Model may read/write/list/mkdir/remove files
+        self.allow_shell_tools = True  # Model may run terminal commands
         self._source_harvest = []
 
     def clear_history(self):
@@ -1545,6 +1650,10 @@ class AshenAIAgenticEngine:
             self.auto_swarm_council = bool(s['auto_swarm_council'])
         if 'auto_web_research' in s:
             self.auto_web_research = bool(s['auto_web_research'])
+        if 'allow_file_tools' in s:
+            self.allow_file_tools = bool(s['allow_file_tools'])
+        if 'allow_shell_tools' in s:
+            self.allow_shell_tools = bool(s['allow_shell_tools'])
 
     @torch.no_grad()
     def generate_with_speculative_decoding(self, input_ids, max_new_tokens):
@@ -1599,18 +1708,92 @@ class AshenAIAgenticEngine:
                 self._source_harvest = getattr(self, '_source_harvest', [])
 
             if tool_name == 'read_file':
-                path = kwargs.get('file_path', '')
-                if os.path.exists(path):
+                if _tool_kind_blocked("files"):
+                    return "Error: file tools are disabled (allow_file_tools=0 or ASHEN_ALLOW_FILES=0)."
+                raw = kwargs.get('file_path', '') or kwargs.get('path', '')
+                path = _resolve_tool_path(raw)
+                if not path or not os.path.exists(path):
+                    return f"Error: File not found: {raw}"
+                if os.path.isdir(path):
+                    return f"Error: {raw} is a directory — use list_dir(dir_path='...')."
+                try:
                     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                        return f.read()[:2000]
-                return f"Error: File not found: {path}"
+                        data = f.read(8192)
+                    note = "" if len(data) < 8192 else "\n[truncated to ~8KB]"
+                    return data if data else "(empty file)" + note
+                except Exception as e:
+                    return f"Error reading {raw}: {e}"
 
             elif tool_name == 'write_file':
-                path = kwargs.get('file_path', '')
+                if _tool_kind_blocked("files"):
+                    return "Error: file tools are disabled (allow_file_tools=0 or ASHEN_ALLOW_FILES=0)."
+                raw = kwargs.get('file_path', '') or kwargs.get('path', '')
                 content = kwargs.get('content', '')
-                with open(path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                return f"Successfully wrote to {path}"
+                path = _resolve_tool_path(raw)
+                if not path:
+                    return "Error: write_file needs file_path='...'."
+                try:
+                    parent = os.path.dirname(path)
+                    if parent:
+                        os.makedirs(parent, exist_ok=True)
+                    with open(path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    return f"Successfully wrote {len(content)} chars to {path}"
+                except Exception as e:
+                    return f"Error writing {raw}: {e}"
+
+            elif tool_name == 'list_dir':
+                if _tool_kind_blocked("files"):
+                    return "Error: file tools are disabled (allow_file_tools=0 or ASHEN_ALLOW_FILES=0)."
+                raw = kwargs.get('dir_path', '') or kwargs.get('path', '') or kwargs.get('dir', '')
+                target = _resolve_tool_path(raw) if raw else (globals().get("WORKING_DIR") or os.getcwd())
+                if not os.path.isdir(target):
+                    return f"Error: not a directory: {raw or target}"
+                try:
+                    entries = sorted(os.listdir(target))
+                    lines = [f"{target} ({len(entries)} entries):"]
+                    for name in entries[:100]:
+                        full = os.path.join(target, name)
+                        lines.append(("[DIR]  " if os.path.isdir(full) else "[FILE] ") + name)
+                    if len(entries) > 100:
+                        lines.append(f"... and {len(entries) - 100} more")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"Error listing {raw}: {e}"
+
+            elif tool_name == 'make_dir':
+                if _tool_kind_blocked("files"):
+                    return "Error: file tools are disabled (allow_file_tools=0 or ASHEN_ALLOW_FILES=0)."
+                raw = kwargs.get('dir_path', '') or kwargs.get('path', '')
+                path = _resolve_tool_path(raw)
+                if not path:
+                    return "Error: make_dir needs dir_path='...'."
+                try:
+                    os.makedirs(path, exist_ok=True)
+                    return f"Directory ready: {path}"
+                except Exception as e:
+                    return f"Error creating {raw}: {e}"
+
+            elif tool_name == 'remove_path':
+                if _tool_kind_blocked("files"):
+                    return "Error: file tools are disabled (allow_file_tools=0 or ASHEN_ALLOW_FILES=0)."
+                raw = kwargs.get('path', '') or kwargs.get('file_path', '') or kwargs.get('dir_path', '')
+                path = _resolve_tool_path(raw)
+                if not path:
+                    return "Error: remove_path needs path='...'."
+                root = os.path.abspath(os.sep)
+                if path == root or (len(path) <= 3 and path[1:2] == ':'):
+                    return "Error: refusing to delete a filesystem/drive root."
+                if not os.path.exists(path):
+                    return f"Error: not found: {raw}"
+                try:
+                    if os.path.isdir(path) and not os.path.islink(path):
+                        shutil.rmtree(path)
+                        return f"Removed directory tree: {path}"
+                    os.remove(path)
+                    return f"Removed file: {path}"
+                except Exception as e:
+                    return f"Error removing {raw}: {e}"
 
             elif tool_name == 'glob':
                 pattern = kwargs.get('pattern', '*')
@@ -1638,11 +1821,40 @@ class AshenAIAgenticEngine:
                 return "\n".join(results) if results else "No matches found."
 
             elif tool_name == 'run_shell_command':
+                if _tool_kind_blocked("shell"):
+                    return "Error: shell tools are disabled (allow_shell_tools=0 or ASHEN_ALLOW_SHELL=0)."
                 cmd = kwargs.get('command', '')
-                res = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                                      timeout=30, cwd=os.getcwd())
-                output = res.stdout if res.returncode == 0 else res.stderr
-                return output[:2000] if output else "Command executed with no output."
+                if not cmd.strip():
+                    return "Error: run_shell_command needs command='...'."
+                if _is_dangerous_shell(cmd):
+                    return "Error: refused — command matches the destructive-command blocklist."
+                try:
+                    res = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                                         timeout=60, cwd=globals().get("WORKING_DIR") or os.getcwd())
+                except subprocess.TimeoutExpired:
+                    return "Error: command timed out after 60s."
+                output = (res.stdout or "") + (("\n[stderr]\n" + res.stderr) if res.returncode != 0 and res.stderr else "")
+                output = output.strip()
+                if not output:
+                    return "Command executed with no output."
+                if len(output) > 4000:
+                    return output[:4000] + "\n[truncated to ~4KB]"
+                return output
+
+            elif tool_name in ('mkdir', 'make_directory'):
+                return self.execute_tool('make_dir', kwargs)
+            elif tool_name in ('rmdir', 'remove_dir', 'delete_file', 'delete_path', 'remove_directory'):
+                return self.execute_tool('remove_path', kwargs)
+            elif tool_name in ('list_files', 'ls', 'dir'):
+                _mapped = dict(kwargs)
+                if 'path' in _mapped and 'dir_path' not in _mapped:
+                    _mapped['dir_path'] = _mapped.pop('path')
+                return self.execute_tool('list_dir', _mapped)
+            elif tool_name in ('run_shell', 'shell', 'run_command', 'exec'):
+                _mapped = dict(kwargs)
+                if 'cmd' in _mapped and 'command' not in _mapped:
+                    _mapped['command'] = _mapped.pop('cmd')
+                return self.execute_tool('run_shell_command', _mapped)
 
             elif tool_name == 'web_search':
                 query = kwargs.get('query', '')
@@ -1795,96 +2007,148 @@ class AshenAIAgenticEngine:
 
     @torch.no_grad()
     def _solve_qwen(self, prompt):
+        """Chat-templated Qwen solve path with a multi-step tool loop: a step
+        ending in [TOOL: name(...)] executes the tool and its [OBSERVATION] is
+        appended to the next step's user text."""
         self.model.eval()
-        ids = self.model._chat_ids(prompt, history=self.history[-2:])
-        input_ids = ids.unsqueeze(0).to(device)
-        output_ids = self.model.generate(input_ids, max_new_tokens=self.max_new_tokens,
-                                          current_block_size=self.context_length,
-                                          temperature=self.temperature, top_k=self.top_k)
-        # Decode ONLY the generated suffix (tokens after the input prompt),
-        # never the whole re-decoded sequence. String-prefix stripping of the
-        # re-tokenized prompt is fragile (whitespace round-trip drift) and on
-        # multi-turn turns it fails, so the entire input context gets echoed
-        # back as the "answer" and poisons history.
-        generated = self.model.decode(output_ids[0][input_ids.shape[1]:].tolist())
-        mm = re.search(r'<think>([\s\S]*?)(?:</think>|$)', generated)
-        if mm:
-            thought = mm.group(1).strip()
-            resp = generated[mm.end():].strip()
-        else:
-            thought = ""
-            resp = generated.strip()
+        self._source_harvest = getattr(self, '_source_harvest', [])
+        tool_trace = ""
+        tool_observations = []
+        thought, resp = "", ""
+        for _step in range(max(1, self.max_steps)):
+            ids = self.model._chat_ids(prompt + tool_trace, history=self.history[-2:])
+            input_ids = ids.unsqueeze(0).to(device)
+            output_ids = self.model.generate(input_ids, max_new_tokens=self.max_new_tokens,
+                                              current_block_size=self.context_length,
+                                              temperature=self.temperature, top_k=self.top_k)
+            # Decode ONLY the generated suffix (tokens after the input prompt),
+            # never the whole re-decoded sequence. String-prefix stripping of the
+            # re-tokenized prompt is fragile (whitespace round-trip drift) and on
+            # multi-turn turns it fails, so the entire input context gets echoed
+            # back as the "answer" and poisons history.
+            generated = self.model.decode(output_ids[0][input_ids.shape[1]:].tolist())
+            mm = re.search(r'<think>([\s\S]*?)(?:</think>|$)', generated)
+            if mm:
+                thought = mm.group(1).strip()
+                resp = generated[mm.end():].strip()
+            else:
+                thought = ""
+                resp = generated.strip()
+            parsed = _parse_tool_call(resp if resp else generated)
+            if not parsed:
+                break
+            tool_name, kwargs, args_str = parsed
+            tool_obs = self.execute_tool(tool_name, kwargs)
+            tool_observations.append(f"Tool: {tool_name}({args_str})\nObservation:\n{tool_obs}")
+            tool_trace += (f"\n\n[OBSERVATION from {tool_name}]:\n{tool_obs[:2000]}\n"
+                           "Continue toward the user's request using the observation above.")
+        if _parse_tool_call(resp):
+            resp = re.sub(r'\[TOOL:\s*[a-zA-Z_][a-zA-Z0-9_]*\(.*?\)\]', '', resp,
+                          flags=re.DOTALL).strip()
+        if tool_observations:
+            thought = (thought + "\n\n--- Tool Telemetry ---\n"
+                       + "\n".join(tool_observations)).strip() if thought else \
+                "--- Tool Telemetry ---\n" + "\n".join(tool_observations)
         self.history.append((prompt, resp))
         return thought, resp
 
     @torch.no_grad()
     def _solve_qwen_stream(self, prompt):
+        """Streaming Qwen solve path with a multi-step tool loop (same event
+        schema as the custom-model path: thought_delta/thought_done/
+        response_delta/tool_start/tool_result/done)."""
         self.model.eval()
         self._source_harvest = []
-        ids = self.model._chat_ids(prompt, history=self.history[-2:])
-        input_ids = ids.unsqueeze(0).to(device)
-        prompt_text = self.model.tokenizer.apply_chat_template(
-            [{"role": "system", "content": self.model.system_prompt}]
-            + [{"role": "user", "content": u} for u, _ in self.history[-2:]]
-            + [{"role": "assistant", "content": a} for _, a in self.history[-2:]]
-            + [{"role": "user", "content": prompt}],
-            tokenize=False, add_generation_prompt=True)
-        full = ""
-        thought_sent = 0
-        resp_sent = 0
-        input_len = input_ids.shape[1]
-        saw_close = False
-        for full_index, tok_id in self.model.generate_stream(
-                input_ids, max_new_tokens=self.max_new_tokens,
-                current_block_size=self.context_length,
-                temperature=self.temperature, top_k=self.top_k):
-            # Decode ONLY the newly generated tokens (suffix after the input
-            # prompt), never the whole re-decoded sequence. String-prefix
-            # stripping of the re-tokenized prompt is fragile (whitespace
-            # round-trip drift) and on multi-turn turns it fails, so the entire
-            # input context gets echoed back as the "answer" and poisons history.
-            gen_ids = full_index[0][input_len:].tolist()
-            raw = self.model.decode(gen_ids)
-            if len(raw) <= len(full):
-                continue
-            full = raw
-            if not saw_close:
-                if "</think>" in full:
-                    saw_close = True
-                    before, after = full.split("</think>", 1)
-                    nt = before[thought_sent:]
-                    if nt:
-                        yield {"type": "thought_delta", "chunk": nt}
-                    thought_sent = len(before)
-                    yield {"type": "thought_done"}
-                    if after.strip():
-                        yield {"type": "response_delta", "chunk": after}
-                        resp_sent = len(after)
+        tool_trace = ""
+        tool_observations = []
+        all_thoughts = []
+        resp = ""
+        for _step in range(max(1, self.max_steps)):
+            ids = self.model._chat_ids(prompt + tool_trace, history=self.history[-2:])
+            input_ids = ids.unsqueeze(0).to(device)
+            full = ""
+            thought_sent = 0
+            resp_sent = 0
+            input_len = input_ids.shape[1]
+            saw_close = False
+            for full_index, tok_id in self.model.generate_stream(
+                    input_ids, max_new_tokens=self.max_new_tokens,
+                    current_block_size=self.context_length,
+                    temperature=self.temperature, top_k=self.top_k):
+                # Decode ONLY the newly generated tokens (suffix after the input
+                # prompt), never the whole re-decoded sequence. String-prefix
+                # stripping of the re-tokenized prompt is fragile (whitespace
+                # round-trip drift) and on multi-turn turns it fails, so the entire
+                # input context gets echoed back as the "answer" and poisons history.
+                gen_ids = full_index[0][input_len:].tolist()
+                raw = self.model.decode(gen_ids)
+                if len(raw) <= len(full):
+                    continue
+                full = raw
+                if not saw_close:
+                    if "</think>" in full:
+                        saw_close = True
+                        before, after = full.split("</think>", 1)
+                        nt = before[thought_sent:]
+                        if nt:
+                            yield {"type": "thought_delta", "chunk": nt}
+                        thought_sent = len(before)
+                        yield {"type": "thought_done"}
+                        if after.strip():
+                            yield {"type": "response_delta", "chunk": after}
+                            resp_sent = len(after)
+                    else:
+                        nt = full[thought_sent:]
+                        if nt:
+                            yield {"type": "thought_delta", "chunk": nt}
+                        thought_sent = len(full)
                 else:
-                    nt = full[thought_sent:]
-                    if nt:
-                        yield {"type": "thought_delta", "chunk": nt}
-                    thought_sent = len(full)
+                    nr = full[resp_sent:]
+                    if nr:
+                        yield {"type": "response_delta", "chunk": nr}
+                        resp_sent = len(full)
+            mm = re.search(r'<think>([\s\S]*?)(?:</think>|$)', full)
+            if mm:
+                thought = mm.group(1).strip()
+                resp = full[mm.end():].strip()
             else:
-                nr = full[resp_sent:]
-                if nr:
-                    yield {"type": "response_delta", "chunk": nr}
-                    resp_sent = len(full)
-        mm = re.search(r'<think>([\s\S]*?)(?:</think>|$)', full)
-        if mm:
-            thought = mm.group(1).strip()
-            resp = full[mm.end():].strip()
-        else:
-            thought = ""
-            resp = full.strip()
+                thought = ""
+                resp = full.strip()
+            if thought and thought not in all_thoughts:
+                all_thoughts.append(thought)
+            parsed = _parse_tool_call(resp if resp else full)
+            if not parsed:
+                break
+            tool_name, kwargs, args_str = parsed
+            yield {"type": "tool_start", "tool": tool_name, "args": args_str}
+            tool_obs = self.execute_tool(tool_name, kwargs)
+            tool_observations.append(f"Tool: {tool_name}({args_str})\nObservation:\n{tool_obs}")
+            yield {"type": "tool_result", "tool": tool_name, "observation": tool_obs[:800]}
+            tool_trace += (f"\n\n[OBSERVATION from {tool_name}]:\n{tool_obs[:2000]}\n"
+                           "Continue toward the user's request using the observation above.")
+            resp = ""
+        if _parse_tool_call(resp):
+            resp = re.sub(r'\[TOOL:\s*[a-zA-Z_][a-zA-Z0-9_]*\(.*?\)\]', '', resp,
+                          flags=re.DOTALL).strip()
+        combined_thought = "\n--- Ashen AI Reasoning Step ---\n".join(all_thoughts)
+        if tool_observations:
+            combined_thought += ("\n\n--- Tool Telemetry ---\n" if combined_thought else
+                                 "--- Tool Telemetry ---\n") + "\n".join(tool_observations)
+        _seen, _collected_sources = set(), []
+        for _s in getattr(self, '_source_harvest', []):
+            _u = _s.get('url')
+            if _u and _u not in _seen:
+                _seen.add(_u)
+                _collected_sources.append(_s)
+        self.last_sources = _collected_sources
         self.history.append((prompt, resp))
-        yield {"type": "done", "thought": thought, "response": resp,
+        yield {"type": "done", "thought": combined_thought, "response": resp,
                "model": os.path.basename(current_model_filename),
-               "model_path": current_model_filename, "sources": [],
+               "model_path": current_model_filename, "sources": _collected_sources,
                "intent": self.last_intent}
 
     def _api_messages(self, prompt):
-        msgs = [{"role": "system", "content": API_SYSTEM_PROMPT}]
+        msgs = [{"role": "system", "content": API_SYSTEM_PROMPT + "\n\n" + LOCAL_TOOLS_SPEC}]
         for u, a in self.history[-2:]:
             msgs.append({"role": "user", "content": u})
             msgs.append({"role": "assistant", "content": a})
@@ -1902,118 +2166,165 @@ class AshenAIAgenticEngine:
     def _solve_api(self, prompt):
         """Isolated solve path for API-key models (APIModelAdapter).
 
-        Mirrors _solve_qwen: single OpenAI-compatible chat call, no local
+        Mirrors _solve_qwen: OpenAI-compatible chat calls, no local
         ### Instruction:/### Response: framing, returns (thought, resp).
+        Multi-step tool loop: [TOOL: ...] output executes and its
+        [OBSERVATION] is appended as the next user message.
         """
         self.model.eval()
         messages = self._api_messages(prompt)
-        try:
-            full = self.model.chat(messages, temperature=self.temperature,
-                                   max_tokens=self.max_new_tokens, top_p=self.top_p)
-        except Exception as e:
-            return "", f"API request failed: {e}"
-        thought, resp = self._split_api_thought(full)
+        tool_observations = []
+        thought, resp = "", ""
+        for _step in range(max(1, self.max_steps)):
+            try:
+                full = self.model.chat(messages, temperature=self.temperature,
+                                       max_tokens=self.max_new_tokens, top_p=self.top_p)
+            except Exception as e:
+                return "", f"API request failed: {e}"
+            thought, resp = self._split_api_thought(full)
+            parsed = _parse_tool_call(resp if resp else full)
+            if not parsed:
+                break
+            tool_name, kwargs, _args_str = parsed
+            tool_obs = self.execute_tool(tool_name, kwargs)
+            tool_observations.append(f"Tool: {tool_name}({_args_str})\nObservation:\n{tool_obs}")
+            messages = (messages + [{"role": "assistant", "content": full},
+                                    {"role": "user", "content":
+                                     f"[OBSERVATION from {tool_name}]:\n{tool_obs[:2000]}\n"
+                                     "Continue toward the user's request using the observation above."}])
+        if _parse_tool_call(resp):
+            resp = re.sub(r'\[TOOL:\s*[a-zA-Z_][a-zA-Z0-9_]*\(.*?\)\]', '', resp,
+                          flags=re.DOTALL).strip()
+        if tool_observations:
+            thought = (thought + "\n\n--- Tool Telemetry ---\n"
+                       + "\n".join(tool_observations)).strip() if thought else \
+                "--- Tool Telemetry ---\n" + "\n".join(tool_observations)
         self.history.append((prompt, resp))
         return thought, resp
 
     @torch.no_grad()
     def _solve_api_stream(self, prompt):
-        """Streaming solve path for API-key models (APIModelAdapter)."""
+        """Streaming solve path for API-key models (APIModelAdapter, tool loop).
+
+        Each step streams live; a step ending in [TOOL: name(...)] executes the
+        tool (tool_start/tool_result events) and its [OBSERVATION] becomes the
+        next user message."""
         self.model.eval()
         self._source_harvest = []
         label = getattr(self.model, "model_name", "api-model")
         messages = self._api_messages(prompt)
-        try:
-            chunks = self.model.chat_stream(messages, temperature=self.temperature,
-                                            max_tokens=self.max_new_tokens, top_p=self.top_p)
-            chunk_iter = iter(chunks)
-            peek = next(chunk_iter, None)
-        except Exception as e:
-            err = f"API request failed: {e}"
-            yield {"type": "response_delta", "chunk": err}
-            yield {"type": "done", "thought": "", "response": err,
-                   "model": label, "model_path": f"api:{label}",
-                   "sources": [], "intent": self.last_intent}
-            return
-        if peek is None:
-            err = "API returned an empty stream."
-            yield {"type": "response_delta", "chunk": err}
-            yield {"type": "done", "thought": "", "response": err,
-                   "model": label, "model_path": f"api:{label}",
-                   "sources": [], "intent": self.last_intent}
-            return
-        full_reason = ""
-        content = ""
-        thought_sent = 0
-        resp_sent = 0
-        saw_close = False
-        thought_done = False
-        native_reasoning = False
-        stream_error = None
-        try:
-            for reasoning, delta in [peek] + list(chunk_iter):
-                if reasoning:
-                    native_reasoning = True
-                    full_reason += reasoning
-                    yield {"type": "thought_delta", "chunk": reasoning}
-                    thought_sent += len(reasoning)
-                if not delta:
-                    continue
-                content += delta
-                if native_reasoning:
-                    # Provider streams reasoning separately: everything in
-                    # content is the answer (strip any inline think blocks).
-                    if not thought_done:
-                        thought_done = True
-                        yield {"type": "thought_done"}
-                    no_think = re.sub(r'<think>[\s\S]*?(?:</think>|$)', '', content)
-                    nr = no_think[resp_sent:]
-                    if nr:
-                        yield {"type": "response_delta", "chunk": nr}
-                        resp_sent = len(no_think)
-                elif not saw_close:
-                    if "</think>" in content:
-                        saw_close = True
-                        before, after = content.split("</think>", 1)
-                        nt = before[thought_sent:]
-                        if nt:
-                            yield {"type": "thought_delta", "chunk": nt}
-                        thought_sent = len(before)
-                        thought_done = True
-                        yield {"type": "thought_done"}
-                        if after.strip():
-                            yield {"type": "response_delta", "chunk": after}
-                            resp_sent = len(after)
+        tool_observations = []
+        thought, resp, content = "", "", ""
+        for _step in range(max(1, self.max_steps)):
+            try:
+                chunks = self.model.chat_stream(messages, temperature=self.temperature,
+                                                max_tokens=self.max_new_tokens, top_p=self.top_p)
+                chunk_iter = iter(chunks)
+                peek = next(chunk_iter, None)
+            except Exception as e:
+                err = f"API request failed: {e}"
+                yield {"type": "response_delta", "chunk": err}
+                resp = (resp + "\n" + err).strip() if resp else err
+                break
+            if peek is None:
+                if not resp and not content:
+                    err = "API returned an empty stream."
+                    yield {"type": "response_delta", "chunk": err}
+                    resp = err
+                break
+            full_reason = ""
+            content = ""
+            thought_sent = 0
+            resp_sent = 0
+            saw_close = False
+            thought_done = False
+            native_reasoning = False
+            stream_error = None
+            try:
+                for reasoning, delta in [peek] + list(chunk_iter):
+                    if reasoning:
+                        native_reasoning = True
+                        full_reason += reasoning
+                        yield {"type": "thought_delta", "chunk": reasoning}
+                        thought_sent += len(reasoning)
+                    if not delta:
+                        continue
+                    content += delta
+                    if native_reasoning:
+                        # Provider streams reasoning separately: everything in
+                        # content is the answer (strip any inline think blocks).
+                        if not thought_done:
+                            thought_done = True
+                            yield {"type": "thought_done"}
+                        no_think = re.sub(r'<think>[\s\S]*?(?:</think>|$)', '', content)
+                        nr = no_think[resp_sent:]
+                        if nr:
+                            yield {"type": "response_delta", "chunk": nr}
+                            resp_sent = len(no_think)
+                    elif not saw_close:
+                        if "</think>" in content:
+                            saw_close = True
+                            before, after = content.split("</think>", 1)
+                            nt = before[thought_sent:]
+                            if nt:
+                                yield {"type": "thought_delta", "chunk": nt}
+                            thought_sent = len(before)
+                            thought_done = True
+                            yield {"type": "thought_done"}
+                            if after.strip():
+                                yield {"type": "response_delta", "chunk": after}
+                                resp_sent = len(after)
+                        else:
+                            nt = content[thought_sent:]
+                            if nt:
+                                yield {"type": "thought_delta", "chunk": nt}
+                            thought_sent = len(content)
                     else:
-                        nt = content[thought_sent:]
-                        if nt:
-                            yield {"type": "thought_delta", "chunk": nt}
-                        thought_sent = len(content)
-                else:
-                    nr = content[resp_sent:]
-                    if nr:
-                        yield {"type": "response_delta", "chunk": nr}
-                        resp_sent = len(content)
-        except Exception as e:
-            stream_error = str(e)
-        if native_reasoning:
-            thought = full_reason.strip()
-            extra, resp = self._split_api_thought(content)
-            if extra:
-                thought = (thought + "\n" + extra).strip()
-            if not resp:
-                resp = re.sub(r'<think>[\s\S]*?(?:</think>|$)', '', content).strip()
-        else:
-            thought, resp = self._split_api_thought(content)
-            if not thought_done:
-                thought_done = True
-                yield {"type": "thought_done"}
-            if not saw_close and resp and resp_sent == 0:
-                # Model never emitted <think>: what streamed as "thought"
-                # is actually the answer — re-emit it as the response.
-                yield {"type": "response_delta", "chunk": resp}
-        if stream_error:
-            resp = (resp + f"\n\n[stream interrupted: {stream_error}]").strip()
+                        nr = content[resp_sent:]
+                        if nr:
+                            yield {"type": "response_delta", "chunk": nr}
+                            resp_sent = len(content)
+            except Exception as e:
+                stream_error = str(e)
+            if native_reasoning:
+                thought = full_reason.strip()
+                extra, resp = self._split_api_thought(content)
+                if extra:
+                    thought = (thought + "\n" + extra).strip()
+                if not resp:
+                    resp = re.sub(r'<think>[\s\S]*?(?:</think>|$)', '', content).strip()
+            else:
+                thought, resp = self._split_api_thought(content)
+                if not thought_done:
+                    thought_done = True
+                    yield {"type": "thought_done"}
+                if not saw_close and resp and resp_sent == 0:
+                    # Model never emitted <think>: what streamed as "thought"
+                    # is actually the answer — re-emit it as the response.
+                    yield {"type": "response_delta", "chunk": resp}
+            if stream_error:
+                resp = (resp + f"\n\n[stream interrupted: {stream_error}]").strip()
+                break
+            parsed = _parse_tool_call(resp if resp else content)
+            if not parsed:
+                break
+            tool_name, kwargs, args_str = parsed
+            yield {"type": "tool_start", "tool": tool_name, "args": args_str}
+            tool_obs = self.execute_tool(tool_name, kwargs)
+            tool_observations.append(f"Tool: {tool_name}({args_str})\nObservation:\n{tool_obs}")
+            yield {"type": "tool_result", "tool": tool_name, "observation": tool_obs[:800]}
+            messages = (messages + [{"role": "assistant", "content": content},
+                                    {"role": "user", "content":
+                                     f"[OBSERVATION from {tool_name}]:\n{tool_obs[:2000]}\n"
+                                     "Continue toward the user's request using the observation above."}])
+            resp, content = "", ""
+        if _parse_tool_call(resp):
+            resp = re.sub(r'\[TOOL:\s*[a-zA-Z_][a-zA-Z0-9_]*\(.*?\)\]', '', resp,
+                          flags=re.DOTALL).strip()
+        if tool_observations:
+            thought = (thought + "\n\n--- Tool Telemetry ---\n"
+                       + "\n".join(tool_observations)).strip() if thought else \
+                "--- Tool Telemetry ---\n" + "\n".join(tool_observations)
         self.history.append((prompt, resp))
         yield {"type": "done", "thought": thought, "response": resp,
                "model": label, "model_path": f"api:{label}",
@@ -2087,13 +2398,9 @@ class AshenAIAgenticEngine:
                 thought_process = "Ashen AI agent telemetry..."
                 remainder = generated_text
             all_thoughts.append(thought_process)
-            tool_match = re.search(r'\[TOOL:\s*([a-zA-Z_][a-zA-Z0-9_]*)\((.*?)\)\]', remainder, re.DOTALL)
-            if tool_match:
-                tool_name = tool_match.group(1)
-                args_str = tool_match.group(2)
-                kwargs = {}
-                for am in re.finditer(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([\"\'])(.*?)\2', args_str):
-                    kwargs[am.group(1)] = am.group(3)
+            parsed = _parse_tool_call(remainder)
+            if parsed:
+                tool_name, kwargs, args_str = parsed
                 tool_obs = self.execute_tool(tool_name, kwargs)
                 tool_observations.append(f"Tool: {tool_name}({args_str})\nObservation:\n{tool_obs}")
                 current_prompt += f"{remainder}\n[OBSERVATION]:\n{tool_obs}\n</think>\n"
@@ -2220,13 +2527,9 @@ class AshenAIAgenticEngine:
                 remainder_local = acc.strip()
             if thought_process and thought_process not in all_thoughts:
                 all_thoughts.append(thought_process)
-            tool_match = re.search(r'\[TOOL:\s*([a-zA-Z_][a-zA-Z0-9_]*)\((.*?)\)\]', remainder_local, re.DOTALL)
-            if tool_match:
-                tool_name = tool_match.group(1)
-                args_str = tool_match.group(2)
-                kwargs = {}
-                for am in re.finditer(r'([a-zA-Z_][a-zA-Z0-9_]*)\s*=\s*([\"\'])(.*?)\2', args_str):
-                    kwargs[am.group(1)] = am.group(3)
+            parsed = _parse_tool_call(remainder_local)
+            if parsed:
+                tool_name, kwargs, args_str = parsed
                 yield {"type": "tool_start", "tool": tool_name, "args": args_str}
                 tool_obs = self.execute_tool(tool_name, kwargs)
                 tool_observations.append(f"Tool: {tool_name}({args_str})\nObservation:\n{tool_obs}")
@@ -3191,6 +3494,72 @@ def cmd_websearch(arg):
     print(reasoner.execute_tool('web_search', {'query': q}))
 
 
+def cmd_read(arg):
+    path = arg.strip() or input("Read path: ").strip()
+    if not path:
+        print("[Tools] usage: /read <path>")
+        return
+    print(reasoner.execute_tool('read_file', {'file_path': path}))
+
+
+def cmd_write(arg):
+    parts = arg.strip().split(None, 1)
+    if not parts:
+        print("[Tools] usage: /write <path> <text...>  (use \\n for newlines)")
+        return
+    path = parts[0]
+    text = parts[1] if len(parts) > 1 else ""
+    if not text:
+        print("[Tools] reading stdin until a single '.' line (Ctrl+C aborts)...")
+        lines = []
+        try:
+            while True:
+                line = input()
+                if line.strip() == ".":
+                    break
+                lines.append(line)
+        except (KeyboardInterrupt, EOFError):
+            print("[Tools] aborted.")
+            return
+        text = "\n".join(lines)
+    else:
+        text = text.replace("\\n", "\n").replace("\\t", "\t")
+    print(reasoner.execute_tool('write_file', {'file_path': path, 'content': text}))
+
+
+def cmd_ls(arg):
+    target = arg.strip()
+    print(reasoner.execute_tool('list_dir', {'dir_path': target} if target else {}))
+
+
+def cmd_mkdir(arg):
+    path = arg.strip() or input("Make dir: ").strip()
+    if not path:
+        print("[Tools] usage: /mkdir <path>")
+        return
+    print(reasoner.execute_tool('make_dir', {'dir_path': path}))
+
+
+def cmd_rm(arg):
+    path = arg.strip() or input("Remove path: ").strip()
+    if not path:
+        print("[Tools] usage: /rm <path>")
+        return
+    print(reasoner.execute_tool('remove_path', {'path': path}))
+
+
+def cmd_run(arg):
+    cmd = arg.strip() or input("Run command: ").strip()
+    if not cmd:
+        print("[Tools] usage: /run <command...>")
+        return
+    print(reasoner.execute_tool('run_shell_command', {'command': cmd}))
+
+
+def cmd_tools():
+    print(LOCAL_TOOLS_SPEC)
+
+
 def cmd_improve():
     log = _load_improvement_log()
     print(f"Total feedback: {log['stats'].get('total_feedback', 0)}  "
@@ -3691,6 +4060,27 @@ if __name__ == "__main__":
             if cmd.startswith('/websearch'):
                 cmd_websearch(cmd[10:])
                 continue
+            if cmd == '/read' or cmd.startswith('/read '):
+                cmd_read(cmd[5:])
+                continue
+            if cmd.startswith('/write'):
+                cmd_write(cmd[6:])
+                continue
+            if cmd == '/ls' or cmd.startswith('/ls '):
+                cmd_ls(cmd[3:])
+                continue
+            if cmd.startswith('/mkdir'):
+                cmd_mkdir(cmd[6:])
+                continue
+            if cmd.startswith('/rm '):
+                cmd_rm(cmd[4:])
+                continue
+            if cmd.startswith('/run '):
+                cmd_run(cmd[5:])
+                continue
+            if cmd == '/tools':
+                cmd_tools()
+                continue
             if cmd.startswith('/selfimprove'):
                 cmd_selfimprove(cmd[11:])
                 continue
@@ -3745,6 +4135,13 @@ if __name__ == "__main__":
   /council [--drafts N --critics M] <task>  Council vote & revise
   /research <topic> Deep web research (cites sources)
   /websearch <q>    Quick DuckDuckGo search
+  /read <path>      Read a text file (model tool, manual use)
+  /write <path> <text...>  Write a file (\\n = newline; no text = stdin until '.')
+  /ls [path]        List a directory (model tool, manual use)
+  /mkdir <path>     Create a directory incl. parents
+  /rm <path>        Delete a file or directory tree
+  /run <command...> Run a terminal command in the working dir
+  /tools            Show the file/shell tools the model can invoke
   /selfimprove analyze|auto-tune|regenerate <text>
   /up /down         Rate the last answer (feeds self-improvement)
   /sessions /new /load <id> /delete <id> /rename <name>

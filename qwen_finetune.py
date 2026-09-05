@@ -343,7 +343,23 @@ SYSTEM_PROMPT = (
     "3. If the task admits more than one approach, weigh them briefly, then pick "
     "the strongest. When unsure, say so rather than guessing.\n"
     "4. End with the final answer clearly separated from the reasoning. For "
-    "graded/math tasks, give the result last."
+    "graded/math tasks, give the result last.\n\n"
+    "Available local tools — emit exactly one per turn as "
+    "[TOOL: name(arg='value', ...)] on its own line, then wait for the "
+    "[OBSERVATION] before continuing:\n"
+    "- read_file(file_path='...') — read a text file (first ~8KB)\n"
+    "- write_file(file_path='...', content='...') — create/overwrite a file "
+    "(parent dirs auto-created)\n"
+    "- list_dir(dir_path='...') — list a directory (default: working dir)\n"
+    "- make_dir(dir_path='...') — create a directory incl. parents\n"
+    "- remove_path(path='...') — delete a file or directory tree\n"
+    "- run_shell_command(command='...') — run a terminal command in the "
+    "working dir (60s timeout), e.g. python, pip, git, pytest\n"
+    "- glob(pattern='...'), grep_search(pattern='...'), "
+    "web_search(query='...'), browse_url(url='...'), "
+    "deep_research(topic='...')\n"
+    "After the [OBSERVATION] arrives, continue reasoning and answer. "
+    "Never invent tool output."
 )
 
 # --- optional external data (merged with the hardcoded seeds above) ---------
@@ -451,6 +467,27 @@ SFT_CONVERSATIONS = [
       "streaming hash set with disk spill. Pick C for constant memory, or sort|uniq if "
       "exactness and disk space allow.\nAnswer: use a streaming distinct counter "
       "(HyperLogLog) for constant memory, or `sort file | uniq -c` for an exact count.")],
+    # -- local file/shell tools: emit [TOOL: ...], then consume [OBSERVATION] --
+    [("user", "What files are in the current directory?"),
+     ("assistant", "[TOOL: list_dir(dir_path='.')]")],
+    [("user", "What files are in the current directory?\n\n[OBSERVATION from list_dir]:\n"
+      "/tmp/work (3 entries):\n[FILE] app.py\n[FILE] notes.txt\n[DIR]  tests\n"
+      "Continue toward the user's request using the observation above."),
+     ("assistant", "The current directory holds 2 files and 1 folder:\n- app.py\n- notes.txt\n"
+      "- tests/ (directory)")],
+    [("user", "Read the file notes.txt and tell me what it says."),
+     ("assistant", "[TOOL: read_file(file_path='notes.txt')]")],
+    [("user", "Read the file notes.txt and tell me what it says.\n\n[OBSERVATION from read_file]:\n"
+      "Buy milk, fix bug #42.\nContinue toward the user's request using the observation above."),
+     ("assistant", "notes.txt says:\nBuy milk, fix bug #42.")],
+    [("user", "Create a hello.py that prints hello world."),
+     ("assistant", "[TOOL: write_file(file_path='hello.py', content='print(\"hello world\")')]")],
+    [("user", "Run the test suite with pytest."),
+     ("assistant", "[TOOL: run_shell_command(command='python -m pytest -q')]")],
+    [("user", "Make a new folder called drafts."),
+     ("assistant", "[TOOL: make_dir(dir_path='drafts')]")],
+    [("user", "Delete the file scratch.txt."),
+     ("assistant", "[TOOL: remove_path(path='scratch.txt')]")],
 ]
 
 # -- intent classification training set (text -> label index) ----------------

@@ -1102,6 +1102,25 @@
       "type": "benchmark",
       "stats_delta": {},
       "ts": "2026-08-30T16:47:28.621726"
+    },
+    {
+      "type": "swarm",
+      "prompt": "hello",
+      "mode": "divide",
+      "agents": 2,
+      "elapsed": 0.21,
+      "stats_delta": {},
+      "ts": "2026-09-05T17:47:20.388752"
+    },
+    {
+      "type": "council",
+      "prompt": "hello",
+      "drafts": 2,
+      "critics": 2,
+      "winner": 1,
+      "elapsed": 0.32,
+      "stats_delta": {},
+      "ts": "2026-09-05T17:47:20.716947"
     }
   ],
   "stats": {
@@ -1204,6 +1223,14 @@
     {
       "ts": "2026-08-30T16:47:28.621726",
       "text": "Benchmark executed via self-improve"
+    },
+    {
+      "ts": "2026-09-05T17:47:20.388752",
+      "text": "Swarm 2xdivide completed \"hello\""
+    },
+    {
+      "ts": "2026-09-05T17:47:20.716947",
+      "text": "Council 2 drafts + 2 critics \u2192 winner Draft 1 (Researcher)"
     }
   ]
 }

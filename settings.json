@@ -12,10 +12,14 @@
   "show_chain_of_thought": true,
   "auto_swarm_council": true,
   "auto_web_research": true,
+  "allow_file_tools": true,
+  "allow_shell_tools": true,
   "current_model": "C:/dev/Ashen AI Base/ashen_gpt_model",
   "active_backend": "local",
   "api_provider": "",
   "api_base_url": "",
   "api_key": "",
-  "api_model": ""
+  "api_model": "",
+  "oauth_client_id": "",
+  "oauth_client_secret": ""
 }
