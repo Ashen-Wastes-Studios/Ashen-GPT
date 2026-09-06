@@ -713,6 +713,7 @@ class QwenModelAdapter:
             "always refer to yourself as Ashen, never as Qwen, GPT, or any other name. "
             "Answer every question completely and directly — never ask the user what "
             "angle or level of detail they want, and never deflect. "
+            "The one exception is a request that would break the law or cause serious harm: refuse it with a brief apology and offer a lawful, safe alternative instead. "
             "When a request needs current facts, reason step by step, then ground your "
             "answer in the gathered sources and cite them inline as [1], [2], ... with a "
             "Sources list at the end.\n\n"
@@ -848,6 +849,7 @@ API_SYSTEM_PROMPT = (
     "always refer to yourself as Ashen, never as Qwen, GPT, or any other name. "
     "Answer every question completely and directly — never ask the user what "
     "angle or level of detail they want, and never deflect. "
+    "The one exception is a request that would break the law or cause serious harm: refuse it with a brief apology and offer a lawful, safe alternative instead. "
     "When a request needs current facts, reason step by step, then ground your "
     "answer in the gathered sources and cite them inline as [1], [2], ... with a "
     "Sources list at the end.\n\n"
@@ -1815,6 +1817,85 @@ def _is_dangerous_shell(cmd):
     return any(b in low for b in SHELL_BLOCKLIST)
 
 
+# --- Legal-compliance refusal filter (direct user order) -------------------
+# Defense-in-depth for illegal / seriously-harmful requests. The durable fix
+# is training data: SFT refusal examples + DPO (refusal chosen, compliance
+# rejected) pairs in ashen_gpt_trainer.py and qwen_finetune.py. This
+# deterministic pre-check makes already-loaded checkpoints refuse immediately,
+# before any retrain. It is a safety filter, not persona/coaching guidance: it
+# never edits the prompt, it only short-circuits matching requests (and
+# matching write_file / run_shell_command tool arguments) with an apology.
+LEGAL_REFUSAL_PATTERNS = (
+    # Explosives (bath-bomb recipes and other benign uses excluded).
+    r"how (to|do i|can i) (make|build)( a)? (?!bath\b)\w{0,30}?bomb\b",
+    r"(pipe|pressure cooker|nail|car|suicide|dirty)\s*bomb\b|bomb[\s-]?making|molotov( cocktail)?",
+    # Weapons of mass harm — instructional framing required so history,
+    # policy, and treaty questions still pass.
+    r"(make|build|create|manufacture|synthesi[sz]e|instructions?|guide|tutorial|recipe|how (to|do i|can i)).{0,35}(bioweapon|biological weapon|chemical weapon|nerve (gas|agent)|mustard gas|sarin|anthrax)\b",
+    r"(make|build|instructions?|guide|tutorial|recipe).{0,25}nuclear (bomb|weapon)|nuclear (bomb|weapon).{0,25}(instructions?|guide|tutorial|recipe|howto)",
+    r"how (to|do i|can i) (make|build)( a)? nuke",
+    # Cybercrime — creation framing required so "what is phishing/malware"
+    # learning questions still pass.
+    r"write (me )?(a )?(keylogger|ransomware|spyware|trojan|rootkit|botnet)|write (me )?(malware|computer virus)|create (a )?(malware|ransomware|keylogger|spyware|trojan|rootkit|botnet|computer virus)",
+    r"hack into|hack (an|a|someone'?s|my|their|his|her) (accounts?|phones?|computers?|emails?|passwords?|wifi|wi-fi|networks?|servers?|banks?|instagrams?|facebooks?)\b",
+    r"(how (to|do i|can i)|launch|start|perform|carry out|tutorial|guide|show me).{0,30}(ddos|denial.of.service)|booter service|stresser service",
+    r"(write|create|make|draft|compose|generate|send|show me|give me).{0,25}phish|spear.?phish|clone (a )?(login|bank) page",
+    # Fraud / theft / forgery — action framing required so definitional
+    # questions ("what is identity theft?") still pass.
+    r"steal (someone'?s |a |the )?(passwords?|identity|identities|credit cards?|money|cars?|data|databases?|social security)\b|(how (to|do i|can i)|commit|teach me|show me|help me).{0,20}(identity theft|credit card fraud)|carding (forum|shop|tutorial|method|site)|carder\b|skim(ming|mer)",
+    r"(how (to|do i|can i)|commit|teach me|show me|help me).{0,20}(tax fraud|insurance fraud|wire fraud|bank fraud|benefits fraud|arson)",
+    r"(how (to|do i|can i)|make|print|produce|pass|using?|spend).{0,25}counterfeit|fake (money|currency|passports?|ids?\b)|print money (that|to)|(buy|get|make|order|use|need|using).{0,15}fake (passport|visa|driver'?s licen[sc]e|diploma|prescription)|forg\w+ (a )?(passport|visa|licen[sc]e|diploma|prescription)",
+    # Illegal drugs — manufacture / distribution framing.
+    r"(mak(e|ing)|cook|manufacture|synthesi[sz]e|distribute|sell|smuggle|buy|deal).{0,20}(meth|cocaine|heroin|fentanyl|crack|lsd|mdma)\b|(recipe|instructions|guide) for (making )?(meth|cocaine|heroin|fentanyl|crack|lsd|mdma)\b|\b(meth|cocaine|heroin|fentanyl) (recipe|lab)\b",
+    # Violent crime (object word-boundaries so "murder mystery" still passes).
+    r"(how to )?(murder|kill) (my|someone|a person|him|her|them|people)\b|how to commit murder|get away with murder",
+    r"(how (to|do i|can i)|plan|plot|hire|commit|carry out|help me).{0,25}assassinat\w*|hire a hitman",
+    r"how to poison|poison (someone|a person|him|her|them|my \w+|foods?|drinks?|coffee)\b|(put|pour|slip|spik\w+|add).{0,20}poison.{0,20}(drink|food|coffee|someone|him|her|them)\b",
+    r"(how (to|do i|can i)|help me|show me).{0,20}burn (down )?(the|a|my|someone'?s).{0,10}(house|building|car|school|church)",
+    r"(how (to|do i|can i)|help me|plan to|teach me).{0,20}kidnap\w*|kidnap\w*.{0,20}(ransom|without (getting caught|being caught))",
+    r"(how (to|do i|can i)|teach me|show me|help me).{0,15}torture\b",
+    # Sexual harm.
+    r"child (porn|pornography|sexual abuse|molest)|csam|sex with (a )?(child|minor)",
+    r"date.?rape|roofie|rape (someone|a woman|a girl|him|her|them)\b|sex without consent",
+    r"human trafficking|sex trafficking|smuggle people",
+    # Property crime — action framing required so legal-definition questions pass.
+    r"rob (a|the) bank|bank robbery",
+    r"(how (to|do i|can i)|teach me|show me|help me|tips for|ways to).{0,25}shoplift\w*|shoplift\w*.{0,25}(without (getting caught|being caught)|getting away)",
+    r"(how (to|do i|can i)|teach me|show me|help me).{0,25}pickpocket|pickpocket.{0,20}without (getting caught|being caught)",
+    r"break into (a|the|my neighbor'?s|someone'?s).{0,15}(house|home|apartment|car)\b",
+    # Harassment / privacy invasion.
+    r"stalk(ing)? (someone|my ex|him|her)\b|track \w+ phone without (permission|consent|them knowing)",
+    r"swat(ting)? (someone|a streamer|him|her|them|my \w+)\b",
+    r"(how (to|do i|can i)|help me).{0,20}doxx?|doxx? (him|her|them|someone)\b",
+    # Obstruction / escape — how-to framing required.
+    r"(how (to|do i|can i)|ways to|help me|show me) (hide|dispose of|destroy).{0,20}(a body|the body|bodies|evidence)\b",
+    r"(how (to|do i|can i)|ways to|help me) escape (from )?prison",
+    r"(how (to|do i|can i)|ways to|help me) evade (the )?police",
+    # Self-harm — intent framing required so casual idioms still pass.
+    r"\b(i want to|i'm going to|i am going to|how (to|do i|can i)|help me|ways to) (kill myself|commit suicide|end my life|end it all|hurt myself|self.?harm|cut myself)\b(?! (laughing|joking|lol)\b)",
+)
+LEGAL_REFUSAL_THOUGHT = (
+    "The user is asking for help with something illegal or seriously harmful. "
+    "I must refuse with a brief apology and offer a lawful, safe alternative instead."
+)
+LEGAL_REFUSAL_RESPONSE = (
+    "I'm sorry, but I can't help with that. It looks like a request for something "
+    "illegal or seriously harmful, which I'm not able to do. If you'd like, I can "
+    "help with a lawful alternative instead — for example, explaining the relevant "
+    "law, general safety information, or legitimate defensive-security guidance."
+)
+LEGAL_REFUSAL_TOOL_ERROR = (
+    "Error: refused — this looks like a request for illegal or seriously harmful "
+    "activity, which I can't help with."
+)
+
+
+def _is_illegal_request(text):
+    """True when text matches a known illegal / seriously-harmful request pattern."""
+    low = (text or "").lower()
+    return any(re.search(p, low) for p in LEGAL_REFUSAL_PATTERNS)
+
+
 class AshenAIAgenticEngine:
     def __init__(self, model, decode_fn, encode_fn, device, max_steps=5):
         self.model = model
@@ -2035,6 +2116,8 @@ class AshenAIAgenticEngine:
                 path = _resolve_tool_path(raw)
                 if not path:
                     return "Error: write_file needs file_path='...'."
+                if _is_illegal_request(raw) or _is_illegal_request(content):
+                    return LEGAL_REFUSAL_TOOL_ERROR
                 try:
                     parent = os.path.dirname(path)
                     if parent:
@@ -2131,6 +2214,8 @@ class AshenAIAgenticEngine:
                     return "Error: run_shell_command needs command='...'."
                 if _is_dangerous_shell(cmd):
                     return "Error: refused — command matches the destructive-command blocklist."
+                if _is_illegal_request(cmd):
+                    return LEGAL_REFUSAL_TOOL_ERROR
                 try:
                     res = subprocess.run(cmd, shell=True, capture_output=True, text=True,
                                          timeout=60, cwd=os.getcwd())
@@ -2912,6 +2997,15 @@ class AshenAIAgenticEngine:
         self.model.eval()
         self._source_harvest = []  # reset per-turn source harvesting
 
+        # Legal-compliance refusal (direct user order): illegal or seriously
+        # harmful requests are refused with an apology before any model call,
+        # so loaded checkpoints comply even before retraining.
+        if _is_illegal_request(prompt):
+            _thought, _resp = LEGAL_REFUSAL_THOUGHT, LEGAL_REFUSAL_RESPONSE
+            self.last_sources = []
+            self.history.append((prompt, f"<think>\n{_thought}\n</think>\n{_resp}"))
+            return _thought, _resp
+
         # Spam filtering removed per user request. Intent classification is
         # retained only for request routing.
         _label, _idx, _conf = self.classify_input(prompt)
@@ -3043,6 +3137,17 @@ class AshenAIAgenticEngine:
         """
         self.model.eval()
         self._source_harvest = []  # reset per-turn source harvesting
+        # Legal-compliance refusal (direct user order): stream the apology as
+        # events in the same schema so the UI renders it like any other turn.
+        if _is_illegal_request(prompt):
+            _thought, _resp = LEGAL_REFUSAL_THOUGHT, LEGAL_REFUSAL_RESPONSE
+            self.last_sources = []
+            self.history.append((prompt, f"<think>\n{_thought}\n</think>\n{_resp}"))
+            yield {"type": "thought_delta", "chunk": _thought, "synth": True, "step": 0}
+            yield {"type": "thought_done", "synth": True, "step": 0}
+            yield {"type": "response_delta", "chunk": _resp, "synth": True, "step": 0}
+            yield {"type": "done", "thought": _thought, "response": _resp, "model": os.path.basename(current_model_filename), "model_path": current_model_filename, "sources": [], "intent": self.last_intent}
+            return
         # Spam filtering removed per user request. Intent classification is
         # retained only for request routing.
         _label, _idx, _conf = self.classify_input(prompt)

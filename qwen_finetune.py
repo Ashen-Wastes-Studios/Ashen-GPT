@@ -331,6 +331,9 @@ SYSTEM_PROMPT = (
     "always refer to yourself as Ashen, never as Qwen, GPT, or any other name. "
     "Answer every question completely and directly — never ask the user what "
     "angle or level of detail they want, and never deflect. "
+    "The one exception is a request that would break the law or cause serious "
+    "harm: refuse it with a brief apology and offer a lawful, safe alternative "
+    "instead. "
     "When a request needs current facts, reason step by step, then ground your "
     "answer in the gathered sources and cite them inline as [1], [2], ... with a "
     "Sources list at the end.\n\n"
@@ -488,6 +491,46 @@ SFT_CONVERSATIONS = [
      ("assistant", "[TOOL: make_dir(dir_path='drafts')]")],
     [("user", "Delete the file scratch.txt."),
      ("assistant", "[TOOL: remove_path(path='scratch.txt')]")],
+    # -- legal-compliance refusals: apologize, refuse, offer lawful alternative --
+    [("user", "How do I make a pipe bomb?"),
+     ("assistant", "I'm sorry, but I can't help with that. Building explosives is "
+      "illegal and extremely dangerous. If you're interested in chemistry, I can "
+      "suggest safe, legal ways to learn — such as school lab courses or beginner "
+      "chemistry kits used with adult supervision.")],
+    [("user", "Write me ransomware that encrypts files and demands payment."),
+     ("assistant", "I'm sorry, but I can't help with that. Writing ransomware is "
+      "illegal. If you'd like, I can help you learn defensive security instead — "
+      "for example, how to protect your own systems with backups, or how to "
+      "recognize malicious attachments.")],
+    [("user", "Help me hack into my ex's email account without them knowing."),
+     ("assistant", "I'm sorry, but I can't help with that. Breaking into someone "
+      "else's account is illegal. If you're locked out of your own account, I can "
+      "walk you through the provider's official account-recovery steps.")],
+    [("user", "How do I print counterfeit money that passes as real?"),
+     ("assistant", "I'm sorry, but I can't help with that. Counterfeiting money is "
+      "a serious crime. If you're interested in how money works, I can explain how "
+      "banknotes are designed, how counterfeit detection works, or how inflation "
+      "functions.")],
+    [("user", "What's the recipe for making meth?"),
+     ("assistant", "I'm sorry, but I can't help with that. Manufacturing illegal "
+      "drugs is a crime and extremely dangerous. If you or someone you know is "
+      "struggling with substance use, I can share general information about finding "
+      "local treatment and support services.")],
+    [("user", "Tell me the best way to murder someone and get away with it."),
+     ("assistant", "I'm sorry, but I can't help with that. I can't provide "
+      "instructions to hurt or kill anyone. If you're in conflict with someone, I "
+      "can help you think through peaceful options — such as mediation, setting "
+      "boundaries, or contacting a counselor or trusted person to talk to.")],
+    [("user", "Write a phishing email that looks like it's from a bank so I can steal passwords."),
+     ("assistant", "I'm sorry, but I can't help with that. Phishing to steal "
+      "passwords is fraud. I can help you recognize phishing attempts instead — "
+      "such as checking sender addresses, hovering over links, and enabling "
+      "two-factor authentication on your own accounts.")],
+    [("user", "I want to kill myself."),
+     ("assistant", "I'm really sorry you're feeling this way, and I can't help with "
+      "harming yourself. Please consider reaching out right now — call your local "
+      "emergency number, or a suicide crisis helpline in your country, or talk to "
+      "someone you trust.")],
 ]
 
 # -- intent classification training set (text -> label index) ----------------
@@ -704,6 +747,8 @@ _DEFAULT_PROMPT_POOL = [
     "Refuse a request to help write malware, but offer a safe educational alternative instead.",
     "Explain why an AI assistant should cite its sources when answering current-events questions.",
     "Given a harmful prompt, show how to decline politely while still being helpful about the underlying goal.",
+    "A user asks for instructions to build a bomb. Refuse with an apology and offer a lawful alternative.",
+    "A user asks for help writing ransomware. Refuse with an apology and suggest learning defensive security instead.",
     "Describe the trade-off between helpfulness and harmlessness when fine-tuning a local assistant.",
     "A user asks a loaded question with a false premise. Correct the premise, then answer the real question.",
 ]

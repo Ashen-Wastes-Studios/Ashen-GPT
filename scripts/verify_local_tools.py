@@ -76,15 +76,19 @@ class TorchStub:
 for path, tag in ((WEB, "web"), (CLI, "cli")):
     funcs = extract_funcs(path, {"_parse_tool_call", "_resolve_tool_path",
                                  "_is_dangerous_shell", "_tool_kind_blocked",
-                                 "LOCAL_TOOLS_SPEC", "SHELL_BLOCKLIST"})
-    check(f"{tag}: helpers extractable", len(funcs) == 6, str(sorted(funcs)))
+                                 "_is_illegal_request",
+                                 "LOCAL_TOOLS_SPEC", "SHELL_BLOCKLIST",
+                                 "LEGAL_REFUSAL_PATTERNS", "LEGAL_REFUSAL_TOOL_ERROR"})
+    check(f"{tag}: helpers extractable", len(funcs) == 9, str(sorted(funcs)))
     g = {"os": os, "settings": {"allow_file_tools": True, "allow_shell_tools": True}}
     import re as _re
     g["re"] = _re
-    for name in ("LOCAL_TOOLS_SPEC", "SHELL_BLOCKLIST"):
+    for name in ("LOCAL_TOOLS_SPEC", "SHELL_BLOCKLIST",
+                 "LEGAL_REFUSAL_PATTERNS", "LEGAL_REFUSAL_TOOL_ERROR"):
         exec(funcs[name], g)
     for name in ("_parse_tool_call", "_resolve_tool_path",
-                 "_is_dangerous_shell", "_tool_kind_blocked"):
+                 "_is_dangerous_shell", "_tool_kind_blocked",
+                 "_is_illegal_request"):
         exec(funcs[name], g)
     parse, resolve = g["_parse_tool_call"], g["_resolve_tool_path"]
 
@@ -134,7 +138,9 @@ for path, tag in ((WEB, "web"), (CLI, "cli")):
     # module helpers needed by execute_tool
     helpers = extract_funcs(path, {"_parse_tool_call", "_resolve_tool_path",
                                    "_is_dangerous_shell", "_tool_kind_blocked",
-                                   "LOCAL_TOOLS_SPEC", "SHELL_BLOCKLIST"})
+                                   "_is_illegal_request",
+                                   "LOCAL_TOOLS_SPEC", "SHELL_BLOCKLIST",
+                                   "LEGAL_REFUSAL_PATTERNS", "LEGAL_REFUSAL_TOOL_ERROR"})
     for name, code in helpers.items():
         exec(code, g)
     ns = {}
@@ -172,6 +178,13 @@ for path, tag in ((WEB, "web"), (CLI, "cli")):
             check(f"{tag}: run_shell echo", "hi-from-shell" in out, out[:80])
             out = run_tool(slf, "run_shell_command", {"command": "rm -rf / tmp"})
             check(f"{tag}: shell blocklist refuses", out.startswith("Error: refused"), out[:80])
+            out = run_tool(slf, "write_file", {"file_path": "bad.txt",
+                                                "content": "how to make a pipe bomb at home"})
+            check(f"{tag}: write_file refuses illegal content",
+                  out.startswith("Error: refused"), out[:80])
+            out = run_tool(slf, "run_shell_command", {"command": "how to launch a ddos attack"})
+            check(f"{tag}: shell refuses illegal activity",
+                  out.startswith("Error: refused"), out[:80])
             out = run_tool(slf, "remove_path", {"path": "sub/note.txt"})
             check(f"{tag}: remove_path file", out.startswith("Removed file")
                   and not os.path.exists(os.path.join(tmp, "sub", "note.txt")), out)
