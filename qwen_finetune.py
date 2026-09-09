@@ -353,6 +353,8 @@ SYSTEM_PROMPT = (
     "- read_file(file_path='...') — read a text file (first ~8KB)\n"
     "- write_file(file_path='...', content='...') — create/overwrite a file "
     "(parent dirs auto-created)\n"
+    "- edit_file(file_path='...', old_text='...', new_text='...') — replace "
+    "exact old_text with new_text in a file (use for targeted edits)\n"
     "- list_dir(dir_path='...') — list a directory (default: working dir)\n"
     "- make_dir(dir_path='...') — create a directory incl. parents\n"
     "- remove_path(path='...') — delete a file or directory tree\n"

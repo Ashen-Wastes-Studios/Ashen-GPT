@@ -97,6 +97,108 @@ try:
         _self_improvement_stats.update(_existing_log['stats'])
 except: pass
 
+# =====================================================================
+#  Persistent memory (key-value + semantic recall)
+# =====================================================================
+MEMORY_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'memory.json')
+
+def _load_memory():
+    try:
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict) and 'entries' in data:
+                return data
+    except Exception:
+        pass
+    return {'entries': [], 'stats': {'stores': 0, 'recalls': 0}}
+
+def _save_memory(data):
+    try:
+        with open(MEMORY_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+def memory_store(key, value):
+    mem = _load_memory()
+    ts = datetime.datetime.now().isoformat()
+    mem['entries'] = [e for e in mem['entries'] if e.get('key') != key]
+    mem['entries'].append({'key': key, 'value': value, 'ts': ts})
+    if len(mem['entries']) > 200:
+        mem['entries'] = mem['entries'][-200:]
+    mem['stats']['stores'] = mem['stats'].get('stores', 0) + 1
+    _save_memory(mem)
+    return True
+
+def memory_recall(query, max_results=5):
+    mem = _load_memory()
+    mem['stats']['recalls'] = mem['stats'].get('recalls', 0) + 1
+    _save_memory(mem)
+    q_words = set(re.findall(r'[a-z]{3,}', (query or '').lower()))
+    if not q_words:
+        recent = mem['entries'][-max_results:]
+        return [{'key': e['key'], 'value': e['value'], 'ts': e.get('ts', '')} for e in reversed(recent)]
+    scored = []
+    for e in mem['entries']:
+        e_words = set(re.findall(r'[a-z]{3,}', (e.get('key', '') + ' ' + e.get('value', '')).lower()))
+        if not e_words:
+            continue
+        overlap = len(q_words & e_words)
+        if overlap > 0:
+            scored.append((overlap, e))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [{'key': e['key'], 'value': e['value'], 'ts': e.get('ts', '')} for _, e in scored[:max_results]]
+
+def memory_all():
+    mem = _load_memory()
+    return mem['entries']
+
+# =====================================================================
+#  Plan storage
+# =====================================================================
+PLANS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plans.json')
+
+def _load_plans():
+    try:
+        if os.path.exists(PLANS_FILE):
+            with open(PLANS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if isinstance(data, dict) and 'plans' in data:
+                return data
+    except Exception:
+        pass
+    return {'plans': [], 'stats': {'created': 0}}
+
+def _save_plans(data):
+    try:
+        with open(PLANS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        pass
+
+def plan_store(title, steps, source='ai'):
+    plans = _load_plans()
+    ts = datetime.datetime.now().isoformat()
+    entry = {
+        'id': f"plan_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        'title': title,
+        'steps': steps,
+        'source': source,
+        'ts': ts,
+        'status': 'active',
+    }
+    plans['plans'].append(entry)
+    if len(plans['plans']) > 100:
+        plans['plans'] = plans['plans'][-100:]
+    plans['stats']['created'] = plans['stats'].get('created', 0) + 1
+    _save_plans(plans)
+    return entry
+
+def plan_list(max_n=10):
+    plans = _load_plans()
+    return plans['plans'][-max_n:]
+
 # --- Settings Persistence ---
 import argparse
 
@@ -613,6 +715,8 @@ LOCAL_TOOLS_SPEC = (
     "- read_file(file_path='...') — read a text file (first ~8KB)\n"
     "- write_file(file_path='...', content='...') — create/overwrite a file "
     "(parent dirs auto-created)\n"
+    "- edit_file(file_path='...', old_text='...', new_text='...') — replace "
+    "exact old_text with new_text in a file (use for targeted edits)\n"
     "- list_dir(dir_path='...') — list a directory (default: working dir)\n"
     "- make_dir(dir_path='...') — create a directory incl. parents\n"
     "- remove_path(path='...') — delete a file or directory tree\n"
@@ -621,6 +725,25 @@ LOCAL_TOOLS_SPEC = (
     "- glob(pattern='...'), grep_search(pattern='...'), "
     "web_search(query='...'), browse_url(url='...'), "
     "deep_research(topic='...')\n"
+    "QUICK ACTIONS — these invoke Ashen's multi-agent / meta capabilities "
+    "directly. Use them when the user's task benefits from structured "
+    "deliberation, memory, or planning:\n"
+    "- run_swarm(task='...', num_agents=3, mode='parallel') — spawn N "
+    "subagents (modes: parallel, divide, debate) and synthesize one "
+    "consolidated answer\n"
+    "- run_council(task='...', num_drafts=3, num_critics=3) — N proposer "
+    "drafts critiqued by M critics; the winner is refined into a final "
+    "answer\n"
+    "- self_improve(action='analyze|auto-tune|regenerate', text='...') — "
+    "analyze feedback history, auto-tune temperature, or regenerate an "
+    "answer with self-critique\n"
+    "- store_memory(key='...', value='...') — save a fact to persistent "
+    "memory so it can be recalled in later turns\n"
+    "- recall_memory(query='...') — search stored memory for relevant "
+    "facts\n"
+    "- create_plan(task='...') — break a complex task into an ordered "
+    "step-by-step plan, then return it\n"
+    "- quick_actions() — list the quick-action tools available (no args)\n"
     "After the [OBSERVATION] arrives, continue reasoning and answer. "
     "Never invent tool output."
 )
@@ -2048,7 +2171,7 @@ class AshenAIAgenticEngine:
     def update_settings(self, settings):
         # Move all globals to top
         global m, device
-        
+
         self.temperature = float(settings.get('temperature', self.temperature))
         self.top_k = int(settings.get('top_k', self.top_k))
         self.top_p = float(settings.get('top_p', self.top_p))
@@ -2056,13 +2179,13 @@ class AshenAIAgenticEngine:
         self.context_length = int(settings.get('context_length', self.context_length))
         self.gpu_layers = int(settings.get('gpu_layers', self.gpu_layers))
         self.repeat_penalty = float(settings.get('repeat_penalty', self.repeat_penalty))
-        
+
         # Add draft model support
         if 'use_draft_model' in settings:
             self.use_draft_model = bool(settings['use_draft_model'])
         if 'draft_temperature' in settings:
             self.draft_temperature = float(settings['draft_temperature'])
-        
+
         # Low-end GPU optimization settings
         if 'low_end_gpu_mode' in settings:
             self.low_end_gpu_mode = bool(settings['low_end_gpu_mode'])
@@ -2074,6 +2197,10 @@ class AshenAIAgenticEngine:
             self.allow_file_tools = bool(settings['allow_file_tools'])
         if 'allow_shell_tools' in settings:
             self.allow_shell_tools = bool(settings['allow_shell_tools'])
+        if 'auto_swarm_council' in settings:
+            self.auto_swarm_council = bool(settings['auto_swarm_council'])
+        if 'auto_web_research' in settings:
+            self.auto_web_research = bool(settings['auto_web_research'])
 
         # Apply precision setting after updating values
         try:
@@ -2425,6 +2552,129 @@ class AshenAIAgenticEngine:
 
                 except Exception as e:
                     return f"Deep research error: {str(e)}"
+
+            elif tool_name == 'run_swarm':
+                task = kwargs.get('task', '')
+                num_agents = int(kwargs.get('num_agents', 3))
+                mode = kwargs.get('mode', 'parallel')
+                if not task.strip():
+                    return "Error: run_swarm needs task='...'."
+                try:
+                    result = _run_swarm(task, num_agents=num_agents, mode=mode)
+                    synth = result.get('synthesis', {})
+                    return f"Swarm synthesis ({result.get('num_agents', '?')} agents, {result.get('mode', '?')}, {result.get('elapsed_s', '?')}s):\n\n{synth.get('response', '(empty)')}"
+                except Exception as e:
+                    return f"Error: run_swarm failed: {e}"
+
+            elif tool_name == 'run_council':
+                task = kwargs.get('task', '')
+                num_drafts = int(kwargs.get('num_drafts', 3))
+                num_critics = int(kwargs.get('num_critics', 3))
+                if not task.strip():
+                    return "Error: run_council needs task='...'."
+                try:
+                    result = _run_council(task, num_drafts=num_drafts, num_critics=num_critics)
+                    final = result.get('final', {})
+                    winner = result.get('winner', {})
+                    return (f"Council final (winner Draft {winner.get('id', '?')}/{winner.get('role', '?')}, "
+                            f"{result.get('num_drafts', '?')} drafts, {result.get('num_critics', '?')} critics, "
+                            f"{result.get('elapsed_s', '?')}s):\n\n{final.get('response', '(empty)')}")
+                except Exception as e:
+                    return f"Error: run_council failed: {e}"
+
+            elif tool_name == 'self_improve':
+                action = kwargs.get('action', 'analyze')
+                text = kwargs.get('text', '')
+                if action == 'analyze':
+                    log = _load_improvement_log()
+                    sugg = log.get('suggestions', [])
+                    stats = log.get('stats', {})
+                    lines = [f"Self-improvement stats: {stats}"]
+                    if sugg:
+                        lines.append("\nRecent suggestions:")
+                        for s in sugg[-8:]:
+                            lines.append(f"  - {s.get('text', '')[:140]}")
+                    return "\n".join(lines) if lines else "No feedback history yet."
+                elif action == 'auto-tune':
+                    up = _self_improvement_stats['up']
+                    down = _self_improvement_stats['down']
+                    if up + down >= 3:
+                        if down > up:
+                            new_t = max(0.3, round(settings['temperature'] - 0.05, 2))
+                        else:
+                            new_t = min(1.2, round(settings['temperature'] + 0.02, 2))
+                        settings['temperature'] = new_t
+                        save_settings_to_json({'temperature': new_t})
+                        reasoner.update_settings({'temperature': new_t})
+                        _self_improvement_stats['auto_tunes'] += 1
+                        return f"Auto-tuned temperature -> {new_t}"
+                    return "Not enough feedback to auto-tune (need >=3 ratings)."
+                elif action == 'regenerate':
+                    if not text.strip():
+                        return "Error: self_improve regenerate needs text='...'."
+                    thought, ans = reasoner.solve_with_agent(
+                        f"Regenerate with self-critique: be more direct and relevant.\n\n{text}")
+                    return f"<think>\n{thought}\n</think>\n\n{ans}"
+                else:
+                    return "Error: self_improve action must be analyze|auto-tune|regenerate."
+
+            elif tool_name == 'store_memory':
+                key = kwargs.get('key', '')
+                value = kwargs.get('value', '')
+                if not key.strip():
+                    return "Error: store_memory needs key='...'."
+                memory_store(key, value)
+                return f"Stored memory key '{key}' ({len(value)} chars)."
+
+            elif tool_name == 'recall_memory':
+                query = kwargs.get('query', '')
+                results = memory_recall(query, max_results=5)
+                if not results:
+                    return f"No memory entries matching '{query}'."
+                lines = [f"Memory recall for '{query}' ({len(results)} results):"]
+                for r in results:
+                    v = r.get('value', '')[:200]
+                    lines.append(f"  - [{r.get('key', '?')}] {v}")
+                return "\n".join(lines)
+
+            elif tool_name == 'create_plan':
+                task = kwargs.get('task', '')
+                if not task.strip():
+                    return "Error: create_plan needs task='...'."
+                plan_prompt = (
+                    f"Break this task into a clear, ordered step-by-step plan. "
+                    f"Output EXACTLY as:\nPLAN: <title>\n1. <step one>\n2. <step two>\n...\n"
+                    f"Keep steps concrete and actionable.\n\nTask: {task}"
+                )
+                try:
+                    thought, plan_text = reasoner.solve_with_agent(plan_prompt)
+                except Exception as e:
+                    return f"Error: create_plan failed: {e}"
+                title = task[:80]
+                steps = []
+                for line in plan_text.splitlines():
+                    lm = re.match(r'^(?:\d+[\.\):])\s+(.+)', line.strip())
+                    if lm:
+                        steps.append(lm.group(1).strip())
+                    elif line.strip().upper().startswith('PLAN:'):
+                        title = line.strip()[5:].strip()[:80]
+                if not steps:
+                    steps = [plan_text.strip()[:200]] if plan_text.strip() else ["(no steps generated)"]
+                entry = plan_store(title, steps, source='ai')
+                step_block = "\n".join(f"{i+1}. {s}" for i, s in enumerate(steps))
+                return f"Plan created: {title}\n\n{step_block}"
+
+            elif tool_name == 'quick_actions':
+                return (
+                    "Quick actions available:\n"
+                    "- run_swarm(task='...', num_agents=3, mode='parallel|divide|debate')\n"
+                    "- run_council(task='...', num_drafts=3, num_critics=3)\n"
+                    "- self_improve(action='analyze|auto-tune|regenerate', text='...')\n"
+                    "- store_memory(key='...', value='...')\n"
+                    "- recall_memory(query='...')\n"
+                    "- create_plan(task='...')\n"
+                    "- quick_actions()"
+                )
 
             elif tool_name == 'run_benchmark':
                 """Run LLM benchmark tests across multiple categories and score performance."""
