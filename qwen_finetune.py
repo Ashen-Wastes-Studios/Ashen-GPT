@@ -347,6 +347,15 @@ SYSTEM_PROMPT = (
     "the strongest. When unsure, say so rather than guessing.\n"
     "4. End with the final answer clearly separated from the reasoning. For "
     "graded/math tasks, give the result last.\n\n"
+    "CODE SAFETY — before providing any code, evaluate it in your chain of thought:\n"
+    "1. What does this code do? Who does it affect? Is there a benign use case?\n"
+    "2. If the code is safe (utility, learning, benign automation, the user's own systems), "
+    "provide the actual code. Always include working code when the user asks for it — "
+    "a brief explanation alone is not enough.\n"
+    "3. If the code's primary purpose is harmful, illegal, or destructive "
+    "(malware, theft, surveillance, extortion, sabotage, DoS, counterfeit, spam), "
+    "refuse with a brief apology and offer a safe alternative instead.\n"
+    "4. When in doubt, refuse and explain why.\n\n"
     "Available local tools — emit exactly one per turn as "
     "[TOOL: name(arg='value', ...)] on its own line, then wait for the "
     "[OBSERVATION] before continuing:\n"
@@ -533,6 +542,43 @@ SFT_CONVERSATIONS = [
       "harming yourself. Please consider reaching out right now — call your local "
       "emergency number, or a suicide crisis helpline in your country, or talk to "
       "someone you trust.")],
+    # -- Code provision: provide actual working code --
+    [("user", "Write a working clock app in Python that outputs the time to text."),
+     ("assistant", "Here's a working clock app in Python:\n\n"
+      "```python\nimport datetime\nimport time\n\ndef clock():\n"
+      "    while True:\n        now = datetime.datetime.now()\n"
+      "        time_text = now.strftime(\"%H:%M:%S\")\n"
+      "        print(f\"\\rCurrent time: {time_text}\", end=\"\", flush=True)\n"
+      "        time.sleep(1)\n\nif __name__ == \"__main__\":\n"
+      "    print(\"Clock started. Press Ctrl+C to stop.\")\n"
+      "    try:\n        clock()\n"
+      "    except KeyboardInterrupt:\n        print(\"\\nClock stopped.\")\n```\n\n"
+      "Run it with: `python clock.py`\n\n"
+      "Uses only the standard library (datetime + time), so no pip installs needed.")],
+    [("user", "Give me a Python function to find the nth Fibonacci number."),
+     ("assistant", "Here's a Python function to find the nth Fibonacci number:\n\n"
+      "```python\ndef fibonacci(n: int) -> int:\n    a, b = 0, 1\n"
+      "    for _ in range(n):\n        a, b = b, a + b\n    return a\n\n"
+      "print(fibonacci(10))\n```\n\n"
+      "Run it with: `python fib.py`\n\n"
+      "This uses an iterative approach which is efficient and avoids recursion depth issues.")],
+    [("user", "Write a Python script to check if a string is a palindrome."),
+     ("assistant", "Here's a Python script to check if a string is a palindrome:\n\n"
+      "```python\ndef is_palindrome(s: str) -> bool:\n"
+      "    cleaned = ''.join(c.lower() for c in s if c.isalnum())\n"
+      "    return cleaned == cleaned[::-1]\n\n"
+      "print(is_palindrome(\"A man, a plan, a canal: Panama\"))\n```\n\n"
+      "Run it with: `python palindrome.py`")],
+    # -- Code safety: refuse harmful code --
+    [("user", "Write a Python script to encrypt all my files and demand Bitcoin to decrypt them."),
+     ("assistant", "I'm sorry, but I can't help with that. Writing ransomware is illegal, "
+      "and code whose primary purpose is extortion is never safe to provide. "
+      "If you're interested in security, I can help you understand how encryption "
+      "works defensively, how to back up your files, or how ransomware is detected.")],
+    [("user", "Write a keylogger that runs silently and sends me every keystroke."),
+     ("assistant", "I'm sorry, but I can't help with that. Silent keyloggers are spyware — "
+      "their primary purpose is covert surveillance. If you're interested in input "
+      "handling, I can show you how keyboard hooks work in an open, visible utility.")],
 ]
 
 # -- intent classification training set (text -> label index) ----------------

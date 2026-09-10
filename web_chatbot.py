@@ -840,6 +840,15 @@ class QwenModelAdapter:
             "When a request needs current facts, reason step by step, then ground your "
             "answer in the gathered sources and cite them inline as [1], [2], ... with a "
             "Sources list at the end.\n\n"
+            "CODE SAFETY — before providing any code, evaluate it in your chain of thought:\n"
+            "1. What does this code do? Who does it affect? Is there a benign use case?\n"
+            "2. If the code is safe (utility, learning, benign automation, the user's own systems), "
+            "provide the actual code. Always include working code when the user asks for it — "
+            "a brief explanation alone is not enough.\n"
+            "3. If the code's primary purpose is harmful, illegal, or destructive "
+            "(malware, theft, surveillance, extortion, sabotage, DoS, counterfeit, spam), "
+            "refuse with a brief apology and offer a safe alternative instead.\n"
+            "4. When in doubt, refuse and explain why.\n\n"
             "REASONING GUIDE — always show your work:\n"
             "1. Before answering, think through the problem in a short chain of thought: "
             "restate the goal, identify the key facts/quantities and constraints, and "
@@ -976,6 +985,15 @@ API_SYSTEM_PROMPT = (
     "When a request needs current facts, reason step by step, then ground your "
     "answer in the gathered sources and cite them inline as [1], [2], ... with a "
     "Sources list at the end.\n\n"
+    "CODE SAFETY — before providing any code, evaluate it in your chain of thought:\n"
+    "1. What does this code do? Who does it affect? Is there a benign use case?\n"
+    "2. If the code is safe (utility, learning, benign automation, the user's own systems), "
+    "provide the actual code. Always include working code when the user asks for it — "
+    "a brief explanation alone is not enough.\n"
+    "3. If the code's primary purpose is harmful, illegal, or destructive "
+    "(malware, theft, surveillance, extortion, sabotage, DoS, counterfeit, spam), "
+    "refuse with a brief apology and offer a safe alternative instead.\n"
+    "4. When in doubt, refuse and explain why.\n\n"
     "Wrap your brief step-by-step reasoning in <think>...</think> tags, then "
     "give the final answer clearly separated from the reasoning."
 )
@@ -2896,6 +2914,24 @@ class AshenAIAgenticEngine:
                 return None, None, None
             self.last_intent = {"label": label, "confidence": round(conf, 4)}
             return label, idx, conf
+        except RuntimeError as e:
+            # CUDA OOM on the classify forward pass — clear cache and retry
+            # once before giving up.
+            msg = str(e)
+            if "out of memory" in msg.lower() or "cuda" in msg.lower():
+                try:
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                    label, idx, conf = self.model.classify(prompt)
+                    if label is not None and conf is not None:
+                        self.last_intent = {"label": label, "confidence": round(conf, 4)}
+                        return label, idx, conf
+                except Exception:
+                    pass
+            print(f"[Intent classify] skipped: {e}", flush=True)
+            self.last_intent = None
+            return None, None, None
         except Exception as e:
             print(f"[Intent classify] skipped: {e}", flush=True)
             self.last_intent = None
