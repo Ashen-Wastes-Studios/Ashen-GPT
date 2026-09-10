@@ -84,6 +84,8 @@ secrets.json
 *.txt
 !vocab.txt
 
+ashen_reactor.py
+
 *.pk1
 *.bak
 *.zip
@@ -98,3 +100,5 @@ ashen_gpt_model/
 oauth_tokens.json
 
 LICENSE-LLVM-OpenMP
+
+*.png
