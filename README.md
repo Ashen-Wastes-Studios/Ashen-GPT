@@ -1,8 +1,8 @@
 # Ashen GPT
 
 Ashen GPT is a local, self-hosted AI assistant that runs entirely on consumer hardware
-(8 GB+ VRAM). It pairs **two model pipelines** with **two user interfaces** that share the
-same backend behaviors:
+(8 GB+ VRAM). It pairs **two model pipelines** with **three user interfaces** that share
+the same backend behaviors:
 
 - **Qwen3.5 fine-tune pipeline** (`qwen_finetune.py`) — the default/active model
   (`ashen_gpt_model/`, a LoRA fine-tune of Qwen3.5-0.8B emitted as a merged HuggingFace
@@ -11,7 +11,7 @@ same backend behaviors:
   Qwen-style MoE trained on the book-code corpus, saved as `ashen_gpt_model.pk1`. Still
   supported and swappable via Model Hub / `/model`.
 
-Two front-ends, identical capabilities:
+Three front-ends, identical capabilities:
 
 - **`chatbot.py`** — a single-file terminal (CLI) chatbot. Self-contained: it folds the
   full Qwen/engine/swarm/council/research/settings backend into one file with **zero
@@ -19,10 +19,14 @@ Two front-ends, identical capabilities:
 - **`web_chatbot.py`** — a browser UI (stdlib `http.server`, `http://localhost:5000`)
   with a cyberpunk theme, Model Hub, live-streaming chain-of-thought, swarm/council, and a
   self-improvement dashboard.
+- **`ashen_reactor.py`** — a Twitch chat + microphone + screen-vision reactor. Imports the
+  already-loaded model from `chatbot.py` (single VRAM copy) and runs a low-latency loop
+  that answers prompts from Twitch chat, voice (Google STT), and autonomous screen-capture
+  reactions. `ashen_gpt_model`-exclusive.
 
-Both front-ends route generation through the same `QwenModelAdapter` (and, for the legacy
+All front-ends route generation through the same `QwenModelAdapter` (and, for the legacy
 model, the same `AshenAIAgenticEngine`), so behavior — reasoning, tool calls, citations,
-CoT display — is consistent across CLI and web.
+CoT display — is consistent across CLI, web, and reactor.
 
 ---
 
@@ -67,6 +71,9 @@ CoT display — is consistent across CLI and web.
 | `flash-attn` | ≥2.5 | Faster attention (requires build) |
 | `xformers` | ≥0.0.27 | Memory-efficient attention |
 | `wandb` | ≥0.17 | Experiment tracking (if enabled) |
+| `Pillow` | ≥10.0 | Image capture for reactor screen OCR |
+| `easyocr` | ≥1.7 | Screen text extraction (reactor vision) |
+| `speech_recognition` | ≥3.10 | Microphone STT (reactor mic input) |
 
 ### One-Line Install (Bundled CUDA Venv)
 
@@ -102,6 +109,9 @@ python -m pip install gguf llama-cpp-python
 
 # Utilities
 python -m pip install numpy pyyaml
+
+# Reactor-only deps (optional)
+python -m pip install Pillow easyocr speech_recognition
 ```
 
 ### Building `llama.cpp` Tools (for GGUF Quantization)
@@ -118,7 +128,7 @@ cmake --build . --config Release -j
 # Produces: llama-quantize.exe, convert_hf_to_gguf.py (in parent convert dir)
 ```
 
-> **Windows note:** Pre-built `llama-quantize.exe` is committed at repo root for convenience. The auto-downloader fetches release binaries if the build step is skipped.
+> **Windows note:** Pre-built `convert_hf_to_gguf.py` is committed at `tools/llama.cpp/`. The auto-downloader fetches release binaries if the build step is skipped.
 
 ### Verification Checklist
 
@@ -166,6 +176,7 @@ All imports OK
 | **Activate bundled venv** | `call cuda\Scripts\activate.bat` |
 | **Run web chatbot** | `python web_chatbot.py` → http://localhost:5000 |
 | **Run CLI chatbot** | `python chatbot.py` |
+| **Run reactor** | `python ashen_reactor.py` (Twitch + mic + screen) |
 | **Fine-tune Qwen (LoRA bf16)** | `python qwen_finetune.py` |
 | **Fine-tune + GGUF Q4_K_M export** | `set QWEN_GGUF=1 && set QWEN_GGUF_QUANT=Q4_K_M && python qwen_finetune.py` |
 | **Legacy pre-training** | `python ashen_gpt_trainer.py` |
@@ -223,10 +234,30 @@ cuda\Scripts\python.exe chatbot.py
 
 **Slash commands** (type `/help` in-app for the full, current list):
 
-`/clear` · `/help` · `/exit` · `/models` · `/model <path>` · `/settings [k=v]` ·
-`/persona <name>` · `/swarm` · `/council` · `/research <topic>` · `/websearch <query>` ·
-`/selfimprove` · `/up` `/down` · `/sessions` · `/workspace` · `/cd` `/pwd` ·
-`/auto-swarm` `/auto-research` · `/cyber on|off` · `/benchmark`
+```
+/clear  /help  /exit
+/models  /model <path>  /backend [local|api]
+/api-provider <name|url>  /api-key <key|clear>
+/api-models  /api-use <model-id>
+/login [openrouter|google|anthropic]  /logout [provider]  /account
+/settings [k=v]  /persona <name>
+/swarm [--agents N --mode M] <task>
+/council [--drafts N --critics M] <task>
+/research <topic>  /websearch <q>
+/read <path>  /write <path> <text...>
+/ls [path]  /mkdir <path>  /rm <path>  /run <command...>
+/tools
+/memory recall <q> | store <key> <val> | all
+/plan <task>  /plans
+/selfimprove analyze|auto-tune|regenerate <text>
+/up  /down
+/sessions  /new  /load <id>  /delete <id>  /rename <name>
+/workspace <path>  /wctx off
+/cd <path>  /pwd
+/auto-swarm on|off  /auto-research on|off
+/cyber on|off
+/benchmark
+```
 
 #### Cybernetic theme & pinned input box
 - **Cybernetic theme** — neon / box-drawing terminal UI (toggle with `/cyber on|off`, or set
@@ -265,7 +296,35 @@ CoT is gray and the final answer is white — same semantics as the web chatbot'
   into the system prompt so the agent knows which files you're looking at.
 - **Agent tools (via `[TOOL: name(args)]`)** — `read_file`, `write_file`, `glob`,
   `grep_search`, `run_shell_command`, `web_search`, `browse_url`,
-  `deep_research(topic, max_searches)`.
+  `deep_research(topic, max_searches)`, `store_memory(key, value)`,
+  `recall_memory(query)`.
+
+#### Persistent memory & planning
+- **Persistent memory** — `/memory store <key> <value>` saves a fact to `memory.json`;
+  `/memory recall <q>` searches stored entries by keyword overlap; `/memory all` lists
+  everything. Also available as agent tools `store_memory` / `recall_memory` so the model
+  can remember things autonomously across turns.
+- **Planning** — `/plan <task>` asks the model to generate a step-by-step plan and stores
+  it in `plans.json`. `/plans` lists saved plans. Plans are also generated when the model
+  invokes the `plan` tool during reasoning.
+
+#### API provider backend (`/backend`, `/login`, `/api-provider`)
+The CLI can switch between two answering backends:
+- **`local`** (default) — the loaded model weights answer directly.
+- **`api`** — an external OpenAI-compatible provider answers using your API key or OAuth
+  token. Configure via:
+  - `/login openrouter|google|anthropic` — OAuth browser login (token stored in
+    `oauth_tokens.json`, gitignored).
+  - `/api-provider <name|url>` — set a preset (`openrouter`, `google`, `anthropic`,
+    `mistral`, `groq`, `together`) or a custom OpenAI-compatible base URL.
+  - `/api-key <key>` — paste an API key directly (masked in display; `ASHEN_API_KEY` env
+    takes precedence).
+  - `/api-models` — list all models available under the provider.
+  - `/api-use <model-id>` — switch to answering through a specific API model while keeping
+    the local install intact.
+  - `/backend local|api` — flip the active backend.
+  - `/account` — show active provider logins and backend.
+  - `/logout [provider]` — drop a provider login.
 
 ### Web Chatbot (`web_chatbot.py`) — Cyberpunk UI
 
@@ -284,7 +343,7 @@ cuda\Scripts\python.exe web_chatbot.py --port 5000 --host localhost
 - **Persona switcher** — *Ashen AI Agent*, *Code Architect*, *Cyber Companion*.
 - **Model Hub modal** — browse local `.pk1`/`.gguf` checkpoints **and Qwen HuggingFace
   dirs** (e.g. `ashen_gpt_model/`, auto-tagged `QWEN`), upload weights, swap models live.
-  GGUF alternatives (e.g. `Jackrong_Qwopus3.5-9B-coder-Exp-Q3_K_M.gguf`) are switchable here.
+  GGUF alternatives are switchable here.
 - **Quick-action chips** — one-click buttons for common tools (*File Glob*, *Grep*,
   *Git Status*, *Run Tests*, *Web Search*, *Browse URL*, *Deep Research*).
 - **Live CoT streaming** — `POST /api/chat/stream` returns NDJSON
@@ -312,12 +371,23 @@ never wipe `current_model`.
 
 | Key | Default | Notes |
 |---|---|---|
-| `temperature` | `0.70` | |
+| `temperature` | `0.7` | |
 | `top_k` / `top_p` | `40` / `0.9` | |
 | `max_new_tokens` / `context_length` | `250` / `8192` | |
 | `gpu_layers` / `precision` / `cpu_offload_layers` | `16` / `fp16` / `0` | |
-| `current_model` | `ashen_gpt_model.pk1` — or an HF dir like `ashen_gpt_model` (Qwen3.5) | |
+| `low_end_gpu_mode` | `false` | Enables CPU offload + lower VRAM presets |
+| `use_draft_model` | `false` | Speculative decoding with a draft model |
 | `show_chain_of_thought` | `true` | |
+| `current_model` | `ashen_gpt_model.pk1` (legacy) — or `ashen_gpt_model/` after fine-tune | |
+| `active_backend` | `local` | `local` = weights, `api` = provider |
+| `api_provider` | `""` | `openrouter`, `google`, `anthropic`, `mistral`, `groq`, `together`, or `custom` |
+| `api_base_url` | `""` | Custom OpenAI-compatible base URL when provider is `custom` |
+| `api_key` | `""` | Masked; `ASHEN_API_KEY` env takes precedence |
+| `api_model` | `""` | Model ID for the provider |
+| `auto_swarm_council` | `false` | |
+| `auto_web_research` | `false` | |
+| `allow_file_tools` | `true` | |
+| `allow_shell_tools` | `true` | |
 
 #### Self-improvement loop, Swarm, and Council
 - **Self-improvement** — file-based (no DB): `feedback.json` (last 500 ratings) +
@@ -335,6 +405,55 @@ never wipe `current_model`.
 Built-in evaluation across 5 categories (Knowledge, Code Generation, Math Reasoning,
 Language Understanding, Ethics & Safety) with 12 standardized questions and a letter grade.
 Trigger via `[TOOL: run_benchmark()]` or the web **Run Benchmark** button (~30–60 s).
+
+---
+
+### Ashen Reactor (`ashen_reactor.py`) — Twitch + Speech + Vision
+
+```cmd
+run_reactor.bat
+:: or
+cuda\Scripts\python.exe ashen_reactor.py
+```
+
+A separate chatbot entry point that imports the already-loaded model from `chatbot.py`
+(single VRAM copy) and runs a **reactor loop** that pulls prompts from three concurrent
+sources:
+
+1. **Twitch chat** — raw-socket IRC monitor (`irc.chat.twitch.tv:6697`, TLS) that enqueues
+   every `PRIVMSG` from the target channel. Uses anonymous `justinfan` NICK (no OAuth needed
+   for reading). Optional `--twitch-oauth` enables sending replies.
+2. **Microphone** — `speech_recognition` + Google STT listens continuously and enqueues
+   recognized utterances.
+3. **Screen capture** — background thread grabs the screen every ~8s, runs EasyOCR to extract
+   visible text, and an autonomous `ScreenReactor` thread enqueues reaction prompts when the
+   screen changes (with a cooldown to avoid spam).
+
+Each dequeued prompt is fed to a **fast, entertaining solve path** that:
+- uses a custom short system prompt (streamer personality, witty, roasty)
+- skips the multi-step agentic tool loop (low latency)
+- clears history each turn (no context bloat)
+- caps tokens low (short, snappy responses, default 120)
+- auto-classifies factual questions and injects Bing search results via `[SEARCH: query]`
+- includes the latest OCR screen text for context-aware reactions
+
+**Model exclusivity:** `ashen_reactor.py` is `ashen_gpt_model`-exclusive — it refuses to run
+if the loaded model is anything other than the `ashen_gpt_model` directory or `.pk1`
+checkpoint.
+
+**CLI flags:**
+```
+--channel <name>          Twitch channel (default: nicktouey_gaming)
+--twitch-oauth <token>    OAuth token to send to chat (reading is anonymous)
+--twitch-nick <nick>      Nickname when --twitch-oauth is set
+--no-mic                  Disable microphone input
+--no-twitch               Disable Twitch chat monitoring
+--no-screen               Disable screen capture and reaction
+--screen-interval <n>     Seconds between screen captures (default: 15)
+--screen-cooldown <n>     Minimum seconds between screen reactions (default: 30)
+--max-tokens <n>          Max generated tokens per response (default: 120)
+--temperature <f>         Sampling temperature (default: 0.85)
+```
 
 ---
 
@@ -361,6 +480,10 @@ activations fits comfortably in 8.59 GB; a full bf16 fine-tune would not.
   chain-of-thought prints **in gray**, flips to **white** when the model reaches its answer,
   and flushes every token so you watch it in real time. The plain-text reply is also written
   to `training_logs.txt`.
+- **GGUF export** — every run also exports the merged checkpoint as a quantized GGUF file
+  (default `ashen_gpt_model-Q4_K_M.gguf`) via the llama.cpp converter + `llama-quantize`.
+  Disable with `QWEN_GGUF=0`; change type with `QWEN_GGUF_QUANT=Q8_0`; export an existing
+  checkpoint without training via `--export-gguf-only [hf_dir] [out.gguf]`.
 - **Key knobs (env vars):**
   - `QWEN_ITERS` — training iterations (default `200`)
   - `QWEN_EVAL_EVERY` — eval/stream cadence (default `20`)
@@ -373,6 +496,7 @@ activations fits comfortably in 8.59 GB; a full bf16 fine-tune would not.
   - `QWEN_KV_CAP` / `QWEN_GEN_CAP` — inference-time VRAM caps (default `2048` / `512`)
   - `QWEN_EVAL_PROMPT` / `QWEN_PROMPT_POOL` — override the eval prompt (single / `|||`-joined)
   - `QWEN_SFT_JSONL` / `QWEN_CLS_JSONL` — paths to SFT / classification data
+  - `QWEN_GGUF` / `QWEN_GGUF_QUANT` / `QWEN_GGUF_OUT` — GGUF export control (see above)
 - **Width-upscale on resume** — hidden size is widened by √2 (copy-init, depth unchanged) so
   a resumed run grows capacity without retraining from scratch.
 - **Checkpoints** — `save_checkpoint()` merges LoRA via `merge_and_unload()` into a plain
@@ -411,8 +535,6 @@ run_ashen_gpt.bat
 
 - **Literature** — `train_split.txt` / `val_split.txt` (raw-text book corpus).
 - **Code** — `code_train_split.txt` (scraped public GitHub source).
-- **SFT / classification** — `qwen_finetune.py` consumes `sft_data.jsonl` /
-  `cls_data.jsonl` for reasoning + intent-routing examples.
 - Memory-mapped streaming (`mmap.mmap`) for O(1) RAM regardless of dataset size; the Qwen
   trainer selects between text and code splits during training.
 
@@ -432,6 +554,7 @@ run_ashen_gpt.bat
 | `qwen_finetune.py` | LoRA bf16 fine-tune + width-upscale the Qwen3.5 checkpoint (`ashen_gpt_model/`) | `cuda\Scripts\python.exe qwen_finetune.py` / `run_qwen_finentuner.bat` |
 | `chatbot.py` | Terminal-based agentic chatbot | `python chatbot.py` / `run_chatbot.bat` |
 | `web_chatbot.py` | Browser-based cyberpunk UI (port 5000) | `python web_chatbot.py` / `run_web_chatbot.bat` |
+| `ashen_reactor.py` | Twitch + speech + vision reactor | `python ashen_reactor.py` / `run_reactor.bat` |
 
 **Web chatbot examples:**
 
@@ -457,29 +580,43 @@ set SETTINGS_PATH=C:\path\to\settings.json && python web_chatbot.py
 ## Project Structure
 
 ```
-qwen_finetune.py       # LoRA (bf16) fine-tune of Qwen3.5 -> ashen_gpt_model/; width-upscale on resume; tees training_logs.txt
+qwen_finetune.py       # LoRA (bf16) fine-tune of Qwen3.5 -> ashen_gpt_model/; width-upscale on resume; GGUF export
 ashen_gpt_trainer.py   # Legacy custom MoE pre-training -> ashen_gpt_model.pk1; Tee stdout -> training_logs.txt
 run_qwen_finetuner.bat # Windows launcher for qwen_finetune.py (cuda venv)
 run_ashen_gpt.bat      # Windows launcher for ashen_gpt_trainer.py
 chatbot.py             # Self-contained CLI chatbot (no import of web_chatbot.py)
 web_chatbot.py         # Browser cyberpunk UI (stdlib http.server, port 5000)
+ashen_reactor.py       # Twitch + speech-to-text + screen-vision reactor (ashen_gpt_model exclusive)
 run_chatbot.bat        # Windows launcher for chatbot.py
 run_web_chatbot.bat    # Windows launcher for web_chatbot.py
+run_reactor.bat        # Windows launcher for ashen_reactor.py
 ashen_gpt_model/       # Default model (Qwen3.5 fine-tune, HF format): config.json + safetensors + class_head.pt
 ashen_gpt_model.pk1    # Legacy custom MoE model (~127M params, 8K context)
-ashen_gpt_model_lora/  # Adapter-only LoRA checkpoint from qwen_finetune.py
+ashen_gpt_model_dpo.pk1# DPO-aligned variant of the legacy model
 settings.json          # Generation + display config (resolved via __file__)
 feedback.json          # Last 500 user ratings (👍/👎 + corrections)
 self_improvement.json  # {stats, log, suggestions} — swarm/council/gibberish_fix/regenerate/auto_tune entries
+memory.json            # Persistent memory entries {key, value, ts} for /memory
+plans.json             # Stored step-by-step plans for /plan
+oauth_tokens.json      # Provider OAuth tokens (gitignored)
 training_logs.txt      # Auto-generated training log (terminal + this file, ANSI-stripped)
 sessions/              # Web chatbot sessions (JSON: history, settings, workspace context)
 sessions_cli/          # CLI chatbot sessions (JSON: history, workspace context)
 train_split.txt        # Literature training data
 val_split.txt          # Validation data
 code_train_split.txt   # Scraped code training data
-sft_data.jsonl         # Qwen SFT reasoning examples
-cls_data.jsonl         # Intent-classification examples
-run_*.bat              # Windows launch scripts
+memory/project/        # Project memory (MEMORY.md + hybrid-code-training.md)
+scripts/               # Offline verification scripts (AST-extract + exec with stubs)
+  verify_gguf_export.py      # Tests GGUF export block without model load / network
+  verify_legal_refusal.py    # Tests refusal filter for illegal/harmful requests
+  verify_local_tools.py      # Tests file/shell/web tools with stubbed I/O
+tools/llama.cpp/       # GGUF conversion tools (convert_hf_to_gguf.py committed; llama-quantize auto-downloaded)
+web_chatbot/           # Web chatbot support files
+  search_fn_fragment.py # Reference search function fragment
+cuda/                  # Bundled CUDA virtualenv (gitignored)
+Qwen_Qwen3.5-0.8B/     # Upstream Qwen3.5 base model (gitignored)
+vocab.txt              # GPT-2 BPE vocabulary (legacy model tokenizer)
+*.ipynb                # Jupyter notebooks (ashen-gpt, bigram, torch-examples)
 ```
 
 **Key web endpoints** (served by the stdlib `http.server` `ChatHandler`; unknown paths → 404):
@@ -535,13 +672,13 @@ run_*.bat              # Windows launch scripts
 | `GET` | `/api/feedback` | Last 50 feedback entries |
 | `GET` | `/api/self-improve` | `{stats, entries[-20], suggestions[-10], feedback_recent, gibberish_rate}` |
 | `POST` | `/api/feedback` | `{rating, prompt, response, thought, correction, model}` |
-| `POST` | `/api/self-improve` | `{action: regenerate\|auto-tune\|analyze, run_benchmark}` |
+| `POST` | `/api/self-improve` | `{action: regenerate|auto-tune|analyze, run_benchmark}` |
 
 *Swarm*
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/api/swarm` | `{roles[6], recent_runs, model, model_path}` |
-| `POST` | `/api/swarm` | `{task\|prompt, num_agents:2-6, mode}` → `{agents, synthesis, elapsed_s}` |
+| `POST` | `/api/swarm` | `{task|prompt, num_agents:2-6, mode}` → `{agents, synthesis, elapsed_s}` |
 | `POST` | `/api/swarm/stream` | Live `swarm_start → agent_* → synthesis_* → done` |
 
 *Council*
