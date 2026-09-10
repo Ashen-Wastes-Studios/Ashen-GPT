@@ -1,7 +1,7 @@
 # Ashen GPT
 
 Ashen GPT is a local, self-hosted AI assistant that runs entirely on consumer hardware
-(8 GB+ VRAM). It pairs **two model pipelines** with **three user interfaces** that share
+(8 GB+ VRAM). It pairs **two model pipelines** with **two user interfaces** that share
 the same backend behaviors:
 
 - **Qwen3.5 fine-tune pipeline** (`qwen_finetune.py`) — the default/active model
@@ -11,7 +11,7 @@ the same backend behaviors:
   Qwen-style MoE trained on the book-code corpus, saved as `ashen_gpt_model.pk1`. Still
   supported and swappable via Model Hub / `/model`.
 
-Three front-ends, identical capabilities:
+Two front-ends, identical capabilities:
 
 - **`chatbot.py`** — a single-file terminal (CLI) chatbot. Self-contained: it folds the
   full Qwen/engine/swarm/council/research/settings backend into one file with **zero
@@ -19,14 +19,11 @@ Three front-ends, identical capabilities:
 - **`web_chatbot.py`** — a browser UI (stdlib `http.server`, `http://localhost:5000`)
   with a cyberpunk theme, Model Hub, live-streaming chain-of-thought, swarm/council, and a
   self-improvement dashboard.
-- **`ashen_reactor.py`** — a Twitch chat + microphone + screen-vision reactor. Imports the
-  already-loaded model from `chatbot.py` (single VRAM copy) and runs a low-latency loop
-  that answers prompts from Twitch chat, voice (Google STT), and autonomous screen-capture
-  reactions. `ashen_gpt_model`-exclusive.
 
-All front-ends route generation through the same `QwenModelAdapter` (and, for the legacy
+Both front-ends route generation through the same `QwenModelAdapter` (and, for the legacy
 model, the same `AshenAIAgenticEngine`), so behavior — reasoning, tool calls, citations,
-CoT display — is consistent across CLI, web, and reactor.
+CoT display — is consistent across CLI and web.
+
 
 ---
 
@@ -71,9 +68,6 @@ CoT display — is consistent across CLI, web, and reactor.
 | `flash-attn` | ≥2.5 | Faster attention (requires build) |
 | `xformers` | ≥0.0.27 | Memory-efficient attention |
 | `wandb` | ≥0.17 | Experiment tracking (if enabled) |
-| `Pillow` | ≥10.0 | Image capture for reactor screen OCR |
-| `easyocr` | ≥1.7 | Screen text extraction (reactor vision) |
-| `speech_recognition` | ≥3.10 | Microphone STT (reactor mic input) |
 
 ### One-Line Install (Bundled CUDA Venv)
 
@@ -109,9 +103,6 @@ python -m pip install gguf llama-cpp-python
 
 # Utilities
 python -m pip install numpy pyyaml
-
-# Reactor-only deps (optional)
-python -m pip install Pillow easyocr speech_recognition
 ```
 
 ### Building `llama.cpp` Tools (for GGUF Quantization)
@@ -176,7 +167,6 @@ All imports OK
 | **Activate bundled venv** | `call cuda\Scripts\activate.bat` |
 | **Run web chatbot** | `python web_chatbot.py` → http://localhost:5000 |
 | **Run CLI chatbot** | `python chatbot.py` |
-| **Run reactor** | `python ashen_reactor.py` (Twitch + mic + screen) |
 | **Fine-tune Qwen (LoRA bf16)** | `python qwen_finetune.py` |
 | **Fine-tune + GGUF Q4_K_M export** | `set QWEN_GGUF=1 && set QWEN_GGUF_QUANT=Q4_K_M && python qwen_finetune.py` |
 | **Legacy pre-training** | `python ashen_gpt_trainer.py` |
@@ -408,55 +398,6 @@ Trigger via `[TOOL: run_benchmark()]` or the web **Run Benchmark** button (~30�
 
 ---
 
-### Ashen Reactor (`ashen_reactor.py`) — Twitch + Speech + Vision
-
-```cmd
-run_reactor.bat
-:: or
-cuda\Scripts\python.exe ashen_reactor.py
-```
-
-A separate chatbot entry point that imports the already-loaded model from `chatbot.py`
-(single VRAM copy) and runs a **reactor loop** that pulls prompts from three concurrent
-sources:
-
-1. **Twitch chat** — raw-socket IRC monitor (`irc.chat.twitch.tv:6697`, TLS) that enqueues
-   every `PRIVMSG` from the target channel. Uses anonymous `justinfan` NICK (no OAuth needed
-   for reading). Optional `--twitch-oauth` enables sending replies.
-2. **Microphone** — `speech_recognition` + Google STT listens continuously and enqueues
-   recognized utterances.
-3. **Screen capture** — background thread grabs the screen every ~8s, runs EasyOCR to extract
-   visible text, and an autonomous `ScreenReactor` thread enqueues reaction prompts when the
-   screen changes (with a cooldown to avoid spam).
-
-Each dequeued prompt is fed to a **fast, entertaining solve path** that:
-- uses a custom short system prompt (streamer personality, witty, roasty)
-- skips the multi-step agentic tool loop (low latency)
-- clears history each turn (no context bloat)
-- caps tokens low (short, snappy responses, default 120)
-- auto-classifies factual questions and injects Bing search results via `[SEARCH: query]`
-- includes the latest OCR screen text for context-aware reactions
-
-**Model exclusivity:** `ashen_reactor.py` is `ashen_gpt_model`-exclusive — it refuses to run
-if the loaded model is anything other than the `ashen_gpt_model` directory or `.pk1`
-checkpoint.
-
-**CLI flags:**
-```
---channel <name>          Twitch channel (default: nicktouey_gaming)
---twitch-oauth <token>    OAuth token to send to chat (reading is anonymous)
---twitch-nick <nick>      Nickname when --twitch-oauth is set
---no-mic                  Disable microphone input
---no-twitch               Disable Twitch chat monitoring
---no-screen               Disable screen capture and reaction
---screen-interval <n>     Seconds between screen captures (default: 15)
---screen-cooldown <n>     Minimum seconds between screen reactions (default: 30)
---max-tokens <n>          Max generated tokens per response (default: 120)
---temperature <f>         Sampling temperature (default: 0.85)
-```
-
----
-
 ## Training & Fine-Tuning
 
 There are **two** training entry points, one per model pipeline. Both tee their output to
@@ -554,7 +495,6 @@ run_ashen_gpt.bat
 | `qwen_finetune.py` | LoRA bf16 fine-tune + width-upscale the Qwen3.5 checkpoint (`ashen_gpt_model/`) | `cuda\Scripts\python.exe qwen_finetune.py` / `run_qwen_finentuner.bat` |
 | `chatbot.py` | Terminal-based agentic chatbot | `python chatbot.py` / `run_chatbot.bat` |
 | `web_chatbot.py` | Browser-based cyberpunk UI (port 5000) | `python web_chatbot.py` / `run_web_chatbot.bat` |
-| `ashen_reactor.py` | Twitch + speech + vision reactor | `python ashen_reactor.py` / `run_reactor.bat` |
 
 **Web chatbot examples:**
 
@@ -586,10 +526,8 @@ run_qwen_finetuner.bat # Windows launcher for qwen_finetune.py (cuda venv)
 run_ashen_gpt.bat      # Windows launcher for ashen_gpt_trainer.py
 chatbot.py             # Self-contained CLI chatbot (no import of web_chatbot.py)
 web_chatbot.py         # Browser cyberpunk UI (stdlib http.server, port 5000)
-ashen_reactor.py       # Twitch + speech-to-text + screen-vision reactor (ashen_gpt_model exclusive)
 run_chatbot.bat        # Windows launcher for chatbot.py
 run_web_chatbot.bat    # Windows launcher for web_chatbot.py
-run_reactor.bat        # Windows launcher for ashen_reactor.py
 ashen_gpt_model/       # Default model (Qwen3.5 fine-tune, HF format): config.json + safetensors + class_head.pt
 ashen_gpt_model.pk1    # Legacy custom MoE model (~127M params, 8K context)
 ashen_gpt_model_dpo.pk1# DPO-aligned variant of the legacy model
