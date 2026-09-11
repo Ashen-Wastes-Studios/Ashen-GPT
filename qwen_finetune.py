@@ -29,6 +29,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 from transformers import (AutoTokenizer, AutoModelForCausalLM,
                           Qwen3_5ForCausalLM)
+from transformers.models.qwen3_5.modeling_qwen3_5 import (Qwen3_5MLP,
+                                                        Qwen3_5DecoderLayer)
 from peft import LoraConfig, get_peft_model, PeftModel
 
 # --- paths -----------------------------------------------------------------
@@ -322,6 +324,229 @@ if os.environ.get("QWEN_LORA_TIER", "default").lower() == "full":
         "norm", "conv1d",
     ]
 LORA_BIAS = "lora_only" if os.environ.get("QWEN_LORA_BIAS", "0") == "1" else "none"
+
+# --- MoE (Mixture-of-Experts) ---------------------------------------------
+# Replace each layer's dense MLP with a sparse MoE: N experts, top-k routing.
+# Only the active experts compute per token, so parameter count grows without
+# a proportional compute increase. On the 3060 Ti we freeze base + experts and
+# train only the routers + LoRA adapters on expert projections (~5 GB VRAM).
+#
+#   QWEN_MOE = 1                    enable MoE
+#   QWEN_MOE_EXPERTS = 4            number of experts per layer
+#   QWEN_MOE_TOPK = 2               experts activated per token
+#   QWEN_MOE_AUX = 0.01             load-balancing aux-loss weight
+#   QWEN_MOE_EXPERT_DIV = 1         expert intermediate_size divisor (1=full, 2=half)
+#   QWEN_MOE_MERGE_ON_SAVE = 1      collapse MoE -> single dense MLP on export
+#                                    (so the chatbot loads it with no changes)
+MOE_ENABLED = os.environ.get("QWEN_MOE", "0") == "1"
+MOE_NUM_EXPERTS = int(os.environ.get("QWEN_MOE_EXPERTS", "4"))
+MOE_TOP_K = int(os.environ.get("QWEN_MOE_TOPK", "2"))
+MOE_AUX_LOSS_WEIGHT = float(os.environ.get("QWEN_MOE_AUX", "0.01"))
+MOE_EXPERT_DIVISOR = int(os.environ.get("QWEN_MOE_EXPERT_DIV", "1"))
+MOE_MERGE_ON_SAVE = os.environ.get("QWEN_MOE_MERGE_ON_SAVE", "1") == "1"
+
+
+class TopKRouter(nn.Module):
+    """Token-level router: projects hidden states to expert logits."""
+
+    def __init__(self, hidden_size: int, num_experts: int):
+        super().__init__()
+        self.linear = nn.Linear(hidden_size, num_experts, bias=False)
+        self.num_experts = num_experts
+
+    def forward(self, x):
+        return self.linear(x)  # [T, E]
+
+
+class Qwen3_5MoE(nn.Module):
+    """Sparse Mixture-of-Experts replacement for Qwen3_5MLP.
+
+    Holds `num_experts` full MLPs and a router. Each token is dispatched to
+    the top-k experts; outputs are summed weighted by the router's softmax.
+    All experts are copy-initialized from the original dense MLP so the
+    function is preserved on day one (routing is irrelevant when all experts
+    are identical).
+
+    Accumulates the load-balancing aux loss into ``self._moe_aux_loss`` per
+    forward so the training loop can collect it without modifying the decoder
+    layer.
+    """
+
+    def __init__(self, config, original_mlp, num_experts, top_k, expert_divisor=1):
+        super().__init__()
+        self.config = config
+        self.hidden_size = config.hidden_size
+        self.num_experts = num_experts
+        self.top_k = top_k
+        intermediate = max(1, original_mlp.intermediate_size // expert_divisor)
+        self.intermediate_size = intermediate
+
+        self.experts = nn.ModuleList([
+            Qwen3_5MLP(config, intermediate) for _ in range(num_experts)
+        ])
+        self.router = TopKRouter(config.hidden_size, num_experts)
+        self.act_fn = original_mlp.act_fn
+        self._moe_aux_loss = 0.0
+
+        # Copy-init: every expert starts identical to the original dense MLP.
+        # If expert_divisor > 1 the expert is smaller; slice the weight matrices.
+        src_sd = original_mlp.state_dict()
+        for expert in self.experts:
+            esd = expert.state_dict()
+            for key in esd:
+                if key not in src_sd:
+                    continue
+                src, dst = src_sd[key], esd[key]
+                if src.shape == dst.shape:
+                    dst.copy_(src)
+                elif src.ndim == 2:
+                    # [out, in] — slice both dims to fit the smaller expert
+                    o = min(src.shape[0], dst.shape[0])
+                    i = min(src.shape[1], dst.shape[1])
+                    dst.zero_()
+                    dst[:o, :i].copy_(src[:o, :i])
+                elif src.ndim == 1:
+                    i = min(src.shape[0], dst.shape[0])
+                    dst.zero_()
+                    dst[:i].copy_(src[:i])
+            expert.load_state_dict(esd)
+
+    def forward(self, hidden_states):
+        B, S, H = hidden_states.shape
+        x = hidden_states.reshape(-1, H)  # [T, H]  where T = B*S
+
+        # --- route --------------------------------------------------------
+        router_logits = self.router(x)  # [T, E]
+        top_k_vals, top_k_idx = torch.topk(router_logits, self.top_k, dim=-1)
+        top_k_weights = F.softmax(top_k_vals, dim=-1)  # [T, K]
+
+        # --- dispatch: gather tokens per expert, run, scatter back --------
+        flat_idx = top_k_idx.reshape(-1)          # [T*K]
+        flat_weights = top_k_weights.reshape(-1)  # [T*K]
+        flat_input = x.unsqueeze(1).expand(-1, self.top_k, -1).reshape(-1, H)  # [T*K, H]
+
+        flat_output = torch.zeros_like(flat_input)
+        for e_idx, expert in enumerate(self.experts):
+            mask = flat_idx == e_idx
+            if mask.any():
+                flat_output[mask] = expert(flat_input[mask])
+
+        # --- combine: weight by router prob, sum over top-k ---------------
+        flat_output = flat_output * flat_weights.unsqueeze(-1)
+        output = flat_output.reshape(B * S, self.top_k, H).sum(dim=1)  # [T, H]
+
+        # --- load-balancing aux loss (Switch Transformers / GShard) -------
+        with torch.no_grad():
+            counts = torch.bincount(flat_idx, minlength=self.num_experts).float()
+            frac = counts / flat_idx.shape[0]
+            target = 1.0 / self.num_experts
+            aux = self.num_experts * (frac * (frac / target - 1) + target).sum()
+            # Simpler equivalent: sum of squared deviations from uniform
+            aux = ((frac - target) ** 2).sum() * self.num_experts
+        self._moe_aux_loss = aux
+
+        return output.reshape(B, S, H)
+
+
+def apply_moe_to_model(model, num_experts, top_k, expert_divisor=1):
+    """Replace every decoder layer's dense MLP with a frozen MoE. Returns the
+    model with base + experts frozen and routers unfrozen (trainable)."""
+    replaced = 0
+    for layer in model.model.layers:
+        if not isinstance(layer, Qwen3_5DecoderLayer):
+            continue
+        orig_mlp = layer.mlp
+        tcfg = getattr(model.config, "text_config", model.config)
+        layer.mlp = Qwen3_5MoE(
+            tcfg, orig_mlp, num_experts, top_k, expert_divisor,
+        )
+        # New modules default to float32; cast to model dtype (bf16).
+        layer.mlp = layer.mlp.to(next(model.parameters()).dtype)
+        # Freeze expert weights (they stay as copy-init); router stays trainable.
+        for expert in layer.mlp.experts:
+            for p in expert.parameters():
+                p.requires_grad = False
+        replaced += 1
+
+    # Freeze the entire base model (attention, embeddings, norms, ...).
+    for p in model.parameters():
+        p.requires_grad = False
+    # Unfreeze routers so they train.
+    for layer in model.model.layers:
+        if hasattr(layer, "mlp") and isinstance(layer.mlp, Qwen3_5MoE):
+            for p in layer.mlp.router.parameters():
+                p.requires_grad = True
+
+    print(f"[MoE] replaced {replaced} layers with {num_experts}-expert MoE "
+          f"(top-{top_k}, expert_div={expert_divisor}); base+frozen experts, "
+          f"trainable = routers + LoRA adapters on experts")
+    return model
+
+
+def collect_moe_aux_loss(model):
+    """Sum the per-layer MoE aux losses and reset them. Returns a float."""
+    total = 0.0
+    for layer in model.model.layers:
+        mlp = getattr(layer, "mlp", None)
+        if isinstance(mlp, Qwen3_5MoE):
+            total += float(mlp._moe_aux_loss)
+            mlp._moe_aux_loss = 0.0
+    return total
+
+
+def merge_moe_to_dense(model, sample_batches=4, maxlen=128, device="cpu"):
+    """Collapse each MoE layer into a single dense MLP weighted by the router's
+    average dispatch probability (measured over a few random input windows).
+    This produces standard Qwen3_5MLP layers the chatbot can load with no
+    changes. Operates IN-PLACE on `model` and returns it."""
+    for layer_idx, layer in enumerate(model.model.layers):
+        mlp = getattr(layer, "mlp", None)
+        if not isinstance(mlp, Qwen3_5MoE):
+            continue
+        num_experts = mlp.num_experts
+        hidden_size = mlp.hidden_size
+        intermediate = mlp.intermediate_size
+
+        # Measure average router dispatch over random inputs.
+        router_counts = torch.zeros(num_experts)
+        total_tokens = 0
+        with torch.no_grad():
+            for _ in range(sample_batches):
+                x = torch.randn(1, maxlen, hidden_size, device=device, dtype=DT)
+                logits = mlp.router(x.reshape(-1, hidden_size))
+                _, idx = torch.topk(logits, mlp.top_k, dim=-1)
+                for e in range(num_experts):
+                    router_counts[e] += (idx == e).sum().item()
+                total_tokens += idx.numel()
+        expert_weights = router_counts / total_tokens
+        ew = expert_weights / expert_weights.sum()
+        print(f"[MoE merge] layer {layer_idx}: expert weights = "
+              ", ".join(f"{w:.3f}" for w in ew.tolist()))
+
+        # Build a dense MLP whose weights are the weighted sum of experts.
+        dense = Qwen3_5MLP(mlp.config, intermediate).to(DT)
+        dsd = dense.state_dict()
+        for key in dsd:
+            if key == "act_fn":
+                continue
+            acc = None
+            for e_idx, expert in enumerate(mlp.experts):
+                esd = expert.state_dict()
+                if key not in esd:
+                    continue
+                w = ew[e_idx]
+                if acc is None:
+                    acc = esd[key].float() * w
+                else:
+                    acc = acc + esd[key].float() * w
+            if acc is not None:
+                dsd[key].copy_(acc.to(DT))
+        dense.load_state_dict(dsd)
+        layer.mlp = dense
+
+    print("[MoE merge] all MoE layers collapsed to dense MLPs (in-place)")
+    return model
+
 
 # --- SFT data: chat-formatted, behavior baked in via template --------------
 # Each item is a (role, content) turn set. The chat template renders the
@@ -685,6 +910,16 @@ base.gradient_checkpointing_enable()
 base.config.use_cache = False
 print(f"[qwen_finetune] base loaded in {time.time()-t0:.1f}s (grad_ckpt=on, use_cache=off)")
 
+if MOE_ENABLED:
+    # Apply MoE BEFORE LoRA so LoRA targets the experts' gate/up/down projs.
+    # This freezes base + experts and unfreezes routers; LoRA will add adapters
+    # to expert projections (target_modules include gate/up/down_proj).
+    base = apply_moe_to_model(base, MOE_NUM_EXPERTS, MOE_TOP_K, MOE_EXPERT_DIVISOR)
+    moe_params = sum(p.numel() for p in base.parameters())
+    moe_train = sum(p.numel() for p in base.parameters() if p.requires_grad)
+    print(f"[qwen_finetune] MoE active: {moe_params/1e6:.1f}M total params, "
+          f"{moe_train/1e6:.1f}M trainable (routers only before LoRA)")
+
 FULL_FT = os.environ.get("QWEN_FULLFT", "0") == "1"
 if FULL_FT:
     # Unfreeze the ENTIRE model so 100% of params are trainable. To keep this on an
@@ -695,6 +930,8 @@ if FULL_FT:
     model = base
     print("[qwen_finetune] full fine-tune enabled: ALL params trainable")
 else:
+    # LoRA target_modules include gate/up/down_proj which now live inside MoE
+    # experts. peft will wrap those Linear layers with LoRA adapters.
     lora_cfg = LoraConfig(
         r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT, bias=LORA_BIAS,
         task_type="CAUSAL_LM", target_modules=TARGET_MODULES,
@@ -964,12 +1201,18 @@ def save_checkpoint(model, it):
     """Merge (LoRA) or copy (full-FT) into a plain HF model and write it to OUT_DIR so
     the NEXT run resumes from the latest weights — this is how training keeps scaling up
     across sessions. Also keeps a timestamped history copy (a full re-run continues from
-    the most recent OUT_DIR, not from scratch)."""
+    the most recent OUT_DIR, not from scratch).
+
+    If MoE is enabled, collapse MoE layers to dense MLPs before saving so the
+    chatbot can load the checkpoint with no changes."""
     os.makedirs(OUT_DIR, exist_ok=True)
     if isinstance(model, PeftModel):
         merged = model.merge_and_unload()  # -> plain Qwen3_5ForCausalLM
     else:
         merged = model
+    if MOE_ENABLED and MOE_MERGE_ON_SAVE:
+        # Collapse MoE -> dense so the saved model is a standard Qwen3.5.
+        merged = merge_moe_to_dense(merged, device=device)
     try:
         merged.config.architectures = ["Qwen3_5ForCausalLM"]
     except Exception:
@@ -989,123 +1232,136 @@ def save_checkpoint(model, it):
         except Exception as e:
             print(f"[qwen_finetune] GGUF export skipped @{it}: {e}", flush=True)
     return merged
-for it in range(1, MAX_ITERS + 1):
-    model.train(); class_head.train()
-    # --- LM step ---
-    if CORPUS_MODE:
-        cb = corpus_batch(train_reader, LM_BATCH_SIZE, LM_MAX_LEN, device)
-        if cb is None:  # corpus unexpectedly drained; rebuild and loop
-            train_reader = CorpusReader(TRAIN_FILES, tok, LM_MAX_LEN)
-            cb = corpus_batch(train_reader, LM_BATCH_SIZE, LM_MAX_LEN, device)
-        inp, lab = cb
-    else:
-        lm_batch = random.sample(LM_EXAMPLES, min(LM_BATCH_SIZE, len(LM_EXAMPLES)))
-        inp, lab = collate_lm(lm_batch)
-    inp, lab = inp.to(device), lab.to(device)
-    with torch.amp.autocast("cuda" if device == "cuda" else "cpu", dtype=DT):
-        out = model(input_ids=inp, labels=lab, output_hidden_states=True)
-        lm_loss = out.loss
-        last_h = out.hidden_states[-1]
-        cls_logits = class_head(last_h[:, -1, :])  # not used for LM batch labels
-        # dummy cls target = not_spam to keep head warm; real cls step below
-        cls_loss = F.cross_entropy(cls_logits, torch.full((inp.size(0),), 1, device=device))
-        loss = lm_loss + 0.3 * cls_loss
-    optimizer.zero_grad(set_to_none=True)
-    if scaler is not None:
-        scaler.scale(loss).backward()
-        scaler.step(optimizer); scaler.update()
-    else:
-        loss.backward(); optimizer.step()
 
-    # --- dedicated classification step ---
-    c_text, c_label = random.choice(CLS_EXAMPLES)
-    cids = c_text.unsqueeze(0).to(device)
-    with torch.amp.autocast("cuda" if device == "cuda" else "cpu", dtype=DT):
-        cout = model(input_ids=cids, output_hidden_states=True)
-        ch = class_head(cout.hidden_states[-1][:, -1, :])
-        closs = F.cross_entropy(ch, torch.tensor([c_label], device=device))
-    optimizer.zero_grad(set_to_none=True)
-    if scaler is not None:
-        scaler.scale(closs).backward()
-        scaler.step(optimizer); scaler.update()
-    else:
-        closs.backward(); optimizer.step()
-
-    if it % EVAL_EVERY == 0 or it == 1:
-        with torch.no_grad():
-            # classification accuracy
-            correct = 0
-            for c_text, c_label in CLS_EXAMPLES:
-                cids = c_text.unsqueeze(0).to(device)
-                h = model(input_ids=cids, output_hidden_states=True).hidden_states[-1][:, -1, :]
-                pred = int(class_head(h).argmax(dim=-1).item())
-                correct += int(pred == c_label)
-            acc = correct / len(CLS_EXAMPLES)
-            # validation loss on the held-out corpus (corpus mode only)
-            val_loss = (corpus_val_loss(model, val_reader, LM_MAX_LEN, device)
-                        if CORPUS_MODE else float("nan"))
-            # prompt -> response sample so you can watch behavior improve each eval
-            model.eval()
-            eval_prompt = random.choice(PROMPT_POOL)
-            gids = tok.apply_chat_template(
-                [{"role": "user", "content": eval_prompt}],
-                add_generation_prompt=True, return_tensors="pt").input_ids.to(device)
-            # --- stream the generation so the chain-of-thought shows in gray and
-            #     the final answer prints in real time ------------------------------
-            GREY = "\033[90m"; RESET = "\033[0m"
-            print(f"[iter {it}] eval prompt: {eval_prompt}", flush=True)
-            print(f"{GREY}› chain of thought:{RESET}", end="", flush=True)
-            in_think = True
-            past = gids
-            gen_ids = []
-            _reply_parts = []
-            for _ in range(GEN_MAX):
-                with torch.amp.autocast("cuda" if device == "cuda" else "cpu", dtype=DT):
-                    out = model(input_ids=past, use_cache=False)
-                nxt = int(out.logits[0, -1].argmax(dim=-1).item())
-                if nxt == tok.eos_token_id:
-                    break
-                gen_ids.append(nxt)
-                piece = tok.decode([nxt], skip_special_tokens=False)
-                if in_think:
-                    print(f"{GREY}{piece}{RESET}", end="", flush=True)
-                else:
-                    print(piece, end="", flush=True)
-                _reply_parts.append(piece)
-                # when the model emits <answer> we flip from gray (thinking) to white (answer)
-                if "<answer>" in piece or piece.strip().startswith("Answer:") or piece.strip().startswith("Answer"):
-                    in_think = False
-                past = torch.cat([past, torch.tensor([[nxt]], device=device)], dim=1)
-                if len(gen_ids) >= GEN_MAX:
-                    break
-            print(flush=True)
-            # full eval reply (plain text, no ANSI) to the training log
-            _log(f"[iter {it}] eval prompt: {eval_prompt}")
-            _log(f"[iter {it}] eval reply : {_strip_ansi(''.join(_reply_parts))}")
-            model.train()
+def main():
+    global model
+    for it in range(1, MAX_ITERS + 1):
+        model.train(); class_head.train()
+        # --- LM step ---
         if CORPUS_MODE:
-            _log(f"[iter {it}] lm_loss={lm_loss.item():.4f} val_loss={val_loss:.4f} "
-                 f"cls_acc={acc:.3f}")
+            cb = corpus_batch(train_reader, LM_BATCH_SIZE, LM_MAX_LEN, device)
+            if cb is None:  # corpus unexpectedly drained; rebuild and loop
+                train_reader = CorpusReader(TRAIN_FILES, tok, LM_MAX_LEN)
+                cb = corpus_batch(train_reader, LM_BATCH_SIZE, LM_MAX_LEN, device)
+            inp, lab = cb
         else:
-            _log(f"[iter {it}] lm_loss={lm_loss.item():.4f} cls_acc={acc:.3f}")
-        _log(f"[iter {it}] eval prompt: {eval_prompt}")
-        _log(f"[iter {it}] eval reply : (streamed above in real time)")
-        # periodic merged checkpoint so a re-run resumes from the latest weights
-        if CKPT_EVERY and it % CKPT_EVERY == 0:
-            model = save_checkpoint(model, it)
+            lm_batch = random.sample(LM_EXAMPLES, min(LM_BATCH_SIZE, len(LM_EXAMPLES)))
+            inp, lab = collate_lm(lm_batch)
+        inp, lab = inp.to(device), lab.to(device)
+        with torch.amp.autocast("cuda" if device == "cuda" else "cpu", dtype=DT):
+            out = model(input_ids=inp, labels=lab, output_hidden_states=True)
+            lm_loss = out.loss
+            last_h = out.hidden_states[-1]
+            cls_logits = class_head(last_h[:, -1, :])  # not used for LM batch labels
+            # dummy cls target = not_spam to keep head warm; real cls step below
+            cls_loss = F.cross_entropy(cls_logits, torch.full((inp.size(0),), 1, device=device))
+            loss = lm_loss + 0.3 * cls_loss
+            if MOE_ENABLED:
+                # Collect load-balancing aux loss from all MoE layers (routed tokens
+                # must spread evenly across experts or one dominates and capacity
+                # collapses).
+                moe_aux = collect_moe_aux_loss(model)
+                loss = loss + MOE_AUX_LOSS_WEIGHT * moe_aux
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer); scaler.update()
+        else:
+            loss.backward(); optimizer.step()
 
-# --- save: merged HF model + class head ------------------------------------
-_log(f"[qwen_finetune] training complete ({MAX_ITERS} iters) — writing final checkpoint")
-model = save_checkpoint(model, MAX_ITERS)
-if GGUF_ENABLED:
-    try:
-        export_gguf(OUT_DIR, GGUF_OUT, GGUF_QUANT)
-        _log(f"[qwen_finetune] DONE -> GGUF ({GGUF_QUANT}): {GGUF_OUT}")
-    except Exception as e:
-        _log(f"[qwen_finetune] GGUF export FAILED: {e} "
-             f"(HF dir {OUT_DIR} is still usable; retry later with "
-             f"python qwen_finetune.py --export-gguf-only)")
-_log(f"[qwen_finetune] DONE -> merged model: {OUT_DIR}")
-_log(f"[qwen_finetune] class_head: {CLASS_HEAD_PT}")
-_log("[qwen_finetune] Point settings.json 'current_model' at this dir to use it.")
-_log_close()
+        # --- dedicated classification step ---
+        c_text, c_label = random.choice(CLS_EXAMPLES)
+        cids = c_text.unsqueeze(0).to(device)
+        with torch.amp.autocast("cuda" if device == "cuda" else "cpu", dtype=DT):
+            cout = model(input_ids=cids, output_hidden_states=True)
+            ch = class_head(cout.hidden_states[-1][:, -1, :])
+            closs = F.cross_entropy(ch, torch.tensor([c_label], device=device))
+        optimizer.zero_grad(set_to_none=True)
+        if scaler is not None:
+            scaler.scale(closs).backward()
+            scaler.step(optimizer); scaler.update()
+        else:
+            closs.backward(); optimizer.step()
+
+        if it % EVAL_EVERY == 0 or it == 1:
+            with torch.no_grad():
+                # classification accuracy
+                correct = 0
+                for c_text, c_label in CLS_EXAMPLES:
+                    cids = c_text.unsqueeze(0).to(device)
+                    h = model(input_ids=cids, output_hidden_states=True).hidden_states[-1][:, -1, :]
+                    pred = int(class_head(h).argmax(dim=-1).item())
+                    correct += int(pred == c_label)
+                acc = correct / len(CLS_EXAMPLES)
+                # validation loss on the held-out corpus (corpus mode only)
+                val_loss = (corpus_val_loss(model, val_reader, LM_MAX_LEN, device)
+                            if CORPUS_MODE else float("nan"))
+                # prompt -> response sample so you can watch behavior improve each eval
+                model.eval()
+                eval_prompt = random.choice(PROMPT_POOL)
+                gids = tok.apply_chat_template(
+                    [{"role": "user", "content": eval_prompt}],
+                    add_generation_prompt=True, return_tensors="pt").input_ids.to(device)
+                # --- stream the generation so the chain-of-thought shows in gray and
+                #     the final answer prints in real time ------------------------------
+                GREY = "\033[90m"; RESET = "\033[0m"
+                print(f"[iter {it}] eval prompt: {eval_prompt}", flush=True)
+                print(f"{GREY}› chain of thought:{RESET}", end="", flush=True)
+                in_think = True
+                past = gids
+                gen_ids = []
+                _reply_parts = []
+                for _ in range(GEN_MAX):
+                    with torch.amp.autocast("cuda" if device == "cuda" else "cpu", dtype=DT):
+                        out = model(input_ids=past, use_cache=False)
+                    nxt = int(out.logits[0, -1].argmax(dim=-1).item())
+                    if nxt == tok.eos_token_id:
+                        break
+                    gen_ids.append(nxt)
+                    piece = tok.decode([nxt], skip_special_tokens=False)
+                    if in_think:
+                        print(f"{GREY}{piece}{RESET}", end="", flush=True)
+                    else:
+                        print(piece, end="", flush=True)
+                    _reply_parts.append(piece)
+                    # when the model emits <answer> we flip from gray (thinking) to white (answer)
+                    if "<answer>" in piece or piece.strip().startswith("Answer:") or piece.strip().startswith("Answer"):
+                        in_think = False
+                    past = torch.cat([past, torch.tensor([[nxt]], device=device)], dim=1)
+                    if len(gen_ids) >= GEN_MAX:
+                        break
+                print(flush=True)
+                # full eval reply (plain text, no ANSI) to the training log
+                _log(f"[iter {it}] eval prompt: {eval_prompt}")
+                _log(f"[iter {it}] eval reply : {_strip_ansi(''.join(_reply_parts))}")
+                model.train()
+            if CORPUS_MODE:
+                _log(f"[iter {it}] lm_loss={lm_loss.item():.4f} val_loss={val_loss:.4f} "
+                     f"cls_acc={acc:.3f}")
+            else:
+                _log(f"[iter {it}] lm_loss={lm_loss.item():.4f} cls_acc={acc:.3f}")
+            _log(f"[iter {it}] eval prompt: {eval_prompt}")
+            _log(f"[iter {it}] eval reply : (streamed above in real time)")
+            # periodic merged checkpoint so a re-run resumes from the latest weights
+            if CKPT_EVERY and it % CKPT_EVERY == 0:
+                model = save_checkpoint(model, it)
+
+    # --- save: merged HF model + class head ------------------------------------
+    _log(f"[qwen_finetune] training complete ({MAX_ITERS} iters) — writing final checkpoint")
+    model = save_checkpoint(model, MAX_ITERS)
+    if GGUF_ENABLED:
+        try:
+            export_gguf(OUT_DIR, GGUF_OUT, GGUF_QUANT)
+            _log(f"[qwen_finetune] DONE -> GGUF ({GGUF_QUANT}): {GGUF_OUT}")
+        except Exception as e:
+            _log(f"[qwen_finetune] GGUF export FAILED: {e} "
+                 f"(HF dir {OUT_DIR} is still usable; retry later with "
+                 f"python qwen_finetune.py --export-gguf-only)")
+    _log(f"[qwen_finetune] DONE -> merged model: {OUT_DIR}")
+    _log(f"[qwen_finetune] class_head: {CLASS_HEAD_PT}")
+    _log("[qwen_finetune] Point settings.json 'current_model' at this dir to use it.")
+    _log_close()
+
+
+if __name__ == "__main__":
+    main()
