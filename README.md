@@ -168,6 +168,7 @@ All imports OK
 | **Run web chatbot** | `python web_chatbot.py` → http://localhost:5000 |
 | **Run CLI chatbot** | `python chatbot.py` |
 | **Fine-tune Qwen (LoRA bf16)** | `python qwen_finetune.py` |
+| **Fine-tune + MoE** | `set QWEN_MOE=1 && python qwen_finetune.py` |
 | **Fine-tune + GGUF Q4_K_M export** | `set QWEN_GGUF=1 && set QWEN_GGUF_QUANT=Q4_K_M && python qwen_finetune.py` |
 | **Legacy pre-training** | `python ashen_gpt_trainer.py` |
 | **Run benchmark** | `[TOOL: run_benchmark()]` in chat or web UI button |
@@ -182,9 +183,9 @@ All imports OK
 | Norm | Qwen `RMSNorm` + QK-Norm | `RMSNorm` (no mean-centering) |
 | Position | Qwen `RotaryEmbedding` (RoPE) | `RotaryEmbedding` with Dynamic NTK scaling |
 | Attention | `scaled_dot_product_attention` (causal) | same |
-| FFN | SwiGLU | SwiGLU **MoE** — 4 experts, Top-2 gating |
+| FFN | SwiGLU (dense) — or **MoE** (4 experts, Top-2 gating) when `QWEN_MOE=1` | SwiGLU **MoE** — 4 experts, Top-2 gating |
 | Tokenizer | Qwen BPE (`AutoTokenizer`) | GPT-2 BPE via `tiktoken` (50,257 vocab) |
-| Fine-tune | LoRA (bf16, `r=32`) → merged HF ckpt + `class_head.pt` | Full / width-upscaled weights (`.pk1`) |
+| Fine-tune | LoRA (bf16, `r=32`) → merged HF ckpt + `class_head.pt`; MoE training available (`QWEN_MOE=1`) | Full / width-upscaled weights (`.pk1`) |
 | Max context | 8,192 tokens (`context_length`) | 8,192 tokens (`block_size`) |
 
 **Hardware optimization (RTX 3060 Ti, 8.59 GB VRAM):**
@@ -438,11 +439,40 @@ activations fits comfortably in 8.59 GB; a full bf16 fine-tune would not.
   - `QWEN_EVAL_PROMPT` / `QWEN_PROMPT_POOL` — override the eval prompt (single / `|||`-joined)
   - `QWEN_SFT_JSONL` / `QWEN_CLS_JSONL` — paths to SFT / classification data
   - `QWEN_GGUF` / `QWEN_GGUF_QUANT` / `QWEN_GGUF_OUT` — GGUF export control (see above)
+  - `QWEN_MOE` / `QWEN_MOE_EXPERTS` / `QWEN_MOE_TOPK` / `QWEN_MOE_AUX` /
+    `QWEN_MOE_EXPERT_DIV` / `QWEN_MOE_MERGE_ON_SAVE` — MoE training (see below)
 - **Width-upscale on resume** — hidden size is widened by √2 (copy-init, depth unchanged) so
   a resumed run grows capacity without retraining from scratch.
 - **Checkpoints** — `save_checkpoint()` merges LoRA via `merge_and_unload()` into a plain
   `Qwen3_5ForCausalLM`, writes `ashen_gpt_model/`, and keeps a timestamped history copy
   `ashen_gpt_model.ckpt-{it}`.
+
+#### MoE (Mixture-of-Experts) training
+`qwen_finetune.py` can replace each layer's dense MLP with a sparse **Mixture-of-Experts**
+before LoRA is applied. Only the top-k experts activate per token, so parameter count grows
+without a proportional compute increase. On the 3060 Ti the base model and all expert
+weights are **frozen** (copy-initialized from the original MLP, preserving the learned
+function on day one); only the **routers** and **LoRA adapters on expert projections** are
+trained — ~5 GB VRAM.
+
+| Env var | Default | Meaning |
+|---|---|---|
+| `QWEN_MOE` | `0` | Enable MoE |
+| `QWEN_MOE_EXPERTS` | `4` | Number of experts per layer |
+| `QWEN_MOE_TOPK` | `2` | Experts activated per token |
+| `QWEN_MOE_AUX` | `0.01` | Load-balancing aux-loss weight (keeps experts from collapsing) |
+| `QWEN_MOE_EXPERT_DIV` | `1` | Expert intermediate_size divisor (1=full-size, 2=half-size) |
+| `QWEN_MOE_MERGE_ON_SAVE` | `1` | Collapse MoE → single dense MLP on export (chatbot loads standard Qwen3.5) |
+
+A load-balancing aux loss is added to the total loss each iteration. On checkpoint save,
+MoE layers are **automatically collapsed** to dense MLPs weighted by the router's average
+dispatch probability, so the saved `ashen_gpt_model/` is a standard Qwen3.5 checkpoint the
+chatbots load with zero changes.
+
+Run with MoE:
+```cmd
+set QWEN_MOE=1 && cuda\Scripts\python.exe qwen_finetune.py
+```
 
 Run it:
 
@@ -520,41 +550,43 @@ set SETTINGS_PATH=C:\path\to\settings.json && python web_chatbot.py
 ## Project Structure
 
 ```
-qwen_finetune.py       # LoRA (bf16) fine-tune of Qwen3.5 -> ashen_gpt_model/; width-upscale on resume; GGUF export
-ashen_gpt_trainer.py   # Legacy custom MoE pre-training -> ashen_gpt_model.pk1; Tee stdout -> training_logs.txt
-run_qwen_finetuner.bat # Windows launcher for qwen_finetune.py (cuda venv)
-run_ashen_gpt.bat      # Windows launcher for ashen_gpt_trainer.py
-chatbot.py             # Self-contained CLI chatbot (no import of web_chatbot.py)
-web_chatbot.py         # Browser cyberpunk UI (stdlib http.server, port 5000)
-run_chatbot.bat        # Windows launcher for chatbot.py
-run_web_chatbot.bat    # Windows launcher for web_chatbot.py
-ashen_gpt_model/       # Default model (Qwen3.5 fine-tune, HF format): config.json + safetensors + class_head.pt
-ashen_gpt_model.pk1    # Legacy custom MoE model (~127M params, 8K context)
-ashen_gpt_model_dpo.pk1# DPO-aligned variant of the legacy model
-settings.json          # Generation + display config (resolved via __file__)
-feedback.json          # Last 500 user ratings (👍/👎 + corrections)
-self_improvement.json  # {stats, log, suggestions} — swarm/council/gibberish_fix/regenerate/auto_tune entries
-memory.json            # Persistent memory entries {key, value, ts} for /memory
-plans.json             # Stored step-by-step plans for /plan
-oauth_tokens.json      # Provider OAuth tokens (gitignored)
-training_logs.txt      # Auto-generated training log (terminal + this file, ANSI-stripped)
-sessions/              # Web chatbot sessions (JSON: history, settings, workspace context)
-sessions_cli/          # CLI chatbot sessions (JSON: history, workspace context)
-train_split.txt        # Literature training data
-val_split.txt          # Validation data
-code_train_split.txt   # Scraped code training data
-memory/project/        # Project memory (MEMORY.md + hybrid-code-training.md)
-scripts/               # Offline verification scripts (AST-extract + exec with stubs)
-  verify_gguf_export.py      # Tests GGUF export block without model load / network
-  verify_legal_refusal.py    # Tests refusal filter for illegal/harmful requests
-  verify_local_tools.py      # Tests file/shell/web tools with stubbed I/O
-tools/llama.cpp/       # GGUF conversion tools (convert_hf_to_gguf.py committed; llama-quantize auto-downloaded)
-web_chatbot/           # Web chatbot support files
-  search_fn_fragment.py # Reference search function fragment
-cuda/                  # Bundled CUDA virtualenv (gitignored)
-Qwen_Qwen3.5-0.8B/     # Upstream Qwen3.5 base model (gitignored)
-vocab.txt              # GPT-2 BPE vocabulary (legacy model tokenizer)
-*.ipynb                # Jupyter notebooks (ashen-gpt, bigram, torch-examples)
+| File | Description |
+|---|---|
+| `qwen_finetune.py` | LoRA (bf16) fine-tune of Qwen3.5 -> `ashen_gpt_model/`; width-upscale on resume; MoE training; GGUF export |
+| `ashen_gpt_trainer.py` | Legacy custom MoE pre-training -> `ashen_gpt_model.pk1`; Tee stdout -> `training_logs.txt` |
+| `run_qwen_finetuner.bat` | Windows launcher for `qwen_finetune.py` (cuda venv) |
+| `run_ashen_gpt.bat` | Windows launcher for `ashen_gpt_trainer.py` |
+| `chatbot.py` | Self-contained CLI chatbot (no import of `web_chatbot.py`) |
+| `web_chatbot.py` | Browser cyberpunk UI (stdlib `http.server`, port 5000) |
+| `run_chatbot.bat` | Windows launcher for `chatbot.py` |
+| `run_web_chatbot.bat` | Windows launcher for `web_chatbot.py` |
+| `ashen_gpt_model/` | Default model (Qwen3.5 fine-tune, HF format): `config.json` + safetensors + `class_head.pt` |
+| `ashen_gpt_model.pk1` | Legacy custom MoE model (~127M params, 8K context) |
+| `ashen_gpt_model_dpo.pk1` | DPO-aligned variant of the legacy model |
+| `settings.json` | Generation + display config (resolved via `__file__`) |
+| `feedback.json` | Last 500 user ratings (👍/👎 + corrections) |
+| `self_improvement.json` | `{stats, log, suggestions}` — swarm/council/gibberish_fix/regenerate/auto_tune entries |
+| `memory.json` | Persistent memory entries `{key, value, ts}` for `/memory` |
+| `plans.json` | Stored step-by-step plans for `/plan` |
+| `oauth_tokens.json` | Provider OAuth tokens (gitignored) |
+| `training_logs.txt` | Auto-generated training log (terminal + this file, ANSI-stripped) |
+| `sessions/` | Web chatbot sessions (JSON: history, settings, workspace context) |
+| `sessions_cli/` | CLI chatbot sessions (JSON: history, workspace context) |
+| `train_split.txt` | Literature training data |
+| `val_split.txt` | Validation data |
+| `code_train_split.txt` | Scraped code training data |
+| `memory/project/` | Project memory (`MEMORY.md` + `hybrid-code-training.md`) |
+| `scripts/` | Offline verification scripts (AST-extract + exec with stubs) |
+| `verify_gguf_export.py` | Tests GGUF export block without model load / network |
+| `verify_legal_refusal.py` | Tests refusal filter for illegal/harmful requests |
+| `verify_local_tools.py` | Tests file/shell/web tools with stubbed I/O |
+| `tools/llama.cpp/` | GGUF conversion tools (`convert_hf_to_gguf.py` committed; `llama-quantize` auto-downloaded) |
+| `web_chatbot/` | Web chatbot support files |
+| `search_fn_fragment.py` | Reference search function fragment |
+| `cuda/` | Bundled CUDA virtualenv (gitignored) |
+| `Qwen_Qwen3.5-0.8B/` | Upstream Qwen3.5 base model (gitignored) |
+| `vocab.txt` | GPT-2 BPE vocabulary (legacy model tokenizer) |
+| `*.ipynb` | Jupyter notebooks (ashen-gpt, bigram, torch-examples) |
 ```
 
 **Key web endpoints** (served by the stdlib `http.server` `ChatHandler`; unknown paths → 404):
