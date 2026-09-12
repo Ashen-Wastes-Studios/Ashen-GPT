@@ -146,6 +146,7 @@ DEFAULT_SETTINGS = {
     "precision": "fp16",
     "cpu_offload_layers": 0,
     "show_chain_of_thought": True,
+    "cot_as_answer": False,
     "auto_swarm_council": False,
     "auto_web_research": False,
     "allow_file_tools": True,
@@ -1741,6 +1742,7 @@ class AshenAIAgenticEngine:
         self.cpu_offload_layers = 0
         self.auto_swarm_council = False
         self.auto_web_research = False
+        self.cot_as_answer = False  # Replace the model's answer with a summary of its CoT
         self.allow_file_tools = True  # Model may read/write/list/mkdir/remove files
         self.allow_shell_tools = True  # Model may run terminal commands
         self._source_harvest = []
@@ -1770,10 +1772,74 @@ class AshenAIAgenticEngine:
             self.auto_swarm_council = bool(s['auto_swarm_council'])
         if 'auto_web_research' in s:
             self.auto_web_research = bool(s['auto_web_research'])
+        if 'cot_as_answer' in s:
+            self.cot_as_answer = bool(s['cot_as_answer'])
         if 'allow_file_tools' in s:
             self.allow_file_tools = bool(s['allow_file_tools'])
         if 'allow_shell_tools' in s:
             self.allow_shell_tools = bool(s['allow_shell_tools'])
+
+    @staticmethod
+    def _summarize_cot(thought, prompt, model, encode, decode, device, temperature, top_k, max_new_tokens):
+        """Summarize the chain-of-thought into a concise answer.
+
+        Uses the loaded model itself to produce a short, simplified version
+        of the reasoning. Falls back to the raw thought if anything fails.
+        """
+        if not thought or not thought.strip():
+            return thought
+        try:
+            summary_prompt = (
+                "Summarize the following reasoning into a short, clear, "
+                "self-contained answer. Use plain prose. Do not mention "
+                "that this is a summary. Do not use markdown formatting. "
+                "Answer the user's question based on the reasoning.\n\n"
+                f"User question: {prompt}\n\n"
+                f"Reasoning:\n{thought}\n\n"
+                "Summary:"
+            )
+            if hasattr(model, '_chat_ids'):
+                # Qwen path
+                ids = model._chat_ids(summary_prompt, history=None)
+                input_ids = ids.unsqueeze(0).to(device)
+                input_len = input_ids.shape[1]
+                full = ""
+                for full_index, tok_id in model.generate_stream(
+                    input_ids,
+                    max_new_tokens=min(max_new_tokens, 200),
+                    current_block_size=min(model.kv_cap, 2048),
+                    temperature=temperature, top_k=top_k,
+                ):
+                    gen_ids = full_index[0][input_len:].tolist()
+                    raw = decode(gen_ids)
+                    if len(raw) <= len(full):
+                        continue
+                    full = raw
+                summary = full.strip()
+            else:
+                # Custom model path
+                encoded = encode(summary_prompt)
+                if len(encoded) > 2048:
+                    encoded = encoded[-2048:]
+                input_ids = torch.tensor([encoded], dtype=torch.long, device=device)
+                acc = ""
+                for full_index, tok_id in model.generate_stream(
+                    input_ids,
+                    max_new_tokens=min(max_new_tokens, 200),
+                    current_block_size=2048,
+                    temperature=temperature, top_k=top_k,
+                ):
+                    try:
+                        chunk = decode([tok_id])
+                    except Exception:
+                        chunk = ""
+                    if chunk:
+                        acc += chunk
+                summary = acc.strip()
+            return summary if summary else thought
+        except Exception as e:
+            print(f"[CoT summary] failed: {e}", flush=True)
+            return thought
 
     @torch.no_grad()
     def generate_with_speculative_decoding(self, input_ids, max_new_tokens):
@@ -2338,12 +2404,18 @@ class AshenAIAgenticEngine:
             tool_trace += (f"\n\n[OBSERVATION from {tool_name}]:\n{tool_obs[:2000]}\n"
                            "Continue toward the user's request using the observation above.")
         if _parse_tool_call(resp):
-            resp = re.sub(r'\[TOOL:\s*[a-zA-Z_][a-zA-Z0-9_]*\(.*?\)\]', '', resp,
+            resp = re.sub(r'\[TOOL:\s*[a-zA-Z_][a-zA-Z0-9_]*\(.*?\)', '', resp,
                           flags=re.DOTALL).strip()
         if tool_observations:
             thought = (thought + "\n\n--- Tool Telemetry ---\n"
                        + "\n".join(tool_observations)).strip() if thought else \
                 "--- Tool Telemetry ---\n" + "\n".join(tool_observations)
+        if self.cot_as_answer and thought.strip():
+            print(f"\n[CoT→Answer] summarizing thought...", flush=True)
+            resp = self._summarize_cot(
+                thought, prompt, self.model, self.encode, self.decode,
+                device, self.temperature, self.top_k, self.max_new_tokens
+            )
         self.history.append((prompt, resp))
         return thought, resp
 
@@ -2390,8 +2462,11 @@ class AshenAIAgenticEngine:
                         thought_sent = len(before)
                         yield {"type": "thought_done"}
                         if after.strip():
-                            yield {"type": "response_delta", "chunk": after}
-                            resp_sent = len(after)
+                            if self.cot_as_answer:
+                                resp_sent = len(after)
+                            else:
+                                yield {"type": "response_delta", "chunk": after}
+                                resp_sent = len(after)
                     else:
                         nt = full[thought_sent:]
                         if nt:
@@ -2400,8 +2475,11 @@ class AshenAIAgenticEngine:
                 else:
                     nr = full[resp_sent:]
                     if nr:
-                        yield {"type": "response_delta", "chunk": nr}
-                        resp_sent = len(full)
+                        if self.cot_as_answer:
+                            resp_sent = len(full)
+                        else:
+                            yield {"type": "response_delta", "chunk": nr}
+                            resp_sent = len(full)
             mm = re.search(r'<think>([\s\S]*?)(?:</think>|$)', full)
             if mm:
                 thought = mm.group(1).strip()
@@ -2436,6 +2514,12 @@ class AshenAIAgenticEngine:
                 _seen.add(_u)
                 _collected_sources.append(_s)
         self.last_sources = _collected_sources
+        if self.cot_as_answer and combined_thought.strip():
+            print(f"\n[CoT→Answer] summarizing thought...", flush=True)
+            resp = self._summarize_cot(
+                combined_thought, prompt, self.model, self.encode, self.decode,
+                device, self.temperature, self.top_k, self.max_new_tokens
+            )
         self.history.append((prompt, resp))
         yield {"type": "done", "thought": combined_thought, "response": resp,
                "model": os.path.basename(current_model_filename),
@@ -2494,6 +2578,12 @@ class AshenAIAgenticEngine:
             thought = (thought + "\n\n--- Tool Telemetry ---\n"
                        + "\n".join(tool_observations)).strip() if thought else \
                 "--- Tool Telemetry ---\n" + "\n".join(tool_observations)
+        if self.cot_as_answer and thought.strip():
+            print(f"\n[CoT→Answer] summarizing thought...", flush=True)
+            resp = self._summarize_cot(
+                thought, prompt, self.model, self.encode, self.decode,
+                device, self.temperature, self.top_k, self.max_new_tokens
+            )
         self.history.append((prompt, resp))
         return thought, resp
 
@@ -2620,6 +2710,12 @@ class AshenAIAgenticEngine:
             thought = (thought + "\n\n--- Tool Telemetry ---\n"
                        + "\n".join(tool_observations)).strip() if thought else \
                 "--- Tool Telemetry ---\n" + "\n".join(tool_observations)
+        if self.cot_as_answer and thought.strip():
+            print(f"\n[CoT→Answer] summarizing thought...", flush=True)
+            resp = self._summarize_cot(
+                thought, prompt, self.model, self.encode, self.decode,
+                device, self.temperature, self.top_k, self.max_new_tokens
+            )
         self.history.append((prompt, resp))
         yield {"type": "done", "thought": thought, "response": resp,
                "model": label, "model_path": f"api:{label}",
@@ -2723,6 +2819,12 @@ class AshenAIAgenticEngine:
                 _seen.add(_u)
                 _collected_sources.append(_s)
         self.last_sources = _collected_sources
+        if self.cot_as_answer and combined_thought.strip():
+            print(f"\n[CoT→Answer] summarizing thought...", flush=True)
+            clean_final = self._summarize_cot(
+                combined_thought, prompt, self.model, self.encode, self.decode,
+                device, self.temperature, self.top_k, self.max_new_tokens
+            )
         self.history.append((prompt, f"<think>\n{combined_thought}\n</think>\n{clean_final}"))
         return combined_thought, clean_final
 
@@ -2870,6 +2972,12 @@ class AshenAIAgenticEngine:
                 _seen.add(_u)
                 _collected_sources.append(_s)
         self.last_sources = _collected_sources
+        if self.cot_as_answer and combined_thought.strip():
+            print(f"\n[CoT→Answer] summarizing thought...", flush=True)
+            clean_final = self._summarize_cot(
+                combined_thought, prompt, self.model, self.encode, self.decode,
+                device, self.temperature, self.top_k, self.max_new_tokens
+            )
         self.history.append((prompt, f"<think>\n{combined_thought}\n</think>\n{clean_final}"))
         yield {"type": "done", "thought": combined_thought, "response": clean_final,
                "model": os.path.basename(current_model_filename),
@@ -4278,6 +4386,9 @@ def run_streaming(prompt):
             _now = time.strftime('%H:%M:%S')
             print(f"{THEME['dim']}◈ {model_label} · {_now}{RESET}")
             full_resp = ''.join(resp_buf).strip()
+            if not full_resp and ev.get('response'):
+                full_resp = ev['response']
+                print(f"\n{THEME['ans']}{full_resp}{RESET}")
             return ''.join(cot_buf), full_resp
     return ''.join(cot_buf), ''.join(resp_buf).strip()
 

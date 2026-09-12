@@ -278,6 +278,15 @@ Sources                        (when the model cites sources)
 CoT is gray and the final answer is white — same semantics as the web chatbot's collapsed
 `🧠 Thought for <model>` panel.
 
+#### CoT-as-Answer mode
+Both chatbots support a **`cot_as_answer`** setting (default `off`). When enabled:
+- The model's chain-of-thought is generated and displayed as normal
+- The model's actual answer is discarded and replaced with a **summary of the CoT**
+- The summary is produced by a second LLM pass that condenses the reasoning into plain prose
+- Adds ~1 extra LLM call per turn (latency hit) but yields a concise, distilled answer
+
+Enable in the web UI under Settings → "CoT as Answer", or set `"cot_as_answer": true` in `settings.json`.
+
 #### Sessions, workspace, and tools
 - **Sessions** — `/sessions` lists saved sessions; `/new`, `/load <id>`, `/delete <id>`,
   `/rename <name>` manage them. Stored as JSON in `sessions_cli/` (history + workspace
@@ -347,6 +356,7 @@ cuda\Scripts\python.exe web_chatbot.py --port 5000 --host localhost
 - **Adjustable settings** — temperature, top-k, top-p, max tokens, context length, GPU
   layers, repeat penalty, precision, CPU offload. Low-end GPU presets (FP16/BF16, CPU
   offload layers) for <8 GB cards. Optional **speculative decoding** with a draft model.
+  **CoT-as-Answer** toggle replaces the model's answer with a summary of its chain-of-thought.
 - **Session export & purge**, **workspace browser**, and **workspace context injection**.
 
 #### Settings persistence (`settings.json`)
@@ -369,6 +379,7 @@ never wipe `current_model`.
 | `low_end_gpu_mode` | `false` | Enables CPU offload + lower VRAM presets |
 | `use_draft_model` | `false` | Speculative decoding with a draft model |
 | `show_chain_of_thought` | `true` | |
+| `cot_as_answer` | `false` | Replace the model's answer with a summary of its CoT (adds a small LLM call per turn) |
 | `current_model` | `ashen_gpt_model.pk1` (legacy) — or `ashen_gpt_model/` after fine-tune | |
 | `active_backend` | `local` | `local` = weights, `api` = provider |
 | `api_provider` | `""` | `openrouter`, `google`, `anthropic`, `mistral`, `groq`, `together`, or `custom` |
